@@ -11,6 +11,8 @@ const services = [
   "Transport Coordination"
 ];
 
+const WHATSAPP_NUMBER = "254741076845";
+
 initOceanScene();
 
 const groupTypes = [
@@ -483,6 +485,41 @@ function validateQuoteForm() {
   return true;
 }
 
+function valueOrFallback(value) {
+  return value && value.trim() ? value.trim() : "Not provided";
+}
+
+function formatQuoteWhatsAppMessage(data) {
+  const lines = [
+    "Hello Coast Bookings, I would like to request a group accommodation quotation.",
+    "",
+    "GROUP QUOTE REQUEST",
+    `Full Name: ${valueOrFallback(data.fullName)}`,
+    `Organization: ${valueOrFallback(data.organization)}`,
+    `Phone Number: ${valueOrFallback(data.phone)}`,
+    `Email: ${valueOrFallback(data.email)}`,
+    `Group Type: ${valueOrFallback(data.groupType)}`,
+    `Number of Guests: ${valueOrFallback(data.guests)}`,
+    `Arrival Date: ${valueOrFallback(data.arrival)}`,
+    `Departure Date: ${valueOrFallback(data.departure)}`,
+    `Destination: ${valueOrFallback(data.destination)}`,
+    `Meal Requirements: ${valueOrFallback(data.meals)}`,
+    `Preferred Area: ${valueOrFallback(data.preferredArea)}`,
+    "",
+    "Additional Notes:",
+    valueOrFallback(data.notes),
+    "",
+    "Please send suitable accommodation options and a personalized quotation."
+  ];
+
+  return lines.join("\n");
+}
+
+function openQuoteOnWhatsApp(data) {
+  const message = encodeURIComponent(formatQuoteWhatsAppMessage(data));
+  window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${message}`, "_blank", "noopener,noreferrer");
+}
+
 const quoteForm = $("#quoteForm");
 if (quoteForm) {
   quoteForm.addEventListener("submit", (event) => {
@@ -496,8 +533,9 @@ if (quoteForm) {
       ...data
     });
     saveState();
+    openQuoteOnWhatsApp(data);
     event.currentTarget.reset();
-    $("#formMessage").textContent = "Thank you. Our team will contact you shortly with suitable accommodation options.";
+    $("#formMessage").textContent = "Thank you. WhatsApp is opening with your request details ready to send.";
     const dashboard = $("#dashboard");
     if (dashboard && !dashboard.classList.contains("hidden")) renderDashboard();
   });

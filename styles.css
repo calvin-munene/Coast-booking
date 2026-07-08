@@ -718,6 +718,37 @@ textarea:focus {
   line-height: 1.75;
 }
 
+.seo-link-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  width: min(1180px, 100%);
+  margin: 0 auto;
+}
+
+.seo-link-card {
+  display: grid;
+  gap: 12px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--white);
+}
+
+.seo-link-card h3 {
+  margin: 0 0 6px;
+  color: var(--navy);
+  font-size: 20px;
+}
+
+.seo-link-card a {
+  color: var(--navy);
+  font-weight: 800;
+  text-decoration: underline;
+  text-decoration-color: rgba(255, 122, 48, 0.55);
+  text-underline-offset: 4px;
+}
+
 .contact-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -970,6 +1001,10 @@ textarea:focus {
   }
 
   .seo-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .seo-link-grid {
     grid-template-columns: 1fr;
   }
 

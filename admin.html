@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Admin | CoastBookings.org</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Poppins:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="admin-page">
+    <header class="site-header" id="top">
+      <nav class="nav-shell" aria-label="Admin navigation">
+        <a class="brand" href="index.html" aria-label="Back to CoastBookings.org home">
+          <span class="brand-mark">CB</span>
+          <span>CoastBookings.org</span>
+        </a>
+        <div class="nav-links static">
+          <a href="index.html">Website</a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <section class="admin-section standalone" id="admin">
+        <div class="admin-shell">
+          <div class="section-intro">
+            <p class="eyebrow">Admin dashboard</p>
+            <h1>Manage quote operations</h1>
+            <p>View quote requests, update statuses, manage content and export request data.</p>
+          </div>
+          <div class="admin-login" id="adminLogin">
+            <label>Username<input id="adminUser" type="text" autocomplete="username" /></label>
+            <label>Password<input id="adminPass" type="password" autocomplete="current-password" /></label>
+            <button class="btn btn-primary" id="loginButton" type="button">Login</button>
+            <p class="admin-hint">Demo login: admin / coast2026</p>
+          </div>
+          <div class="dashboard hidden" id="dashboard">
+            <div class="dashboard-top">
+              <div class="admin-tabs" id="adminTabs"></div>
+              <button class="btn btn-secondary btn-small" id="logoutButton" type="button">Logout</button>
+            </div>
+            <div class="dashboard-panel" id="dashboardPanel"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

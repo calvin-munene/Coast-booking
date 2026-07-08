@@ -90,21 +90,16 @@ img {
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  flex: 0 0 auto;
   color: var(--navy);
   font-family: Poppins, Inter, sans-serif;
   font-weight: 800;
 }
 
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 42px;
-  height: 42px;
-  border-radius: 10px;
-  background: var(--navy);
-  color: var(--white);
-  box-shadow: 0 12px 24px rgba(11, 45, 91, 0.18);
+.brand-logo {
+  width: 190px;
+  height: 48px;
+  object-fit: contain;
 }
 
 .nav-links {
@@ -257,8 +252,18 @@ img {
 .hero h1 {
   max-width: 760px;
   margin-bottom: 18px;
-  font-size: clamp(40px, 6vw, 72px);
+  font-size: clamp(38px, 5.4vw, 68px);
   line-height: 1.04;
+}
+
+.hero-logo {
+  width: 220px;
+  height: auto;
+  margin-bottom: 22px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 18px 42px rgba(2, 18, 40, 0.22);
 }
 
 .hero p:not(.eyebrow) {
@@ -916,10 +921,6 @@ textarea:focus {
   color: var(--white);
 }
 
-.footer .brand-mark {
-  background: var(--orange);
-}
-
 .footer-links,
 .socials {
   display: flex;
@@ -1023,8 +1024,9 @@ textarea:focus {
     width: min(100% - 24px, 1180px);
   }
 
-  .brand span:last-child {
-    font-size: 14px;
+  .brand-logo {
+    width: 152px;
+    height: 42px;
   }
 
   .hero {
@@ -1033,7 +1035,7 @@ textarea:focus {
   }
 
   .hero h1 {
-    font-size: 41px;
+    font-size: 38px;
   }
 
   .section,

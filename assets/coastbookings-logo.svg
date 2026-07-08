@@ -1,0 +1,10 @@
+<svg width="230" height="48" viewBox="0 0 230 48" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">CoastBookings.org logo</title>
+  <desc id="desc">A navy and orange coastal logo with a sun, wave and CoastBookings.org text.</desc>
+  <rect x="1" y="1" width="46" height="46" rx="13" fill="#0B2D5B"/>
+  <path d="M13 29.2C16.7 25.9 21.1 25.9 24.7 29.2C28.3 32.5 32.9 32.5 36.7 29.2" stroke="#FFFFFF" stroke-width="3.2" stroke-linecap="round"/>
+  <path d="M13 35.1C16.8 32.4 21 32.4 24.8 35.1C28.5 37.8 32.8 37.8 36.7 35.1" stroke="#FF7A30" stroke-width="3.2" stroke-linecap="round"/>
+  <circle cx="30.5" cy="15.5" r="6.5" fill="#FF7A30"/>
+  <text x="58" y="22" fill="#0B2D5B" font-family="Poppins, Inter, Arial, sans-serif" font-size="16" font-weight="800">CoastBookings.org</text>
+  <text x="58" y="37" fill="#52647A" font-family="Inter, Arial, sans-serif" font-size="10" font-weight="700">group stays on the Kenyan Coast</text>
+</svg>

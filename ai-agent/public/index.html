@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NVIDIA AI Assistant</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header><span class="status"></span><div><h1>Your AI Assistant</h1><p>Powered by NVIDIA</p></div></header>
+    <section id="messages" aria-live="polite"><article class="bot">Hello! How can I help you today?</article></section>
+    <form id="chat-form"><label class="sr-only" for="message">Message</label><textarea id="message" rows="1" maxlength="8000" placeholder="Ask me anything…" required></textarea><button aria-label="Send">➜</button></form>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -2,3 +2,5 @@
 .codex/
 .DS_Store
 Thumbs.db
+ai-agent/.env
+ai-agent/node_modules/

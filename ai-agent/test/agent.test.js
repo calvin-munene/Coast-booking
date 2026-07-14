@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { availableModels, defaultModel, reply, selectModel } from "../src/agent.js";
+import { availableModels, defaultModel, reply, selectModel, streamReply } from "../src/agent.js";
 
 test("exposes an approved NVIDIA model catalog", () => {
   const previousModel = process.env.NVIDIA_MODEL;
@@ -92,6 +92,73 @@ test("retries temporary NVIDIA capacity errors", async () => {
   const answer = await reply({ conversationId: "test-retry", text: "hello" });
   assert.equal(answer, "recovered");
   assert.equal(requests, 2);
+
+  globalThis.fetch = previousFetch;
+  if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;
+  else process.env.NVIDIA_API_KEY = previousKey;
+});
+
+test("parses NVIDIA SSE across arbitrary UTF-8 chunk boundaries", async () => {
+  const previousKey = process.env.NVIDIA_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.NVIDIA_API_KEY = "test-key";
+  let requestBody;
+  const source = [
+    ': keepalive',
+    '',
+    'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+    '',
+    'data: {"choices":[{"delta":{"content":"Hello "}}]}',
+    '',
+    'data: {"choices":[{"delta":{"content":"\u{1F30D}"}}]}',
+    '',
+    'data: [DONE]',
+    ''
+  ].join("\r\n");
+  const encoded = new TextEncoder().encode(source);
+  globalThis.fetch = async (_url, options) => {
+    requestBody = JSON.parse(options.body);
+    return new Response(new ReadableStream({
+      start(controller) {
+        for (const boundary of [7, 31, 79, encoded.length - 2, encoded.length]) {
+          const start = this.offset || 0;
+          if (boundary > start) controller.enqueue(encoded.slice(start, boundary));
+          this.offset = boundary;
+        }
+        controller.close();
+      }
+    }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+
+  const deltas = [];
+  const answer = await streamReply({
+    conversationId: "test-stream-boundaries",
+    text: "hello",
+    onDelta: (delta) => deltas.push(delta)
+  });
+
+  assert.equal(requestBody.stream, true);
+  assert.equal(answer, "Hello \u{1F30D}");
+  assert.deepEqual(deltas, ["Hello ", "\u{1F30D}"]);
+
+  globalThis.fetch = previousFetch;
+  if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;
+  else process.env.NVIDIA_API_KEY = previousKey;
+});
+
+test("rejects an incomplete NVIDIA stream", async () => {
+  const previousKey = process.env.NVIDIA_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.NVIDIA_API_KEY = "test-key";
+  globalThis.fetch = async () => new Response(
+    'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
+
+  await assert.rejects(
+    streamReply({ conversationId: "test-incomplete-stream", text: "hello" }),
+    /ended unexpectedly/
+  );
 
   globalThis.fetch = previousFetch;
   if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;

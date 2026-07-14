@@ -15,21 +15,27 @@ Never put API keys in browser code or commit `.env`.
 
 The browser can switch between the server-approved NVIDIA models returned by `/api/models`. Set `NVIDIA_MODEL` for the preferred default and optionally set `NVIDIA_MODELS` to an authoritative comma-separated allowlist. If the preferred default is not in that allowlist, the first allowed model becomes the default. The NVIDIA API key remains server-side, and model IDs submitted by the browser are rejected unless they are allowed.
 
+Browser answers stream token-by-token over a protected server-sent event connection. The **STOP** control cancels the active NVIDIA request; partial cancelled answers are shown but are not added to conversation memory.
+
 ## Deploy on Render
 
 The repository includes a root-level `render.yaml` Blueprint. In Render, create a new Blueprint from the GitHub repository, then provide the secret values requested during setup. Render supplies `PORT` automatically.
 
 ## Telegram
 
-1. Create a bot using `@BotFather`, then place its token in `TELEGRAM_BOT_TOKEN`.
-2. Deploy this service at a public HTTPS URL.
-3. Register the webhook (replace the placeholders):
+1. Create a bot using `@BotFather`, then place its token in the Render `TELEGRAM_BOT_TOKEN` secret.
+2. Set `PUBLIC_URL` to the deployed HTTPS origin and provide a random `TELEGRAM_WEBHOOK_SECRET`.
+3. Optionally set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram user IDs so only those people can spend the NVIDIA quota. Send `/whoami` to the bot to discover your numeric ID.
 
-```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://YOUR_DOMAIN/webhooks/telegram","secret_token":"YOUR_WEBHOOK_SECRET","allowed_updates":["message"]}'
-```
+At startup the service validates the token, publishes the bot command menu, registers the protected webhook, and verifies it with Telegram. Private chats receive animated native message drafts while NVIDIA generates the answer; the completed answer is then persisted as a normal reply. Group chats receive typing status followed by the final answer.
+
+Bot commands:
+
+- `/start` and `/help` show usage.
+- `/models` lists server-approved NVIDIA models.
+- `/model 2` or `/model <model-id>` changes the model for that Telegram chat.
+- `/reset` clears that chat's in-memory AI context.
+- `/whoami` shows the user and chat IDs used by the optional allowlist.
 
 ## WhatsApp Cloud API
 
@@ -44,5 +50,5 @@ During Meta's test phase, add recipient numbers in the developer dashboard. Prod
 
 - Replace in-memory history with Redis or a database.
 - Add user authentication and per-user rate limits to `/api/chat`.
-- Add logging, monitoring, retries, and a job queue for webhooks.
+- Add durable webhook jobs and centralized monitoring for higher traffic.
 - Deploy behind HTTPS and rotate any key that has ever been exposed.

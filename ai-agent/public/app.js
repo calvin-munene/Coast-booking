@@ -9,9 +9,12 @@ const networkStatus = document.querySelector("#network-status");
 const uptime = document.querySelector("#uptime");
 const modelSelect = document.querySelector("#model-select");
 const activeModel = document.querySelector("#active-model");
+const telegramLink = document.querySelector("#telegram-link");
 const sessionId = localStorage.aiSessionId ||= crypto.randomUUID();
 const startedAt = Date.now();
 const modelsById = new Map();
+let activeChatController = null;
+let channelLoadAttempts = 0;
 
 sessionCode.textContent = sessionId.slice(0, 8).toUpperCase();
 
@@ -53,6 +56,25 @@ async function loadModels() {
   }
 }
 
+async function loadChannels() {
+  if (!telegramLink) return;
+  channelLoadAttempts += 1;
+  try {
+    const response = await fetch("/api/channels", { headers: { accept: "application/json" } });
+    if (!response.ok) return;
+    const { telegram } = await response.json();
+    if (telegram?.enabled && !telegram.configured && channelLoadAttempts < 3) {
+      setTimeout(loadChannels, 3000);
+      return;
+    }
+    if (!telegram?.configured || !/^[A-Za-z0-9_]{5,32}$/.test(telegram.username || "")) return;
+    telegramLink.href = `https://t.me/${telegram.username}`;
+    telegramLink.hidden = false;
+  } catch {
+    // The website chat remains available when an optional channel is offline.
+  }
+}
+
 function addMessage(text, type, modelLabel = "") {
   const item = document.createElement("article");
   item.className = `message ${type}`;
@@ -89,12 +111,66 @@ function syncComposer() {
 function setBusy(isBusy) {
   input.disabled = isBusy;
   modelSelect.disabled = isBusy || modelsById.size === 0;
-  sendButton.disabled = isBusy;
-  sendButton.querySelector("span").textContent = isBusy ? "WAIT" : "RUN";
+  sendButton.disabled = false;
+  sendButton.classList.toggle("is-stopping", isBusy);
+  sendButton.querySelector("span").textContent = isBusy ? "STOP" : "RUN";
+  sendButton.querySelector("i").textContent = isBusy ? "X" : "^";
+  sendButton.setAttribute("aria-label", isBusy ? "Stop response" : "Send message");
+}
+
+async function responseError(response) {
+  try {
+    const data = await response.json();
+    return data.error || `Request failed (${response.status})`;
+  } catch {
+    return `Request failed (${response.status})`;
+  }
+}
+
+async function readChatStream(response, onEvent) {
+  if (!response.body) throw new Error("Streaming is not supported by this browser.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completed = false;
+
+  function consumeFrame(frame) {
+    if (!frame.trim() || frame.trimStart().startsWith(":")) return;
+    let event = "message";
+    const data = [];
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+    }
+    if (!data.length) return;
+    const payload = JSON.parse(data.join("\n"));
+    onEvent(event, payload);
+    if (event === "done") completed = true;
+    if (event === "error") throw new Error(payload.error || "The response stream failed.");
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() || "";
+      for (const frame of frames) consumeFrame(frame);
+      if (done) break;
+    }
+    if (buffer.trim()) consumeFrame(buffer);
+  } finally {
+    reader.releaseLock();
+  }
+  if (!completed) throw new Error("The response stream ended before completion.");
 }
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (activeChatController) {
+    activeChatController.abort();
+    return;
+  }
   const message = input.value.trim();
   if (!message) return;
 
@@ -107,22 +183,63 @@ form.addEventListener("submit", async (event) => {
   setBusy(true);
 
   const waiting = addMessage("PROCESSING QUERY", "bot waiting", requestedLabel);
+  waiting.copy.setAttribute("aria-live", "off");
+  waiting.item.setAttribute("aria-busy", "true");
+  const controller = new AbortController();
+  activeChatController = controller;
+  let streamedText = "";
+  let renderedText = "";
+  let paintFrame = 0;
+
+  function paintStream(force = false) {
+    if (force && paintFrame) cancelAnimationFrame(paintFrame);
+    if (!force && paintFrame) return;
+    const paint = () => {
+      paintFrame = 0;
+      if (streamedText === renderedText) return;
+      renderedText = streamedText;
+      waiting.copy.textContent = renderedText;
+      waiting.item.classList.remove("waiting");
+      messages.scrollTop = messages.scrollHeight;
+    };
+    if (force) paint();
+    else paintFrame = requestAnimationFrame(paint);
+  }
+
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, message, model: requestedModel })
+      body: JSON.stringify({ sessionId, message, model: requestedModel }),
+      signal: controller.signal
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error);
-    waiting.copy.textContent = data.answer;
-    waiting.label.textContent = `${selectedModelLabel(data.model).toUpperCase()} // ${clockTime()}`;
+    if (!response.ok) throw new Error(await responseError(response));
+    await readChatStream(response, (eventName, data) => {
+      if (eventName === "meta") {
+        waiting.label.textContent = `${selectedModelLabel(data.model).toUpperCase()} // ${clockTime()}`;
+      }
+      if (eventName === "delta") {
+        streamedText += data.text || "";
+        paintStream();
+      }
+    });
+    paintStream(true);
     waiting.item.classList.remove("waiting");
   } catch (error) {
-    waiting.copy.textContent = error.message || "Connection interrupted. Please try again.";
+    paintStream(true);
+    if (error.name === "AbortError") {
+      if (!streamedText) waiting.copy.textContent = "RESPONSE STOPPED";
+      waiting.label.textContent = `${requestedLabel.toUpperCase()} // STOPPED`;
+    } else {
+      waiting.copy.textContent = error.message || "Connection interrupted. Please try again.";
+    }
     waiting.item.classList.remove("waiting");
   } finally {
+    if (paintFrame) cancelAnimationFrame(paintFrame);
+    waiting.copy.setAttribute("aria-live", "polite");
+    waiting.item.removeAttribute("aria-busy");
     messages.scrollTop = messages.scrollHeight;
+    if (activeChatController === controller) activeChatController = null;
     setBusy(false);
     input.focus();
   }
@@ -322,9 +439,11 @@ function startHackerField(canvas) {
 
 window.addEventListener("online", updateNetworkState);
 window.addEventListener("offline", updateNetworkState);
+window.addEventListener("pagehide", () => activeChatController?.abort());
 setInterval(updateUptime, 1000);
 syncComposer();
 updateNetworkState();
 updateUptime();
 loadModels();
+loadChannels();
 startHackerField(document.querySelector("#hacker-canvas"));

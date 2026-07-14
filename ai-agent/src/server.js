@@ -2,8 +2,14 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { availableModels, defaultModel, reply, selectModel } from "./agent.js";
-import { handleTelegram, handleWhatsApp, validMetaSignature } from "./channels.js";
+import { availableModels, defaultModel, selectModel, streamReply } from "./agent.js";
+import {
+  configureTelegramBot,
+  handleTelegram,
+  handleWhatsApp,
+  telegramPublicStatus,
+  validMetaSignature
+} from "./channels.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const port = Number(process.env.PORT || 3000);
@@ -49,6 +55,83 @@ function consumeChatBudget(req, model) {
   return true;
 }
 
+function validSessionId(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function streamErrorMessage(error) {
+  return [429, 500, 502, 503, 504].includes(error.statusCode)
+    ? "NVIDIA is temporarily busy. Please try again in a moment."
+    : "The assistant could not complete that request";
+}
+
+function writeSse(res, event, data) {
+  if (res.destroyed || res.writableEnded) return Promise.reject(new DOMException("Client disconnected", "AbortError"));
+  const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  if (res.write(frame)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", drained);
+      res.off("close", closed);
+    };
+    const drained = () => {
+      cleanup();
+      resolve();
+    };
+    const closed = () => {
+      cleanup();
+      reject(new DOMException("Client disconnected", "AbortError"));
+    };
+    res.once("drain", drained);
+    res.once("close", closed);
+  });
+}
+
+async function streamWebChat(req, res, { sessionId, message, model }) {
+  const controller = new AbortController();
+  const abort = () => controller.abort(new DOMException("Client disconnected", "AbortError"));
+  const close = () => { if (!res.writableEnded) abort(); };
+  req.once("aborted", abort);
+  res.once("close", close);
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no"
+  });
+  res.flushHeaders();
+  res.write(": connected\n\n");
+  const heartbeat = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) res.write(": heartbeat\n\n");
+  }, 15_000);
+
+  try {
+    await writeSse(res, "meta", { model });
+    await streamReply({
+      conversationId: `web:${sessionId}`,
+      text: message,
+      model,
+      signal: controller.signal,
+      onDelta: (text) => writeSse(res, "delta", { text })
+    });
+    await writeSse(res, "done", { model });
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      console.error(error);
+      try {
+        await writeSse(res, "error", { error: streamErrorMessage(error) });
+      } catch {
+        // The client disconnected before the safe error event could be sent.
+      }
+    }
+  } finally {
+    clearInterval(heartbeat);
+    req.off("aborted", abort);
+    res.off("close", close);
+    if (!res.writableEnded && !res.destroyed) res.end();
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
@@ -56,6 +139,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/models") {
       return json(res, 200, { models: availableModels(), defaultModel: defaultModel() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/channels") {
+      return json(res, 200, { telegram: telegramPublicStatus() });
     }
 
     if (req.method === "POST" && url.pathname === "/api/chat") {
@@ -69,11 +156,13 @@ const server = http.createServer(async (req, res) => {
       } catch (error) {
         return json(res, 400, { error: error.message });
       }
+      if (!validSessionId(data.sessionId)) {
+        return json(res, 400, { error: "A valid browser session is required" });
+      }
       if (!consumeChatBudget(req, model)) {
         return json(res, 429, { error: "Request limit reached. Please try again in a few minutes." });
       }
-      const answer = await reply({ conversationId: `web:${data.sessionId || "anonymous"}`, text: data.message.trim(), model });
-      return json(res, 200, { answer, model });
+      return streamWebChat(req, res, { sessionId: data.sessionId, message: data.message.trim(), model });
     }
 
     if (req.method === "POST" && url.pathname === "/webhooks/telegram") {
@@ -108,8 +197,15 @@ const server = http.createServer(async (req, res) => {
     }
     json(res, 404, { error: "Not found" });
   } catch (error) {
+    if (!res.headersSent && error instanceof SyntaxError) {
+      return json(res, 400, { error: "Request body must be valid JSON" });
+    }
     console.error(error);
-    const providerUnavailable = [429, 502, 503, 504].includes(error.statusCode);
+    if (res.headersSent) {
+      if (!res.writableEnded && !res.destroyed) res.end();
+      return;
+    }
+    const providerUnavailable = [429, 500, 502, 503, 504].includes(error.statusCode);
     json(res, providerUnavailable ? 503 : 500, {
       error: providerUnavailable
         ? "NVIDIA is temporarily busy. Please try again in a moment."
@@ -118,4 +214,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, () => console.log(`AI agent running at http://localhost:${port}`));
+server.listen(port, () => {
+  console.log(`AI agent running at http://localhost:${port}`);
+  configureTelegramBot().catch((error) => console.error(`Telegram setup failed: ${error.message}`));
+});

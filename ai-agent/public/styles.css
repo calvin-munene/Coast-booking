@@ -159,6 +159,21 @@ button { color: inherit; }
 .brand-copy small { color: var(--muted); font-family: var(--mono); font-size: 9px; letter-spacing: 0.24em; }
 
 .topbar-actions { display: flex; align-items: center; gap: 26px; }
+.telegram-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(142, 234, 34, 0.26);
+  color: var(--green-bright);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-decoration: none;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.telegram-link:hover { border-color: var(--green); background: rgba(142, 234, 34, 0.08); }
+.telegram-link[hidden] { display: none; }
 .connection-pill {
   display: inline-flex;
   align-items: center;
@@ -423,6 +438,8 @@ textarea:disabled { opacity: 0.58; }
 }
 
 .send-button:hover { background: var(--green-bright); transform: translateY(-1px); }
+.send-button.is-stopping { background: #f1b43c; color: #160e02; }
+.send-button.is-stopping:hover { background: #ffd36d; }
 .send-button:disabled { cursor: wait; opacity: 0.52; transform: none; }
 .send-button i { font-size: 15px; font-style: normal; }
 
@@ -486,6 +503,7 @@ a:focus-visible { outline: 2px solid var(--green-bright); outline-offset: 3px; }
   .topbar, .main-grid, .site-footer { padding-left: 18px; padding-right: 18px; }
   .topbar { min-height: 74px; }
   .topbar-code { display: none; }
+  .telegram-link { min-height: 32px; padding: 0 9px; font-size: 8px; }
   .connection-pill { padding: 8px; font-size: 8px; }
   .brand-mark { width: 38px; height: 38px; }
   .brand-copy strong { font-size: 13px; }
@@ -522,7 +540,7 @@ a:focus-visible { outline: 2px solid var(--green-bright); outline-offset: 3px; }
 
 @media (max-width: 430px) {
   .topbar-actions { gap: 0; }
-  .connection-pill { border: 0; background: transparent; padding-right: 0; }
+  .connection-pill { display: none; }
   .terminal-header { align-items: flex-start; }
   .terminal-header > div:first-child { align-items: flex-start; }
   .terminal-dots { display: none; }

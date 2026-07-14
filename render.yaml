@@ -23,6 +23,10 @@ services:
         sync: false
       - key: TELEGRAM_WEBHOOK_SECRET
         generateValue: true
+      - key: TELEGRAM_ALLOWED_USER_IDS
+        sync: false
+      - key: PUBLIC_URL
+        value: https://nvidbot.onrender.com
       - key: WHATSAPP_ACCESS_TOKEN
         sync: false
       - key: WHATSAPP_PHONE_NUMBER_ID

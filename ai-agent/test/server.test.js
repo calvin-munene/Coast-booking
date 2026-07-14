@@ -6,6 +6,7 @@ import { createAppServer } from "../src/server.js";
 import { setTelegramStarLedgerForTests } from "../src/channels.js";
 import { createStarPurchasePayload } from "../src/starPayments.js";
 import { resetTelegramWebAuthForTests } from "../src/telegramWebAuth.js";
+import { setPlatformStoreForTests } from "../src/platformRuntime.js";
 
 const originalFetch = global.fetch;
 const ENV_NAMES = [
@@ -18,7 +19,8 @@ const ENV_NAMES = [
   "TELEGRAM_WEBAPP_SESSION_TTL_SECONDS",
   "NVIDIA_API_KEY",
   "NVIDIA_GLOBAL_REQUESTS_PER_HOUR",
-  "NVIDIA_MAX_CONCURRENT_REQUESTS"
+  "NVIDIA_MAX_CONCURRENT_REQUESTS",
+  "PUBLIC_URL"
 ];
 const originalEnvironment = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
 
@@ -29,6 +31,7 @@ function restoreEnvironment() {
   }
   global.fetch = originalFetch;
   setTelegramStarLedgerForTests(null);
+  setPlatformStoreForTests(null);
   resetTelegramWebAuthForTests();
 }
 
@@ -139,6 +142,22 @@ function requestRaw(port, path, requestBody, headers = {}) {
   });
 }
 
+function requestGet(port, path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ host: "127.0.0.1", port, path, method: "GET", headers }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.once("end", () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        text: Buffer.concat(chunks).toString("utf8")
+      }));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
+
 function signedInitData({ authDate = Math.floor(Date.now() / 1000), userId = 123 } = {}) {
   const params = new URLSearchParams({
     auth_date: String(authDate),
@@ -167,6 +186,23 @@ function webLedgerDouble(overrides = {}) {
     async reserveProviderCapacity() { return { reserved: true, used: 1 }; },
     async completePrompt() {},
     async restorePrompt() {},
+    ...overrides
+  };
+}
+
+function platformStoreDouble(overrides = {}) {
+  const features = [{ key: "admin_api", enabled: true, description: "Admin API", config: {}, updatedBy: null }];
+  return {
+    async ensureUser() {},
+    async getUserRole() { return "standard_user"; },
+    async writeSecurityEvent() { return { written: true }; },
+    async getOverview() { return { totalUsers: "1", activeUsers: "1", newUsers: "1", auditEvents: "0", recentSecurityEvents: "0" }; },
+    async listFeatureFlags() { return features; },
+    async setFeatureFlag({ featureKey, enabled }) {
+      return { duplicate: false, feature: { key: featureKey, enabled, description: "", config: {}, updatedBy: "6643462826" } };
+    },
+    async listAuditLogs() { return []; },
+    async listSecurityEvents() { return []; },
     ...overrides
   };
 }
@@ -400,6 +436,96 @@ test("web AI does not call NVIDIA without credit and restores credit after provi
     assert.match(failed.text, /event: error/);
     assert.deepEqual(restored, [`web:123:${requestId}`]);
     assert.ok(nvidiaCalls >= 1);
+  } finally {
+    await close(server);
+  }
+});
+
+test("admin APIs require a Telegram session and a live platform permission", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const securityEvents = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async writeSecurityEvent(event) { securityEvents.push(event); return { written: true }; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    assert.equal((await requestGet(port, "/api/admin/overview")).status, 401);
+    const session = await launchWebSession(port, 123);
+    const forbidden = await requestGet(port, "/api/admin/overview", { authorization: `Bearer ${session}` });
+    assert.equal(forbidden.status, 403, forbidden.text);
+    assert.ok(securityEvents.some((event) => event.eventType === "admin_access_denied"));
+  } finally {
+    await close(server);
+  }
+});
+
+test("configured super admin can read and idempotently mutate feature controls", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "0", payments: "0", prompts: "0" }; }
+  }));
+  const mutations = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async setFeatureFlag(change) {
+      mutations.push(change);
+      return { duplicate: mutations.length > 1, feature: { key: change.featureKey, enabled: change.enabled } };
+    }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 6643462826);
+    const auth = { authorization: `Bearer ${session}` };
+    const features = await requestGet(port, "/api/admin/features", auth);
+    assert.equal(features.status, 200, features.text);
+    assert.equal(JSON.parse(features.text).features[0].key, "admin_api");
+
+    const requestId = crypto.randomUUID();
+    const first = await requestJson(port, "/api/admin/features", {
+      requestId,
+      featureKey: "group_management",
+      enabled: true
+    }, { ...auth, origin: process.env.PUBLIC_URL });
+    assert.equal(first.status, 200, first.text);
+    assert.equal(mutations[0].actorUserId, "6643462826");
+
+    const replay = await requestJson(port, "/api/admin/features", {
+      requestId,
+      featureKey: "group_management",
+      enabled: true
+    }, { ...auth, origin: process.env.PUBLIC_URL });
+    assert.equal(replay.status, 200, replay.text);
+    assert.equal(JSON.parse(replay.text).duplicate, true);
+
+    const forgedOrigin = await requestJson(port, "/api/admin/features", {
+      requestId: crypto.randomUUID(),
+      featureKey: "group_management",
+      enabled: false
+    }, { ...auth, origin: "https://attacker.example" });
+    assert.equal(forgedOrigin.status, 403, forgedOrigin.text);
+  } finally {
+    await close(server);
+  }
+});
+
+test("banned users cannot establish a Mini App session", async () => {
+  enableTelegramPayments();
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getUserControl(userId) {
+      return { userId: String(userId), banned: true, unlimitedCredits: false, persona: null };
+    }
+  }));
+  setPlatformStoreForTests(platformStoreDouble());
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const response = await requestJson(port, "/api/miniapp/state", { initData: signedInitData({ userId: 123 }) });
+    assert.equal(response.status, 403, response.text);
+    assert.match(response.text, /not permitted/i);
   } finally {
     await close(server);
   }

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { availableModels, defaultModel, selectModel, streamReply } from "./agent.js";
+import { runtimeConfig, safeConfigurationStatus, validateRuntimeConfiguration } from "./config.js";
 import {
   configureTelegramBot,
   completeTelegramWebAiUsage,
@@ -21,9 +22,19 @@ import {
   issueTelegramWebAppSession,
   verifyTelegramWebAppSession
 } from "./telegramWebAuth.js";
+import { authorizeHttpRequest, bearerToken } from "./httpAuth.js";
+import { logger } from "./logger.js";
+import {
+  getPlatformStore,
+  initializePlatformFoundation,
+  platformHealth,
+  platformRuntimeStatus
+} from "./platformRuntime.js";
+import { sourceIdentifierHash } from "./platformStore.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const port = Number(process.env.PORT || 3000);
+const startedAt = Date.now();
 const requestRateLimits = new Map();
 const webUsersInFlight = new Set();
 let activeWebAiRequests = 0;
@@ -31,7 +42,13 @@ let providerFailures = [];
 let providerCircuitOpenUntil = 0;
 
 function json(res, status, value) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()"
+  });
   res.end(JSON.stringify(value));
 }
 
@@ -57,6 +74,8 @@ async function body(req, { maxBytes = 1_000_000 } = {}) {
 }
 
 async function jsonBody(req, options) {
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  if (!contentType.startsWith("application/json")) throw httpError(415, "Content-Type must be application/json");
   const raw = await body(req, options);
   return JSON.parse(raw.toString("utf8") || "{}");
 }
@@ -82,12 +101,6 @@ function consumeRequestBudget(req, route, { limit, windowMs, cost = 1 }) {
   return true;
 }
 
-function bearerToken(req) {
-  const value = req.headers.authorization;
-  const match = typeof value === "string" ? value.match(/^Bearer\s+([^\s]+)$/i) : null;
-  return match?.[1] || "";
-}
-
 function authenticateTelegramWebRequest(req, data, { allowLaunch = false } = {}) {
   const existing = verifyTelegramWebAppSession(bearerToken(req));
   if (existing) return { verified: existing, sessionToken: null };
@@ -98,6 +111,53 @@ function authenticateTelegramWebRequest(req, data, { allowLaunch = false } = {})
     verified: launch,
     sessionToken: issueTelegramWebAppSession(launch)
   };
+}
+
+async function recordSecurityEvent(req, event) {
+  const store = getPlatformStore();
+  if (!store?.writeSecurityEvent) return;
+  try {
+    await store.writeSecurityEvent({
+      ...event,
+      sourceHash: sourceIdentifierHash(chatClient(req))
+    });
+  } catch (error) {
+    logger.error("security.event.write_failed", { error, eventType: event.eventType });
+  }
+}
+
+async function authorizeAdminRequest(req, { permission, mutation = false } = {}) {
+  const authorization = await authorizeHttpRequest(req, {
+    permission,
+    mutation,
+    store: getPlatformStore(),
+    expectedOrigin: runtimeConfig().publicOrigin
+  });
+  if (!authorization.allowed) {
+    await recordSecurityEvent(req, {
+      eventType: "admin_access_denied",
+      severity: authorization.status === 401 ? "medium" : "high",
+      userId: authorization.session?.userId || null,
+      metadata: { permission, status: authorization.status }
+    });
+    return authorization;
+  }
+  const dashboard = await telegramDashboardState({ userId: authorization.session.userId });
+  if (dashboard.banned && !dashboard.isAdmin) {
+    await recordSecurityEvent(req, {
+      eventType: "banned_user_admin_access",
+      severity: "high",
+      userId: authorization.session.userId,
+      metadata: { permission }
+    });
+    return { allowed: false, status: 403, error: "This account is banned" };
+  }
+  return authorization;
+}
+
+function parseLimit(url) {
+  const value = Number(url.searchParams.get("limit") || 50);
+  return Number.isSafeInteger(value) && value >= 1 && value <= 250 ? value : 50;
 }
 
 function positiveEnvironmentInteger(name, fallback, minimum, maximum) {
@@ -200,17 +260,17 @@ async function streamWebChat(req, res, { authenticated, usage, message, model })
     await writeSse(res, "done", { model });
     responseDelivered = true;
     await completeTelegramWebAiUsage(usage).catch((error) => {
-      console.error(`Web AI credit completion failed: ${error.message}`);
+      logger.error("web_ai.credit_completion_failed", { error, userId: authenticated.userId });
     });
   } catch (error) {
     recordProviderFailure(error);
     if (!responseDelivered) {
       await restoreTelegramWebAiUsage(usage).catch((restoreError) => {
-        console.error(`Web AI credit restoration failed: ${restoreError.message}`);
+        logger.error("web_ai.credit_restoration_failed", { error: restoreError, userId: authenticated.userId });
       });
     }
     if (!controller.signal.aborted) {
-      console.error(`Web AI generation failed: ${error.message}`);
+      logger.error("web_ai.generation_failed", { error, userId: authenticated.userId, model });
       try {
         await writeSse(res, "error", { error: streamErrorMessage(error) });
       } catch {
@@ -230,9 +290,22 @@ export function createAppServer() {
   return http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
-    if (req.method === "GET" && url.pathname === "/health") {
-      const ok = telegramServiceReady();
-      return json(res, ok ? 200 : 503, { ok });
+    if (req.method === "GET" && url.pathname === "/health/live") {
+      return json(res, 200, { ok: true, uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000) });
+    }
+
+    if (req.method === "GET" && ["/health", "/health/ready"].includes(url.pathname)) {
+      const database = await platformHealth();
+      const telegramReady = telegramServiceReady();
+      const ok = telegramReady && database.ok;
+      return json(res, ok ? 200 : 503, {
+        ok,
+        services: {
+          telegram: { ok: telegramReady },
+          database
+        },
+        deploymentVersion: runtimeConfig().deploymentVersion
+      });
     }
 
     if (req.method === "GET" && url.pathname === "/api/models") {
@@ -256,10 +329,86 @@ export function createAppServer() {
             : "Fresh Telegram Mini App authentication is required"
         });
       }
+      const dashboard = await telegramDashboardState({ userId: auth.verified.userId });
+      if (dashboard.banned && !dashboard.isAdmin) {
+        await recordSecurityEvent(req, {
+          eventType: "banned_user_miniapp_access",
+          severity: "medium",
+          userId: auth.verified.userId
+        });
+        return json(res, 403, { error: "This account is not permitted to use Nvid AI" });
+      }
+      const store = getPlatformStore();
+      if (store?.ensureUser) await store.ensureUser(auth.verified.userId);
       return json(res, 200, {
         verified: true,
         sessionToken: auth.sessionToken,
-        dashboard: await telegramDashboardState({ userId: auth.verified.userId })
+        dashboard
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/overview") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, {
+        overview: await getPlatformStore().getOverview(),
+        system: {
+          deploymentVersion: runtimeConfig().deploymentVersion,
+          uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+          telegram: telegramPublicStatus()
+        }
+      });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/features") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { features: await getPlatformStore().listFeatureFlags() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/features") {
+      if (!consumeRequestBudget(req, "admin-write", { limit: 30, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "features.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 16_000 });
+      if (typeof data.featureKey !== "string" || typeof data.enabled !== "boolean" || typeof data.requestId !== "string") {
+        return json(res, 400, { error: "featureKey, enabled, and requestId are required" });
+      }
+      const changed = await getPlatformStore().setFeatureFlag({
+        actorUserId: auth.principal.userId,
+        featureKey: data.featureKey,
+        enabled: data.enabled,
+        requestId: data.requestId
+      });
+      return json(res, 200, changed);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/logs") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "logs.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { logs: await getPlatformStore().listAuditLogs({ limit: parseLimit(url) }) });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/security-events") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "security_events.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { events: await getPlatformStore().listSecurityEvents({ limit: parseLimit(url) }) });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/system") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, {
+        configuration: safeConfigurationStatus(),
+        platform: platformRuntimeStatus(),
+        telegram: telegramPublicStatus(),
+        nvidia: { circuitOpen: providerCircuitIsOpen(), activeRequests: activeWebAiRequests },
+        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000)
       });
     }
 
@@ -320,7 +469,7 @@ export function createAppServer() {
         await handleTelegram(data);
         return json(res, 200, { ok: true });
       }
-      handleTelegram(data).catch(console.error);
+      handleTelegram(data).catch((error) => logger.error("telegram.update_failed", { error, updateId: data?.update_id }));
       return json(res, 200, { ok: true });
     }
 
@@ -338,7 +487,7 @@ export function createAppServer() {
       }
       const raw = await body(req, { maxBytes: 1_000_000 });
       if (!validMetaSignature(raw, req.headers["x-hub-signature-256"])) return json(res, 401, { error: "Invalid signature" });
-      handleWhatsApp(JSON.parse(raw.toString("utf8"))).catch(console.error);
+      handleWhatsApp(JSON.parse(raw.toString("utf8"))).catch((error) => logger.error("whatsapp.update_failed", { error }));
       return json(res, 200, { ok: true });
     }
 
@@ -357,7 +506,13 @@ export function createAppServer() {
       };
       try {
         const content = await fs.readFile(filePath);
-        res.writeHead(200, { "content-type": types[path.extname(filePath).toLowerCase()] || "application/octet-stream" });
+        res.writeHead(200, {
+          "content-type": types[path.extname(filePath).toLowerCase()] || "application/octet-stream",
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "strict-origin-when-cross-origin",
+          "permissions-policy": "camera=(), microphone=(), geolocation=()",
+          "content-security-policy": "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
+        });
         return res.end(content);
       } catch (error) {
         if (error?.code !== "ENOENT" && error?.code !== "EISDIR") throw error;
@@ -368,15 +523,18 @@ export function createAppServer() {
     if (!res.headersSent && error instanceof SyntaxError) {
       return json(res, 400, { error: "Request body must be valid JSON" });
     }
-    if (!res.headersSent && error?.statusCode === 413) {
-      return json(res, 413, { error: "Request body too large" });
+    if (!res.headersSent && [413, 415].includes(error?.statusCode)) {
+      return json(res, error.statusCode, { error: error.message });
     }
     if (res.headersSent) {
-      console.error(error);
+      logger.error("http.request_failed_after_headers", { error, method: req.method, path: url.pathname });
       if (!res.writableEnded && !res.destroyed) res.end();
       return;
     }
-    console.error(error);
+    logger.error("http.request_failed", { error, method: req.method, path: url.pathname });
+    if (Number(error?.statusCode) >= 400 && Number(error?.statusCode) < 500) {
+      return json(res, Number(error.statusCode), { error: error.message });
+    }
     const providerUnavailable = [429, 500, 502, 503, 504].includes(error.statusCode);
     json(res, providerUnavailable ? 503 : 500, {
       error: providerUnavailable
@@ -388,10 +546,12 @@ export function createAppServer() {
 }
 
 export function startAppServer(listenPort = port) {
+  const config = validateRuntimeConfiguration();
   const server = createAppServer();
   server.listen(listenPort, () => {
-    console.log(`AI agent running at http://localhost:${listenPort}`);
-    configureTelegramBot().catch((error) => console.error(`Telegram setup failed: ${error.message}`));
+    logger.info("application.listening", { port: listenPort, environment: config.environment, deploymentVersion: config.deploymentVersion });
+    initializePlatformFoundation().catch(() => {});
+    configureTelegramBot().catch((error) => logger.error("telegram.setup_failed", { error }));
   });
   return server;
 }

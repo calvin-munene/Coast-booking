@@ -1,0 +1,34 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { PLATFORM_MIGRATIONS, runMigrations } from "../src/migrations.js";
+
+function migrationPool(existingRows = []) {
+  const queries = [];
+  const client = {
+    async query(sql, values) {
+      queries.push({ sql, values });
+      if (String(sql).includes("SELECT version, checksum")) return { rows: existingRows, rowCount: existingRows.length };
+      return { rows: [], rowCount: 0 };
+    },
+    release() { queries.push({ sql: "RELEASE" }); }
+  };
+  return { queries, pool: { async connect() { return client; } } };
+}
+
+test("migration runner applies additive migrations once inside a transaction", async () => {
+  const fake = migrationPool();
+  const result = await runMigrations(fake.pool);
+  assert.deepEqual(result.applied, PLATFORM_MIGRATIONS.map((migration) => migration.version));
+  assert.equal(result.currentVersion, PLATFORM_MIGRATIONS.at(-1).version);
+  assert.equal(fake.queries[0].sql, "BEGIN");
+  assert.ok(fake.queries.some(({ sql }) => String(sql).includes("CREATE TABLE IF NOT EXISTS platform_users")));
+  assert.equal(fake.queries.at(-2).sql, "COMMIT");
+  assert.equal(fake.queries.at(-1).sql, "RELEASE");
+});
+
+test("migration checksum drift rolls back without applying modified history", async () => {
+  const fake = migrationPool([{ version: PLATFORM_MIGRATIONS[0].version, checksum: "0".repeat(64) }]);
+  await assert.rejects(runMigrations(fake.pool), /checksum mismatch/i);
+  assert.ok(fake.queries.some(({ sql }) => sql === "ROLLBACK"));
+  assert.equal(fake.queries.at(-1).sql, "RELEASE");
+});

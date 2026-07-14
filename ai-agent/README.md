@@ -1,10 +1,10 @@
-# NVIDIA multichannel AI agent
+# Nvid AI
 
-One Node.js service powers a browser chat, Telegram bot, and WhatsApp Cloud API bot. Conversation history is kept in memory for this MVP and resets when the server restarts.
+Nvid AI is a Telegram-native NVIDIA AI service with a Telegram bot, authenticated Mini App, Telegram Stars billing, a PostgreSQL platform foundation, and an optional WhatsApp Cloud API channel.
 
 ## Run locally
 
-1. Install Node.js 20 or newer.
+1. Install Node.js 22.22.2.
 2. Copy `.env.example` to `.env` and add your NVIDIA API key.
 3. Run `npm start`.
 4. Open `http://localhost:3000`.
@@ -15,7 +15,21 @@ Never put API keys in browser code or commit `.env`.
 
 The browser can switch between the server-approved NVIDIA models returned by `/api/models`. Set `NVIDIA_MODEL` for the preferred default and optionally set `NVIDIA_MODELS` to an authoritative comma-separated allowlist. If the preferred default is not in that allowlist, the first allowed model becomes the default. The NVIDIA API key remains server-side, and model IDs submitted by the browser are rejected unless they are allowed.
 
-Browser answers stream token-by-token over a protected server-sent event connection. The **STOP** control cancels the active NVIDIA request; partial cancelled answers are shown but are not added to conversation memory.
+Browser answers stream token-by-token over a protected server-sent event connection. AI access requires a fresh Telegram Mini App launch followed by a short-lived signed session. The **STOP** control cancels the active NVIDIA request; failed generation restores any reserved AI credit.
+
+## Secure platform foundation
+
+Startup validates required environment configuration and runs additive, checksummed PostgreSQL migrations under an advisory lock. The platform foundation provides:
+
+- Telegram-session authentication and replay-resistant Mini App launches.
+- Platform roles and server-side permission checks.
+- Database-backed feature flags.
+- Transactional, idempotent administrative mutations.
+- Durable audit logs and security events.
+- Secret-redacted JSON logs.
+- `/health/live` liveness and `/health` or `/health/ready` dependency readiness.
+
+Administrator API routes are under `/api/admin/*`. They require a valid Telegram session, the appropriate platform permission, request rate limits, and same-origin checks for mutations. Configuration status endpoints return presence booleans only, never secret values.
 
 ## Deploy on Render
 
@@ -59,7 +73,9 @@ During Meta's test phase, add recipient numbers in the developer dashboard. Prod
 
 ## Production checklist
 
-- Replace in-memory history with Redis or a database.
-- Add user authentication and per-user rate limits to `/api/chat`.
+- Rotate any credential that has appeared in a message, screenshot, file, or Git history.
+- Keep `.env` untracked and set production secrets only in Render environment variables.
+- Keep PostgreSQL backups and verify migrations against production-like data before deployment.
+- Move remaining in-memory conversation history to durable conversation/message tables.
 - Add durable webhook jobs and centralized monitoring for higher traffic.
-- Deploy behind HTTPS and rotate any key that has ever been exposed.
+- Keep the Mini App and webhook behind HTTPS.

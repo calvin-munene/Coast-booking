@@ -7,6 +7,7 @@ import {
   selectModel,
   streamReply
 } from "./agent.js";
+import { logger } from "./logger.js";
 import { createStarLedger } from "./starLedger.js";
 import {
   MAX_STAR_TOPUP,
@@ -201,7 +202,7 @@ async function reconcileStaleTelegramCredits() {
   try {
     const restored = await telegramStarLedger.refundStaleReservations();
     if (Number(restored?.restoredCount || 0) > 0) {
-      console.log(`Restored ${restored.restoredCount} stale Telegram credit reservation(s)`);
+      logger.info("telegram.credit_reservations_restored", { restoredCount: restored.restoredCount });
     }
   } finally {
     telegramStarSweepInFlight = false;
@@ -212,7 +213,7 @@ function startTelegramStarReconciliation() {
   if (telegramStarSweepTimer) return;
   telegramStarSweepTimer = setInterval(() => {
     reconcileStaleTelegramCredits().catch((error) => {
-      console.error(`Telegram credit reconciliation failed: ${error.message}`);
+      logger.error("telegram.credit_reconciliation_failed", { error });
     });
   }, 60_000);
   telegramStarSweepTimer.unref?.();
@@ -523,7 +524,7 @@ async function sendTelegramWelcome(message) {
   try {
     await sendTelegramPhoto(message, telegramPublicAssetUrl(TELEGRAM_WELCOME_IMAGE_PATH), caption);
   } catch (error) {
-    console.error(`Telegram welcome image failed: ${error.message}`);
+    logger.error("telegram.welcome_image_failed", { error });
     await sendTelegramText(message, caption);
   }
 }
@@ -911,7 +912,7 @@ async function handleSuccessfulStarPayment(message) {
       "",
       "Send any non-command message to use 1 credit."
     ].join("\n")
-  ).catch((error) => console.error(`Telegram payment confirmation failed: ${error.message}`));
+  ).catch((error) => logger.error("telegram.payment_confirmation_failed", { error }));
 
   const adminId = telegramAdminUserId();
   if (adminId) {
@@ -923,7 +924,7 @@ async function handleSuccessfulStarPayment(message) {
         `Amount: ${purchase.amount} Stars`,
         `Payment ID: ${payment.telegram_payment_charge_id}`
       ].join("\n")
-    }).catch((error) => console.error(`Telegram admin payment notice failed: ${error.message}`));
+    }).catch((error) => logger.error("telegram.admin_payment_notice_failed", { error }));
   }
 }
 
@@ -950,7 +951,7 @@ async function handleRefundedStarPayment(message) {
     `Telegram refunded payment ${refund.telegram_payment_charge_id}.`,
     `Credits removed: ${result.deductedAmount}`,
     `Current balance: ${result.balance}`
-  ].join("\n")).catch((error) => console.error(`Telegram refund confirmation failed: ${error.message}`));
+  ].join("\n")).catch((error) => logger.error("telegram.refund_confirmation_failed", { error }));
 
   const adminId = telegramAdminUserId();
   if (adminId) {
@@ -963,7 +964,7 @@ async function handleRefundedStarPayment(message) {
         `Credits removed: ${result.deductedAmount}`,
         `Payment ID: ${refund.telegram_payment_charge_id}`
       ].join("\n")
-    }).catch((error) => console.error(`Telegram admin refund notice failed: ${error.message}`));
+    }).catch((error) => logger.error("telegram.admin_refund_notice_failed", { error }));
   }
 }
 
@@ -1175,7 +1176,7 @@ export async function handleTelegram(update) {
   const isAdminUser = telegramUserIsAdmin(message.from?.id);
   const userControl = telegramStarLedger && typeof telegramStarLedger.getUserControl === "function" && message.from?.id
     ? await telegramStarLedger.getUserControl(String(message.from.id)).catch((error) => {
-        console.error(`Telegram user control lookup failed: ${error.message}`);
+        logger.error("telegram.user_control_lookup_failed", { error, userId: message.from.id });
         return null;
       })
     : null;
@@ -1238,7 +1239,7 @@ export async function handleTelegram(update) {
       creditReserved = true;
     } catch (error) {
       telegramChatsInFlight.delete(chatKey);
-      console.error(`Telegram credit reservation failed: ${error.message}`);
+      logger.error("telegram.credit_reservation_failed", { error, reservationId });
       await sendTelegramText(message, "The credit ledger is temporarily unavailable, so you were not charged. Please try again later.");
       return;
     }
@@ -1308,7 +1309,7 @@ export async function handleTelegram(update) {
       } catch (error) {
         // A stale reservation is restored during startup reconciliation. The
         // user has already received the answer, so do not send a false failure.
-        console.error(`Telegram credit completion failed: ${error.message}`);
+        logger.error("telegram.credit_completion_failed", { error, reservationId });
       }
     }
   } catch {
@@ -1316,7 +1317,7 @@ export async function handleTelegram(update) {
       try {
         await requireStarLedger().restorePrompt(reservationId);
       } catch (error) {
-        console.error(`Telegram credit restoration failed: ${error.message}`);
+        logger.error("telegram.credit_restoration_failed", { error, reservationId });
       }
     }
     await sendTelegramText(message, "I could not complete that response. Please try again in a moment.");

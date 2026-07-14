@@ -11,6 +11,10 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22.22.2
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
       - key: NVIDIA_API_KEY
         sync: false
       - key: NVIDIA_MODEL

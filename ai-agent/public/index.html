@@ -3,15 +3,121 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NVIDIA AI Assistant</title>
+  <meta name="theme-color" content="#050806">
+  <meta name="description" content="NvidBot is a fast, NVIDIA-powered AI assistant for ideas, code, research, and problem solving.">
+  <meta property="og:title" content="NvidBot | NVIDIA-powered AI">
+  <meta property="og:description" content="Think like a hacker. Build like an engineer.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://nvidbot.onrender.com/">
+  <meta property="og:image" content="https://nvidbot.onrender.com/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>NvidBot | NVIDIA-powered AI</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main class="shell">
-    <header><span class="status"></span><div><h1>Your AI Assistant</h1><p>Powered by NVIDIA</p></div></header>
-    <section id="messages" aria-live="polite"><article class="bot">Hello! How can I help you today?</article></section>
-    <form id="chat-form"><label class="sr-only" for="message">Message</label><textarea id="message" rows="1" maxlength="8000" placeholder="Ask me anything…" required></textarea><button aria-label="Send">➜</button></form>
-  </main>
+  <a class="skip-link" href="#message">Skip to the chat</a>
+  <div class="matrix-grid" aria-hidden="true"></div>
+  <div class="scan-line" aria-hidden="true"></div>
+
+  <div class="site-frame">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="NvidBot home">
+        <span class="brand-mark" aria-hidden="true"><span>N</span></span>
+        <span class="brand-copy">
+          <strong>NVIDBOT</strong>
+          <small>NEURAL INTERFACE</small>
+        </span>
+      </a>
+
+      <div class="topbar-actions">
+        <span class="connection-pill"><i aria-hidden="true"></i>NVIDIA AI ONLINE</span>
+        <span class="topbar-code">TLS // SECURE</span>
+      </div>
+    </header>
+
+    <main class="main-grid">
+      <section class="intro-panel" aria-labelledby="hero-title">
+        <div>
+          <p class="eyebrow"><span>01</span> // NEXT-GEN INTELLIGENCE</p>
+          <h1 id="hero-title">Think like a <em>hacker.</em><br>Build like an <em>engineer.</em></h1>
+          <p class="hero-copy">NvidBot turns raw questions into clear answers, working code, sharper plans, and faster decisions.</p>
+        </div>
+
+        <div class="capability-list" aria-label="NvidBot capabilities">
+          <div class="capability">
+            <span class="capability-index">[A]</span>
+            <div><strong>Reason deeply</strong><small>Break down complex systems</small></div>
+          </div>
+          <div class="capability">
+            <span class="capability-index">[B]</span>
+            <div><strong>Build quickly</strong><small>Turn ideas into action</small></div>
+          </div>
+          <div class="capability">
+            <span class="capability-index">[C]</span>
+            <div><strong>Stay focused</strong><small>Signal over noise, always</small></div>
+          </div>
+        </div>
+
+        <dl class="system-metrics">
+          <div><dt>CORE</dt><dd>NVIDIA NIM</dd></div>
+          <div><dt>MODEL</dt><dd>LLAMA 3.1</dd></div>
+          <div><dt>STATE</dt><dd class="metric-live">READY</dd></div>
+        </dl>
+      </section>
+
+      <section class="chat-terminal" aria-labelledby="chat-title">
+        <header class="terminal-header">
+          <div>
+            <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <div>
+              <h2 id="chat-title">NVIDBOT // LIVE SESSION</h2>
+              <p>Secure neural channel established</p>
+            </div>
+          </div>
+          <span class="session-code">ID: <b id="session-id">--------</b></span>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite" aria-relevant="additions text">
+          <article class="message bot">
+            <span class="avatar" aria-hidden="true">AI</span>
+            <div class="bubble">
+              <span class="message-label">NVIDBOT // SYSTEM</span>
+              <p>Neural link established. What are we building today?</p>
+            </div>
+          </article>
+        </div>
+
+        <div id="suggestions" class="suggestions" aria-label="Suggested prompts">
+          <button type="button" data-prompt="Help me turn an idea into a practical step-by-step plan."><span>01</span> Plan a project</button>
+          <button type="button" data-prompt="Help me debug a difficult technical problem."><span>02</span> Debug a problem</button>
+          <button type="button" data-prompt="Explain a complex topic clearly, then give me an example."><span>03</span> Explain a system</button>
+        </div>
+
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="message">Message NvidBot</label>
+          <span class="prompt-prefix" aria-hidden="true">&gt;_</span>
+          <textarea id="message" rows="1" maxlength="8000" placeholder="Ask NvidBot anything..." autocomplete="off" required></textarea>
+          <span id="char-count" class="char-count" aria-hidden="true">0 / 8000</span>
+          <button class="send-button" type="submit" aria-label="Send message">
+            <span>RUN</span><i aria-hidden="true">↗</i>
+          </button>
+        </form>
+
+        <footer class="terminal-footer">
+          <span><i aria-hidden="true"></i><b id="network-status">NETWORK STABLE</b></span>
+          <span id="uptime">UPTIME 00:00:00</span>
+          <span>SHIFT + ENTER FOR NEW LINE</span>
+        </footer>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>© 2026 NVIDBOT</span>
+      <span>POWERED BY NVIDIA</span>
+      <span>BUILD // THINK // SHIP</span>
+    </footer>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

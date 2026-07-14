@@ -62,10 +62,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true });
     }
 
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/styles.css")) {
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/styles.css" || url.pathname === "/og.png")) {
       const name = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
-      const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
-      res.writeHead(200, { "content-type": `${types[path.extname(name)]}; charset=utf-8` });
+      const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png" };
+      res.writeHead(200, { "content-type": types[path.extname(name)] });
       return res.end(await fs.readFile(path.join(root, name)));
     }
     json(res, 404, { error: "Not found" });

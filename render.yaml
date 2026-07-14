@@ -4,7 +4,7 @@ services:
     runtime: node
     rootDir: ai-agent
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /health
     autoDeployTrigger: commit
@@ -23,6 +23,14 @@ services:
         sync: false
       - key: TELEGRAM_WEBHOOK_SECRET
         generateValue: true
+      - key: TELEGRAM_STAR_SIGNING_SECRET
+        generateValue: true
+      - key: TELEGRAM_ADMIN_USER_ID
+        sync: false
+      - key: TELEGRAM_STARS_REQUIRED
+        value: "true"
+      - key: DATABASE_URL
+        sync: false
       - key: TELEGRAM_ALLOWED_USER_IDS
         sync: false
       - key: PUBLIC_URL

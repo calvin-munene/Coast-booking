@@ -25,9 +25,15 @@ The repository includes a root-level `render.yaml` Blueprint. In Render, create 
 
 1. Create a bot using `@BotFather`, then place its token in the Render `TELEGRAM_BOT_TOKEN` secret.
 2. Set `PUBLIC_URL` to the deployed HTTPS origin and provide a random `TELEGRAM_WEBHOOK_SECRET`.
-3. Optionally set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram user IDs so only those people can spend the NVIDIA quota. Send `/whoami` to the bot to discover your numeric ID.
+3. Set `TELEGRAM_ADMIN_USER_ID` to the numeric user ID authorized to view bot Stars totals and receive purchase/support notices.
+4. To require prepaid messages, set `TELEGRAM_STARS_REQUIRED=true`, provide a random 32-byte-or-longer `TELEGRAM_STAR_SIGNING_SECRET`, and connect a durable PostgreSQL database with `DATABASE_URL`.
+5. Optionally set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram user IDs. Leave it empty when any paying Telegram user should be able to use the bot. Send `/whoami` to discover a numeric ID.
 
-At startup the service validates the token, publishes the bot command menu, registers the protected webhook, and verifies it with Telegram. Private chats receive animated native message drafts while NVIDIA generates the answer; the completed answer is then persisted as a normal reply. Group chats receive typing status followed by the final answer.
+At startup the service validates the token, initializes the Stars ledger, restores stale prompt reservations, publishes the bot command menu, registers the protected webhook, and verifies it with Telegram. Private chats receive animated native message drafts while NVIDIA generates the answer; the completed answer is then persisted as a normal reply. Group chats receive typing status followed by the final answer.
+
+With Stars charging enabled, `/topup N` presents the current terms and then opens a native Telegram invoice for exactly `N` XTR. A successful payment atomically adds `N` credits, and each accepted non-command prompt reserves one credit. Failed NVIDIA generation or final Telegram delivery restores the reservation. Payment charge IDs, terms acceptance, balances, prompt reservations, and refunds are stored transactionally and idempotently in PostgreSQL.
+
+Telegram invoice revenue belongs to the bot's Stars balance. `TELEGRAM_ADMIN_USER_ID` controls NvidBot's admin command and notifications; it does not redirect Stars to an arbitrary Telegram user. The Telegram account that owns the bot in BotFather controls the bot balance.
 
 Bot commands:
 
@@ -35,6 +41,11 @@ Bot commands:
 - `/models` lists server-approved NVIDIA models.
 - `/model 2` or `/model <model-id>` changes the model for that Telegram chat.
 - `/reset` clears that chat's in-memory AI context.
+- `/balance` shows the user's prepaid AI-message credits.
+- `/topup 25` buys any whole number of credits from 1 to 10,000 with Telegram Stars.
+- `/terms` shows the active purchase terms.
+- `/paysupport <message>` sends a payment issue to the configured administrator.
+- `/starbalance` shows the bot Stars balance and ledger totals to the configured administrator only.
 - `/whoami` shows the user and chat IDs used by the optional allowlist.
 
 ## WhatsApp Cloud API

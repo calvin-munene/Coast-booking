@@ -8,6 +8,8 @@ import {
   handleTelegram,
   handleWhatsApp,
   telegramPublicStatus,
+  telegramServiceReady,
+  telegramUpdateRequiresSynchronousAck,
   validMetaSignature
 } from "./channels.js";
 
@@ -132,10 +134,14 @@ async function streamWebChat(req, res, { sessionId, message, model }) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+export function createAppServer() {
+  return http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
-    if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true });
+    if (req.method === "GET" && url.pathname === "/health") {
+      const ok = telegramServiceReady();
+      return json(res, ok ? 200 : 503, { ok });
+    }
 
     if (req.method === "GET" && url.pathname === "/api/models") {
       return json(res, 200, { models: availableModels(), defaultModel: defaultModel() });
@@ -170,6 +176,10 @@ const server = http.createServer(async (req, res) => {
         return json(res, 401, { error: "Invalid webhook secret" });
       }
       const data = JSON.parse((await body(req)).toString("utf8"));
+      if (telegramUpdateRequiresSynchronousAck(data)) {
+        await handleTelegram(data);
+        return json(res, 200, { ok: true });
+      }
       handleTelegram(data).catch(console.error);
       return json(res, 200, { ok: true });
     }
@@ -212,9 +222,18 @@ const server = http.createServer(async (req, res) => {
         : "The assistant could not complete that request"
     });
   }
-});
+  });
+}
 
-server.listen(port, () => {
-  console.log(`AI agent running at http://localhost:${port}`);
-  configureTelegramBot().catch((error) => console.error(`Telegram setup failed: ${error.message}`));
-});
+export function startAppServer(listenPort = port) {
+  const server = createAppServer();
+  server.listen(listenPort, () => {
+    console.log(`AI agent running at http://localhost:${listenPort}`);
+    configureTelegramBot().catch((error) => console.error(`Telegram setup failed: ${error.message}`));
+  });
+  return server;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startAppServer();
+}

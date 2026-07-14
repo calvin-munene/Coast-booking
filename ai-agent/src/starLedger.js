@@ -1,0 +1,864 @@
+import { randomUUID } from 'node:crypto';
+
+const MAX_INT64 = 9_223_372_036_854_775_807n;
+const MAX_STAR_AMOUNT = 10_000;
+const DEFAULT_RESERVATION_TTL_MS = 10 * 60 * 1000;
+
+const SCHEMA_SQL = `
+/* star-ledger:schema */
+CREATE TABLE IF NOT EXISTS telegram_star_accounts (
+  user_id BIGINT PRIMARY KEY,
+  balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS telegram_star_payments (
+  telegram_payment_charge_id TEXT PRIMARY KEY,
+  provider_payment_charge_id TEXT,
+  user_id BIGINT NOT NULL REFERENCES telegram_star_accounts(user_id),
+  amount INTEGER NOT NULL CHECK (amount BETWEEN 1 AND 10000),
+  currency TEXT NOT NULL CHECK (currency = 'XTR'),
+  invoice_payload TEXT,
+  credited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  refunded_at TIMESTAMPTZ,
+  refunded_amount INTEGER CHECK (refunded_amount BETWEEN 1 AND 10000)
+);
+
+ALTER TABLE telegram_star_payments
+  ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ;
+ALTER TABLE telegram_star_payments
+  ADD COLUMN IF NOT EXISTS refunded_amount INTEGER
+    CHECK (refunded_amount BETWEEN 1 AND 10000);
+
+CREATE INDEX IF NOT EXISTS telegram_star_payments_user_id_idx
+  ON telegram_star_payments(user_id, credited_at DESC);
+
+CREATE TABLE IF NOT EXISTS telegram_star_terms_acceptances (
+  user_id BIGINT NOT NULL REFERENCES telegram_star_accounts(user_id),
+  terms_version TEXT NOT NULL,
+  accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, terms_version)
+);
+
+CREATE TABLE IF NOT EXISTS telegram_star_prompt_reservations (
+  reservation_id TEXT PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES telegram_star_accounts(user_id),
+  cost INTEGER NOT NULL CHECK (cost BETWEEN 1 AND 10000),
+  status TEXT NOT NULL DEFAULT 'reserved'
+    CHECK (status IN ('reserved', 'completed', 'restored')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  restored_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS telegram_star_prompt_reservations_stale_idx
+  ON telegram_star_prompt_reservations(created_at)
+  WHERE status = 'reserved';
+`;
+
+export class StarLedgerValidationError extends TypeError {
+  constructor(message) {
+    super(message);
+    this.name = 'StarLedgerValidationError';
+  }
+}
+
+export class StarLedgerConflictError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'StarLedgerConflictError';
+  }
+}
+
+export function normalizeTelegramUserId(value) {
+  let normalized;
+
+  if (typeof value === 'bigint') {
+    normalized = value;
+  } else if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value)) {
+      throw new StarLedgerValidationError('userId must be a safe integer, bigint, or decimal string');
+    }
+    normalized = BigInt(value);
+  } else if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) {
+    normalized = BigInt(value);
+  } else {
+    throw new StarLedgerValidationError('userId must be a positive integer');
+  }
+
+  if (normalized <= 0n || normalized > MAX_INT64) {
+    throw new StarLedgerValidationError('userId is outside the PostgreSQL BIGINT range');
+  }
+
+  return normalized.toString();
+}
+
+export function normalizeStarAmount(value, fieldName = 'amount') {
+  let normalized;
+
+  if (typeof value === 'bigint') {
+    if (value < 1n || value > BigInt(MAX_STAR_AMOUNT)) {
+      throw new StarLedgerValidationError(`${fieldName} must be between 1 and ${MAX_STAR_AMOUNT}`);
+    }
+    normalized = Number(value);
+  } else if (typeof value === 'string' && /^\d+$/.test(value)) {
+    const parsed = BigInt(value);
+    if (parsed < 1n || parsed > BigInt(MAX_STAR_AMOUNT)) {
+      throw new StarLedgerValidationError(`${fieldName} must be between 1 and ${MAX_STAR_AMOUNT}`);
+    }
+    normalized = Number(parsed);
+  } else if (typeof value === 'number' && Number.isInteger(value)) {
+    normalized = value;
+  } else {
+    throw new StarLedgerValidationError(`${fieldName} must be an integer between 1 and ${MAX_STAR_AMOUNT}`);
+  }
+
+  if (normalized < 1 || normalized > MAX_STAR_AMOUNT) {
+    throw new StarLedgerValidationError(`${fieldName} must be between 1 and ${MAX_STAR_AMOUNT}`);
+  }
+
+  return normalized;
+}
+
+function normalizeNonEmptyString(value, fieldName, maxLength = 256) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
+    throw new StarLedgerValidationError(`${fieldName} must be a non-empty string of at most ${maxLength} characters`);
+  }
+  return value;
+}
+
+function normalizeOptionalString(value, fieldName, maxLength) {
+  if (value === undefined || value === null || value === '') return null;
+  return normalizeNonEmptyString(value, fieldName, maxLength);
+}
+
+function normalizeDbInt(value, fieldName = 'database integer') {
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+  if (typeof value === 'string' && /^-?\d+$/.test(value)) return BigInt(value).toString();
+  throw new Error(`Invalid ${fieldName} returned by PostgreSQL`);
+}
+
+function normalizeDateFromClock(now) {
+  const value = now();
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('now() returned an invalid date');
+  return date;
+}
+
+function assertPositiveInteger(value, fieldName, maximum = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new StarLedgerValidationError(`${fieldName} must be an integer between 1 and ${maximum}`);
+  }
+  return value;
+}
+
+export function createStarLedger({
+  pool: injectedPool,
+  connectionString = process.env.DATABASE_URL,
+  reservationTtlMs = DEFAULT_RESERVATION_TTL_MS,
+  now = () => new Date(),
+} = {}) {
+  assertPositiveInteger(reservationTtlMs, 'reservationTtlMs');
+  if (typeof now !== 'function') throw new StarLedgerValidationError('now must be a function');
+
+  let pool = injectedPool ?? null;
+  let ownsPool = false;
+  let poolPromise = null;
+  let schemaPromise = null;
+  let closed = false;
+
+  async function resolvePool() {
+    if (closed) throw new Error('Star ledger is closed');
+    if (pool) return pool;
+    if (poolPromise) return poolPromise;
+    if (!connectionString) {
+      throw new Error('DATABASE_URL is required for the Telegram Stars ledger');
+    }
+
+    poolPromise = import('pg')
+      .then(({ Pool }) => {
+        pool = new Pool({ connectionString });
+        ownsPool = true;
+        return pool;
+      })
+      .catch((error) => {
+        poolPromise = null;
+        throw error;
+      });
+    return poolPromise;
+  }
+
+  async function init() {
+    if (schemaPromise) return schemaPromise;
+    schemaPromise = resolvePool()
+      .then((resolvedPool) => resolvedPool.query(SCHEMA_SQL))
+      .then(() => undefined)
+      .catch((error) => {
+        schemaPromise = null;
+        throw error;
+      });
+    return schemaPromise;
+  }
+
+  async function transaction(work) {
+    await init();
+    const resolvedPool = await resolvePool();
+    const client = await resolvedPool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await work(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // Preserve the original transaction error.
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function ensureAccount(client, userId) {
+    await client.query(
+      `/* star-ledger:ensure-account */
+       INSERT INTO telegram_star_accounts (user_id)
+       VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
+  }
+
+  async function lockPaymentCharge(client, telegramPaymentChargeId) {
+    await client.query(
+      `/* star-ledger:lock-payment-charge */
+       SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+      [telegramPaymentChargeId],
+    );
+  }
+
+  async function creditPayment({
+    userId: rawUserId,
+    amount: rawAmount,
+    telegramPaymentChargeId: rawChargeId,
+    providerPaymentChargeId,
+    invoicePayload,
+    currency = 'XTR',
+  } = {}) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const amount = normalizeStarAmount(rawAmount);
+    const telegramPaymentChargeId = normalizeNonEmptyString(
+      rawChargeId,
+      'telegramPaymentChargeId',
+      256,
+    );
+    const normalizedProviderChargeId = normalizeOptionalString(
+      providerPaymentChargeId,
+      'providerPaymentChargeId',
+      256,
+    );
+    const normalizedInvoicePayload = normalizeOptionalString(invoicePayload, 'invoicePayload', 128);
+    if (currency !== 'XTR') {
+      throw new StarLedgerValidationError('currency must be XTR');
+    }
+
+    return transaction(async (client) => {
+      await lockPaymentCharge(client, telegramPaymentChargeId);
+      await ensureAccount(client, userId);
+      const inserted = await client.query(
+        `/* star-ledger:insert-payment */
+         INSERT INTO telegram_star_payments (
+           telegram_payment_charge_id,
+           provider_payment_charge_id,
+           user_id,
+           amount,
+           currency,
+           invoice_payload
+         ) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (telegram_payment_charge_id) DO NOTHING
+         RETURNING telegram_payment_charge_id`,
+        [
+          telegramPaymentChargeId,
+          normalizedProviderChargeId,
+          userId,
+          amount,
+          currency,
+          normalizedInvoicePayload,
+        ],
+      );
+
+      let credited = inserted.rowCount === 1;
+      let refunded = false;
+      if (credited) {
+        await client.query(
+          `/* star-ledger:credit-account */
+           UPDATE telegram_star_accounts
+           SET balance = balance + $2, updated_at = NOW()
+           WHERE user_id = $1`,
+          [userId, amount],
+        );
+      } else {
+        const existing = await client.query(
+          `/* star-ledger:get-payment */
+           SELECT user_id::text, amount, currency, refunded_at
+           FROM telegram_star_payments
+           WHERE telegram_payment_charge_id = $1`,
+          [telegramPaymentChargeId],
+        );
+        const payment = existing.rows[0];
+        if (
+          !payment ||
+          normalizeDbInt(payment.user_id, 'payment user_id') !== userId ||
+          Number(payment.amount) !== amount ||
+          payment.currency !== currency
+        ) {
+          throw new StarLedgerConflictError(
+            'telegramPaymentChargeId is already associated with a different payment',
+          );
+        }
+        credited = false;
+        refunded = Boolean(payment.refunded_at);
+      }
+
+      const balanceResult = await client.query(
+        `/* star-ledger:get-balance-client */
+         SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
+        [userId],
+      );
+
+      return {
+        credited,
+        refunded,
+        userId,
+        amount,
+        telegramPaymentChargeId,
+        balance: normalizeDbInt(balanceResult.rows[0]?.balance ?? '0', 'balance'),
+      };
+    });
+  }
+
+  async function recordRefund({
+    telegramPaymentChargeId: rawChargeId,
+    userId: rawUserId,
+    amount: rawAmount,
+  } = {}) {
+    const telegramPaymentChargeId = normalizeNonEmptyString(
+      rawChargeId,
+      'telegramPaymentChargeId',
+      256,
+    );
+    const expectedUserId = rawUserId === undefined || rawUserId === null
+      ? null
+      : normalizeTelegramUserId(rawUserId);
+    const expectedAmount = rawAmount === undefined || rawAmount === null
+      ? null
+      : normalizeStarAmount(rawAmount);
+
+    return transaction(async (client) => {
+      await lockPaymentCharge(client, telegramPaymentChargeId);
+      const paymentResult = await client.query(
+        `/* star-ledger:get-payment-for-refund */
+         SELECT
+           telegram_payment_charge_id,
+           user_id::text,
+           amount,
+           currency,
+           invoice_payload,
+           credited_at,
+           refunded_at,
+           refunded_amount
+         FROM telegram_star_payments
+         WHERE telegram_payment_charge_id = $1
+         FOR UPDATE`,
+        [telegramPaymentChargeId],
+      );
+      const row = paymentResult.rows[0];
+      if (!row) {
+        if (expectedUserId === null || expectedAmount === null) {
+          throw new StarLedgerConflictError(
+            'an unknown refund requires the original payment userId and amount',
+          );
+        }
+        await ensureAccount(client, expectedUserId);
+        const inserted = await client.query(
+          `/* star-ledger:insert-refunded-payment */
+           INSERT INTO telegram_star_payments (
+             telegram_payment_charge_id,
+             user_id,
+             amount,
+             currency,
+             refunded_at,
+             refunded_amount
+           ) VALUES ($1, $2, $3, 'XTR', NOW(), $3)
+           RETURNING credited_at, refunded_at, refunded_amount`,
+          [telegramPaymentChargeId, expectedUserId, expectedAmount],
+        );
+        const balanceResult = await client.query(
+          `/* star-ledger:get-balance-client */
+           SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
+          [expectedUserId],
+        );
+        return {
+          changed: true,
+          pendingPayment: true,
+          balance: normalizeDbInt(balanceResult.rows[0]?.balance ?? '0', 'balance'),
+          deductedAmount: '0',
+          payment: {
+            telegramPaymentChargeId,
+            userId: expectedUserId,
+            amount: expectedAmount,
+            currency: 'XTR',
+            invoicePayload: null,
+            creditedAt: inserted.rows[0].credited_at,
+            refundedAt: inserted.rows[0].refunded_at,
+            refundedAmount: Number(inserted.rows[0].refunded_amount),
+          },
+        };
+      }
+
+      const userId = normalizeDbInt(row.user_id, 'payment user_id');
+      const amount = normalizeStarAmount(row.amount);
+      if (expectedUserId !== null && expectedUserId !== userId) {
+        throw new StarLedgerConflictError('refund userId does not match the credited payment');
+      }
+      if (expectedAmount !== null && expectedAmount !== amount) {
+        throw new StarLedgerConflictError('refund amount does not match the credited payment');
+      }
+
+      const accountResult = await client.query(
+        `/* star-ledger:get-account-for-refund */
+         SELECT balance::text
+         FROM telegram_star_accounts
+         WHERE user_id = $1
+         FOR UPDATE`,
+        [userId],
+      );
+      const currentBalance = BigInt(
+        normalizeDbInt(accountResult.rows[0]?.balance ?? '0', 'balance'),
+      );
+      const payment = {
+        telegramPaymentChargeId,
+        userId,
+        amount,
+        currency: row.currency,
+        invoicePayload: row.invoice_payload ?? null,
+        creditedAt: row.credited_at,
+        refundedAt: row.refunded_at ?? null,
+        refundedAmount: row.refunded_amount === null || row.refunded_amount === undefined
+          ? null
+          : Number(row.refunded_amount),
+      };
+
+      if (row.refunded_at) {
+        return {
+          changed: false,
+          balance: currentBalance.toString(),
+          deductedAmount: '0',
+          payment,
+        };
+      }
+
+      const deductedAmount = currentBalance < BigInt(amount) ? currentBalance : BigInt(amount);
+      const updatedBalance = currentBalance - deductedAmount;
+      await client.query(
+        `/* star-ledger:deduct-refund */
+         UPDATE telegram_star_accounts
+         SET balance = $2::bigint, updated_at = NOW()
+         WHERE user_id = $1`,
+        [userId, updatedBalance.toString()],
+      );
+      const marked = await client.query(
+        `/* star-ledger:mark-payment-refunded */
+         UPDATE telegram_star_payments
+         SET refunded_at = NOW(), refunded_amount = $2
+         WHERE telegram_payment_charge_id = $1
+         RETURNING refunded_at, refunded_amount`,
+        [telegramPaymentChargeId, amount],
+      );
+
+      return {
+        changed: true,
+        balance: updatedBalance.toString(),
+        deductedAmount: deductedAmount.toString(),
+        payment: {
+          ...payment,
+          refundedAt: marked.rows[0].refunded_at,
+          refundedAmount: Number(marked.rows[0].refunded_amount),
+        },
+      };
+    });
+  }
+
+  async function getBalance(rawUserId) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:get-balance */
+       SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
+      [userId],
+    );
+    return {
+      userId,
+      balance: normalizeDbInt(result.rows[0]?.balance ?? '0', 'balance'),
+    };
+  }
+
+  async function acceptTerms(rawUserId, rawVersion = 'v1') {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const version = normalizeNonEmptyString(rawVersion, 'terms version', 64);
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const result = await client.query(
+        `/* star-ledger:accept-terms */
+         INSERT INTO telegram_star_terms_acceptances (user_id, terms_version)
+         VALUES ($1, $2)
+         ON CONFLICT (user_id, terms_version)
+         DO UPDATE SET accepted_at = telegram_star_terms_acceptances.accepted_at
+         RETURNING accepted_at`,
+        [userId, version],
+      );
+      return {
+        userId,
+        version,
+        acceptedAt: result.rows[0].accepted_at,
+      };
+    });
+  }
+
+  async function hasAcceptedTerms(rawUserId, rawVersion = 'v1') {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const version = normalizeNonEmptyString(rawVersion, 'terms version', 64);
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:has-accepted-terms */
+       SELECT 1
+       FROM telegram_star_terms_acceptances
+       WHERE user_id = $1 AND terms_version = $2`,
+      [userId, version],
+    );
+    return result.rowCount > 0;
+  }
+
+  async function reservePrompt(rawUserId, { cost: rawCost = 1, reservationId: rawId } = {}) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const cost = normalizeStarAmount(rawCost, 'cost');
+    const reservationId = rawId === undefined
+      ? randomUUID()
+      : normalizeNonEmptyString(rawId, 'reservationId', 128);
+
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const inserted = await client.query(
+        `/* star-ledger:insert-reservation */
+         INSERT INTO telegram_star_prompt_reservations (reservation_id, user_id, cost)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (reservation_id) DO NOTHING
+         RETURNING reservation_id`,
+        [reservationId, userId, cost],
+      );
+
+      if (inserted.rowCount === 0) {
+        const existingResult = await client.query(
+          `/* star-ledger:get-reservation-client */
+           SELECT user_id::text, cost, status
+           FROM telegram_star_prompt_reservations
+           WHERE reservation_id = $1
+           FOR UPDATE`,
+          [reservationId],
+        );
+        const existing = existingResult.rows[0];
+        if (
+          !existing ||
+          normalizeDbInt(existing.user_id, 'reservation user_id') !== userId ||
+          Number(existing.cost) !== cost
+        ) {
+          throw new StarLedgerConflictError(
+            'reservationId is already associated with a different reservation',
+          );
+        }
+        const balanceResult = await client.query(
+          `/* star-ledger:get-balance-client */
+           SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
+          [userId],
+        );
+        return {
+          reserved: false,
+          changed: false,
+          reservationId,
+          userId,
+          cost,
+          state: existing.status,
+          balance: normalizeDbInt(balanceResult.rows[0]?.balance ?? '0', 'balance'),
+        };
+      }
+
+      const debit = await client.query(
+        `/* star-ledger:debit-account */
+         UPDATE telegram_star_accounts
+         SET balance = balance - $2, updated_at = NOW()
+         WHERE user_id = $1 AND balance >= $2
+         RETURNING balance::text`,
+        [userId, cost],
+      );
+      if (debit.rowCount === 0) {
+        await client.query(
+          `/* star-ledger:delete-reservation */
+           DELETE FROM telegram_star_prompt_reservations WHERE reservation_id = $1`,
+          [reservationId],
+        );
+        const balanceResult = await client.query(
+          `/* star-ledger:get-balance-client */
+           SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
+          [userId],
+        );
+        return {
+          reserved: false,
+          changed: false,
+          reservationId: null,
+          userId,
+          cost,
+          state: null,
+          balance: normalizeDbInt(balanceResult.rows[0]?.balance ?? '0', 'balance'),
+        };
+      }
+
+      return {
+        reserved: true,
+        changed: true,
+        reservationId,
+        userId,
+        cost,
+        state: 'reserved',
+        balance: normalizeDbInt(debit.rows[0].balance, 'balance'),
+      };
+    });
+  }
+
+  async function completePrompt(rawReservationId) {
+    const reservationId = normalizeNonEmptyString(rawReservationId, 'reservationId', 128);
+    await init();
+    const resolvedPool = await resolvePool();
+    const updated = await resolvedPool.query(
+      `/* star-ledger:complete-reservation */
+       UPDATE telegram_star_prompt_reservations
+       SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+       WHERE reservation_id = $1 AND status = 'reserved'
+       RETURNING user_id::text, cost, status`,
+      [reservationId],
+    );
+    if (updated.rowCount === 1) {
+      const row = updated.rows[0];
+      return {
+        completed: true,
+        changed: true,
+        reservationId,
+        userId: normalizeDbInt(row.user_id, 'reservation user_id'),
+        cost: Number(row.cost),
+        state: row.status,
+      };
+    }
+
+    const existing = await resolvedPool.query(
+      `/* star-ledger:get-reservation */
+       SELECT user_id::text, cost, status
+       FROM telegram_star_prompt_reservations
+       WHERE reservation_id = $1`,
+      [reservationId],
+    );
+    const row = existing.rows[0];
+    return {
+      completed: row?.status === 'completed',
+      changed: false,
+      reservationId,
+      userId: row ? normalizeDbInt(row.user_id, 'reservation user_id') : null,
+      cost: row ? Number(row.cost) : null,
+      state: row?.status ?? null,
+    };
+  }
+
+  async function restorePrompt(rawReservationId) {
+    const reservationId = normalizeNonEmptyString(rawReservationId, 'reservationId', 128);
+    return transaction(async (client) => {
+      const existingResult = await client.query(
+        `/* star-ledger:get-reservation-client */
+         SELECT user_id::text, cost, status
+         FROM telegram_star_prompt_reservations
+         WHERE reservation_id = $1
+         FOR UPDATE`,
+        [reservationId],
+      );
+      const row = existingResult.rows[0];
+      if (!row) {
+        return {
+          restored: false,
+          changed: false,
+          reservationId,
+          userId: null,
+          cost: null,
+          state: null,
+          balance: null,
+        };
+      }
+
+      const userId = normalizeDbInt(row.user_id, 'reservation user_id');
+      const cost = Number(row.cost);
+      if (row.status !== 'reserved') {
+        const balanceResult = await client.query(
+          `/* star-ledger:get-balance-client */
+           SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
+          [userId],
+        );
+        return {
+          restored: row.status === 'restored',
+          changed: false,
+          reservationId,
+          userId,
+          cost,
+          state: row.status,
+          balance: normalizeDbInt(balanceResult.rows[0]?.balance ?? '0', 'balance'),
+        };
+      }
+
+      await client.query(
+        `/* star-ledger:restore-reservation */
+         UPDATE telegram_star_prompt_reservations
+         SET status = 'restored', restored_at = NOW(), updated_at = NOW()
+         WHERE reservation_id = $1 AND status = 'reserved'`,
+        [reservationId],
+      );
+      const balanceResult = await client.query(
+        `/* star-ledger:refund-account */
+         UPDATE telegram_star_accounts
+         SET balance = balance + $2, updated_at = NOW()
+         WHERE user_id = $1
+         RETURNING balance::text`,
+        [userId, cost],
+      );
+      return {
+        restored: true,
+        changed: true,
+        reservationId,
+        userId,
+        cost,
+        state: 'restored',
+        balance: normalizeDbInt(balanceResult.rows[0].balance, 'balance'),
+      };
+    });
+  }
+
+  async function refundStaleReservations({ olderThanMs = reservationTtlMs, limit = 100 } = {}) {
+    assertPositiveInteger(olderThanMs, 'olderThanMs');
+    assertPositiveInteger(limit, 'limit', 1_000);
+    const cutoff = new Date(normalizeDateFromClock(now).getTime() - olderThanMs);
+
+    return transaction(async (client) => {
+      const restored = await client.query(
+        `/* star-ledger:restore-stale */
+         WITH stale AS (
+           SELECT reservation_id
+           FROM telegram_star_prompt_reservations
+           WHERE status = 'reserved' AND created_at < $1
+           ORDER BY created_at
+           LIMIT $2
+           FOR UPDATE SKIP LOCKED
+         )
+         UPDATE telegram_star_prompt_reservations AS reservations
+         SET status = 'restored', restored_at = NOW(), updated_at = NOW()
+         FROM stale
+         WHERE reservations.reservation_id = stale.reservation_id
+           AND reservations.status = 'reserved'
+         RETURNING reservations.user_id::text, reservations.cost`,
+        [cutoff, limit],
+      );
+
+      const refunds = new Map();
+      let refundedAmount = 0n;
+      for (const row of restored.rows) {
+        const userId = normalizeDbInt(row.user_id, 'reservation user_id');
+        const cost = BigInt(normalizeStarAmount(row.cost, 'reservation cost'));
+        refunds.set(userId, (refunds.get(userId) ?? 0n) + cost);
+        refundedAmount += cost;
+      }
+
+      for (const [userId, amount] of refunds) {
+        await client.query(
+          `/* star-ledger:refund-stale-account */
+           UPDATE telegram_star_accounts
+           SET balance = balance + $2::bigint, updated_at = NOW()
+           WHERE user_id = $1`,
+          [userId, amount.toString()],
+        );
+      }
+
+      return {
+        restoredCount: restored.rowCount,
+        refundedAmount: refundedAmount.toString(),
+      };
+    });
+  }
+
+  async function getStats() {
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(`
+      /* star-ledger:get-stats */
+      SELECT
+        (SELECT COUNT(*)::text FROM telegram_star_accounts) AS total_users,
+        (SELECT COALESCE(SUM(balance), 0)::text FROM telegram_star_accounts) AS total_balance,
+        (SELECT COUNT(*)::text FROM telegram_star_payments) AS payment_count,
+        (SELECT COALESCE(SUM(amount), 0)::text FROM telegram_star_payments) AS total_stars_purchased,
+        (SELECT COUNT(*)::text FROM telegram_star_terms_acceptances) AS terms_acceptance_count,
+        (SELECT COUNT(*)::text FROM telegram_star_prompt_reservations WHERE status = 'reserved') AS reserved_prompts,
+        (SELECT COUNT(*)::text FROM telegram_star_prompt_reservations WHERE status = 'completed') AS completed_prompts,
+        (SELECT COUNT(*)::text FROM telegram_star_prompt_reservations WHERE status = 'restored') AS restored_prompts,
+        (SELECT COALESCE(SUM(cost), 0)::text FROM telegram_star_prompt_reservations WHERE status = 'completed') AS total_stars_spent
+    `);
+    const row = result.rows[0];
+    return {
+      totalUsers: normalizeDbInt(row.total_users, 'total_users'),
+      totalBalance: normalizeDbInt(row.total_balance, 'total_balance'),
+      paymentCount: normalizeDbInt(row.payment_count, 'payment_count'),
+      totalStarsPurchased: normalizeDbInt(row.total_stars_purchased, 'total_stars_purchased'),
+      termsAcceptanceCount: normalizeDbInt(row.terms_acceptance_count, 'terms_acceptance_count'),
+      reservedPrompts: normalizeDbInt(row.reserved_prompts, 'reserved_prompts'),
+      completedPrompts: normalizeDbInt(row.completed_prompts, 'completed_prompts'),
+      restoredPrompts: normalizeDbInt(row.restored_prompts, 'restored_prompts'),
+      totalStarsSpent: normalizeDbInt(row.total_stars_spent, 'total_stars_spent'),
+    };
+  }
+
+  async function close() {
+    if (closed) return;
+    closed = true;
+    if (poolPromise) {
+      try {
+        await poolPromise;
+      } catch {
+        return;
+      }
+    }
+    if (ownsPool && pool?.end) await pool.end();
+  }
+
+  return {
+    init,
+    creditPayment,
+    recordRefund,
+    getBalance,
+    acceptTerms,
+    hasAcceptedTerms,
+    reservePrompt,
+    completePrompt,
+    restorePrompt,
+    refundStaleReservations,
+    getStats,
+    close,
+  };
+}

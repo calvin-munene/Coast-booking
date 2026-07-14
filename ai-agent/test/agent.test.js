@@ -25,10 +25,10 @@ test("supports an administrator-configured model allowlist", () => {
   const previousModel = process.env.NVIDIA_MODEL;
   const previousModels = process.env.NVIDIA_MODELS;
   process.env.NVIDIA_MODEL = "meta/llama-3.3-70b-instruct";
-  process.env.NVIDIA_MODELS = "openai/gpt-oss-120b";
+  process.env.NVIDIA_MODELS = "nvidia/llama-3.3-nemotron-super-49b-v1.5";
 
-  assert.deepEqual(availableModels().map(({ id }) => id), ["openai/gpt-oss-120b"]);
-  assert.equal(defaultModel(), "openai/gpt-oss-120b");
+  assert.deepEqual(availableModels().map(({ id }) => id), ["nvidia/llama-3.3-nemotron-super-49b-v1.5"]);
+  assert.equal(defaultModel(), "nvidia/llama-3.3-nemotron-super-49b-v1.5");
   assert.throws(() => selectModel("meta/llama-3.3-70b-instruct"), /not available/);
 
   if (previousModel === undefined) delete process.env.NVIDIA_MODEL;
@@ -57,12 +57,12 @@ test("sends the selected approved model to NVIDIA", async () => {
   const answer = await reply({
     conversationId: "test-model-selection",
     text: "hello",
-    model: "openai/gpt-oss-120b"
+    model: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
   });
 
   assert.equal(answer, "selected model works");
-  assert.equal(requestBody.model, "openai/gpt-oss-120b");
-  assert.equal(requestBody.temperature, 1);
+  assert.equal(requestBody.model, "nvidia/llama-3.3-nemotron-super-49b-v1.5");
+  assert.equal(requestBody.temperature, 0.6);
 
   globalThis.fetch = previousFetch;
   if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;

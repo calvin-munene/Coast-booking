@@ -12,12 +12,12 @@ const MODEL_DEFINITIONS = [
     maxTokens: 1024
   },
   {
-    id: "openai/gpt-oss-120b",
-    label: "GPT-OSS 120B",
+    id: "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    label: "Nemotron Super 49B",
     tag: "REASONING",
-    description: "Deep reasoning for complex questions",
-    temperature: 1,
-    topP: 1,
+    description: "NVIDIA reasoning model for complex questions and planning",
+    temperature: 0.6,
+    topP: 0.95,
     maxTokens: 1024
   },
   {

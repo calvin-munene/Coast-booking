@@ -42,7 +42,7 @@ function consumeChatBudget(req, model) {
   const client = chatClient(req);
   const current = chatRateLimits.get(client);
   const bucket = !current || current.resetAt <= now ? { used: 0, resetAt: now + RATE_WINDOW_MS } : current;
-  const cost = model === "openai/gpt-oss-120b" ? 3 : 1;
+  const cost = model === "nvidia/llama-3.3-nemotron-super-49b-v1.5" ? 2 : 1;
   if (bucket.used + cost > RATE_BUDGET) return false;
   bucket.used += cost;
   chatRateLimits.set(client, bucket);

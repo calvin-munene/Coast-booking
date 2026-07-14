@@ -2,80 +2,40 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NvidBot Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#070b09">
+  <title>Nvid AI OS</title>
   <link rel="stylesheet" href="/miniapp.css">
 </head>
 <body>
-  <main class="shell">
-    <section class="hero">
-      <img class="avatar" src="/telegram/profile-picture.png" alt="NvidBot">
-      <div>
-        <p class="eyebrow">NVIDIA AI OPERATIONS</p>
-        <h1>NvidBot Control</h1>
-      </div>
-    </section>
+  <canvas id="matrix-canvas" aria-hidden="true"></canvas>
+  <div id="offline-banner" class="offline-banner" role="status" hidden>Connection lost. Nvid AI will reconnect automatically.</div>
+  <div class="app-shell">
+    <header class="topbar">
+      <button id="back-button" class="icon-button" type="button" aria-label="Go back" hidden>‹</button>
+      <a class="brand" href="/home" data-route="/home" aria-label="Nvid AI home">
+        <img src="/telegram/profile-picture.png" alt="">
+        <span><small>NVIDIA INTELLIGENCE</small><strong>Nvid AI</strong></span>
+      </a>
+      <span id="connection-state" class="connection-state"><i></i>SECURE</span>
+    </header>
 
-    <section class="status-grid">
-      <article class="stat">
-        <span>Role</span>
-        <strong id="role">Loading</strong>
-      </article>
-      <article class="stat">
-        <span>Credits</span>
-        <strong id="credits">...</strong>
-      </article>
-      <article class="stat">
-        <span>Access</span>
-        <strong id="access">Checking</strong>
-      </article>
-    </section>
+    <main id="app" class="page" tabindex="-1" aria-live="polite">
+      <section class="loading-state">
+        <span class="loader"></span>
+        <p>Authenticating secure Telegram session…</p>
+      </section>
+    </main>
 
-    <section class="panel">
-      <div class="section-title">
-        <h2>Modes</h2>
-        <span>Admin controls run in Telegram</span>
-      </div>
-      <div id="modes" class="mode-list"></div>
-    </section>
-
-    <section class="panel">
-      <div class="section-title">
-        <h2>Personal AI Style</h2>
-        <span>Use /persona in chat</span>
-      </div>
-      <p id="persona" class="copy">Loading your customization.</p>
-    </section>
-
-    <section id="admin-panel" class="panel hidden">
-      <div class="section-title">
-        <h2>Admin Console</h2>
-        <span>Full control</span>
-      </div>
-      <div class="admin-grid">
-        <article>
-          <span>Total users</span>
-          <strong id="total-users">0</strong>
-        </article>
-        <article>
-          <span>Credits in wallets</span>
-          <strong id="total-balance">0</strong>
-        </article>
-        <article>
-          <span>Paid prompts</span>
-          <strong id="paid-prompts">0</strong>
-        </article>
-      </div>
-      <p class="copy">
-        Admin commands: /mode &lt;mode&gt; on|off, /ban &lt;user-id&gt; reason, /unban &lt;user-id&gt;, /starbalance.
-      </p>
-    </section>
-
-    <section class="actions">
-      <button id="open-bot" type="button">Open Bot</button>
-      <button id="close-app" type="button">Close</button>
-    </section>
-  </main>
+    <nav id="bottom-nav" class="bottom-nav" aria-label="Main navigation">
+      <a href="/home" data-route="/home"><span>⌂</span>Home</a>
+      <a href="/chat" data-route="/chat"><span>⌁</span>Chat</a>
+      <a href="/models" data-route="/models"><span>◈</span>Models</a>
+      <a href="/usage" data-route="/usage"><span>◎</span>Usage</a>
+      <a href="/settings" data-route="/settings"><span>⚙</span>Settings</a>
+    </nav>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="/miniapp.js"></script>
 </body>

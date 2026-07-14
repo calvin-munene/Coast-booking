@@ -7,6 +7,8 @@ import { setTelegramStarLedgerForTests } from "../src/channels.js";
 import { createStarPurchasePayload } from "../src/starPayments.js";
 import { resetTelegramWebAuthForTests } from "../src/telegramWebAuth.js";
 import { setPlatformStoreForTests } from "../src/platformRuntime.js";
+import { resetNvidiaModelCatalogForTests } from "../src/agent.js";
+import { aiChatStarCost, resetPricingForTests } from "../src/pricing.js";
 
 const originalFetch = global.fetch;
 const ENV_NAMES = [
@@ -32,6 +34,8 @@ function restoreEnvironment() {
   global.fetch = originalFetch;
   setTelegramStarLedgerForTests(null);
   setPlatformStoreForTests(null);
+  resetNvidiaModelCatalogForTests();
+  resetPricingForTests();
   resetTelegramWebAuthForTests();
 }
 
@@ -186,6 +190,8 @@ function webLedgerDouble(overrides = {}) {
     async reserveProviderCapacity() { return { reserved: true, used: 1 }; },
     async completePrompt() {},
     async restorePrompt() {},
+    async listPayments() { return []; },
+    async listUsage() { return []; },
     ...overrides
   };
 }
@@ -203,6 +209,16 @@ function platformStoreDouble(overrides = {}) {
     },
     async listAuditLogs() { return []; },
     async listSecurityEvents() { return []; },
+    async listAiModels() { return [{ id: "meta/model-a", enabled: true, featured: false, providerAvailable: true }]; },
+    async enabledAiModelIds() { return ["meta/model-a"]; },
+    async setAiModelControl({ modelId, enabled, featured }) {
+      return { duplicate: false, model: { id: modelId, enabled: enabled ?? true, featured: featured ?? false } };
+    },
+    async getBillingPrices() { return [{ featureKey: "ai_chat", starCost: 1, updatedBy: null }]; },
+    async getBillingPrice() { return { featureKey: "ai_chat", starCost: 1, updatedBy: null }; },
+    async setBillingPrice({ featureKey, starCost }) {
+      return { duplicate: false, price: { featureKey, starCost, updatedBy: "6643462826" } };
+    },
     ...overrides
   };
 }
@@ -526,6 +542,114 @@ test("banned users cannot establish a Mini App session", async () => {
     const response = await requestJson(port, "/api/miniapp/state", { initData: signedInitData({ userId: 123 }) });
     assert.equal(response.status, 403, response.text);
     assert.match(response.text, /not permitted/i);
+  } finally {
+    await close(server);
+  }
+});
+
+test("Mini App direct routes serve the protected SPA shell with security headers", async () => {
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    for (const path of ["/home", "/chat", "/groups", "/group/123", "/admin/system"]) {
+      const response = await requestGet(port, path);
+      assert.equal(response.status, 200, `${path}: ${response.text}`);
+      assert.match(response.text, /Nvid AI OS/);
+      assert.match(response.headers["content-security-policy"], /telegram\.org/);
+    }
+  } finally {
+    await close(server);
+  }
+});
+
+test("model administration is authenticated, audited by the store, and updates the runtime allowlist", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "0", payments: "0", prompts: "0" }; }
+  }));
+  const changes = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async setAiModelControl(change) {
+      changes.push(change);
+      return { duplicate: false, model: { id: change.modelId, enabled: true, featured: true } };
+    }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 6643462826);
+    const headers = { authorization: `Bearer ${session}` };
+    assert.equal((await requestGet(port, "/api/admin/models", headers)).status, 200);
+    const response = await requestJson(port, "/api/admin/models", {
+      requestId: crypto.randomUUID(),
+      modelId: "meta/model-a",
+      featured: true
+    }, { ...headers, origin: process.env.PUBLIC_URL });
+    assert.equal(response.status, 200, response.text);
+    assert.equal(changes[0].actorUserId, "6643462826");
+  } finally {
+    await close(server);
+  }
+});
+
+test("billing history is scoped to the authenticated user while admins can query the ledger", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  const paymentQueries = [];
+  const usageQueries = [];
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "0", payments: "1", prompts: "1" }; },
+    async listPayments(options) { paymentQueries.push(options); return [{ chargeId: "charge-1", userId: options.userId || "123" }]; },
+    async listUsage(options) { usageQueries.push(options); return [{ reservationId: "prompt-1", userId: options.userId || "123" }]; }
+  }));
+  setPlatformStoreForTests(platformStoreDouble());
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const userSession = await launchWebSession(port, 123);
+    const self = await requestGet(port, "/api/billing/history?limit=10", { authorization: `Bearer ${userSession}` });
+    assert.equal(self.status, 200, self.text);
+    assert.equal(paymentQueries[0].userId, "123");
+    assert.equal(usageQueries[0].userId, "123");
+
+    resetTelegramWebAuthForTests();
+    const adminSession = await launchWebSession(port, 6643462826);
+    const admin = await requestGet(port, "/api/admin/payments?userId=123&limit=20", { authorization: `Bearer ${adminSession}` });
+    assert.equal(admin.status, 200, admin.text);
+    assert.equal(paymentQueries.at(-1).userId, "123");
+  } finally {
+    await close(server);
+  }
+});
+
+test("pricing changes require billing authority and immediately update the success-charge cost", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "0", payments: "0", prompts: "0" }; }
+  }));
+  const changes = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async setBillingPrice(change) {
+      changes.push(change);
+      return { duplicate: false, price: { featureKey: change.featureKey, starCost: change.starCost } };
+    }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 6643462826);
+    const headers = { authorization: `Bearer ${session}` };
+    assert.equal((await requestGet(port, "/api/admin/pricing", headers)).status, 200);
+    const response = await requestJson(port, "/api/admin/pricing", {
+      requestId: crypto.randomUUID(),
+      featureKey: "ai_chat",
+      starCost: 2
+    }, { ...headers, origin: process.env.PUBLIC_URL });
+    assert.equal(response.status, 200, response.text);
+    assert.equal(changes[0].actorUserId, "6643462826");
+    assert.equal(aiChatStarCost(), 2);
   } finally {
     await close(server);
   }

@@ -183,6 +183,14 @@ function assertPositiveInteger(value, fieldName, maximum = Number.MAX_SAFE_INTEG
   return value;
 }
 
+function normalizeHistoryLimit(value, fallback = 50) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 250) {
+    throw new StarLedgerValidationError('limit must be an integer between 1 and 250');
+  }
+  return parsed;
+}
+
 export function createStarLedger({
   pool: injectedPool,
   connectionString = process.env.DATABASE_URL,
@@ -862,6 +870,59 @@ export function createStarLedger({
     };
   }
 
+  async function listPayments({ userId: rawUserId = null, limit: rawLimit = 50 } = {}) {
+    const userId = rawUserId === null || rawUserId === undefined ? null : normalizeTelegramUserId(rawUserId);
+    const limit = normalizeHistoryLimit(rawLimit);
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:list-payments */
+       SELECT telegram_payment_charge_id, user_id::text, amount, currency,
+              provider_payment_charge_id, credited_at, refunded_at, refunded_amount
+       FROM telegram_star_payments
+       WHERE ($1::bigint IS NULL OR user_id = $1::bigint)
+       ORDER BY credited_at DESC, telegram_payment_charge_id DESC
+       LIMIT $2`,
+      [userId, limit],
+    );
+    return result.rows.map((row) => ({
+      chargeId: row.telegram_payment_charge_id,
+      userId: normalizeDbInt(row.user_id, 'payment user_id'),
+      amount: Number(row.amount),
+      currency: row.currency,
+      providerChargeId: row.provider_payment_charge_id || null,
+      creditedAt: row.credited_at,
+      refundedAt: row.refunded_at || null,
+      refundedAmount: row.refunded_amount === null || row.refunded_amount === undefined ? null : Number(row.refunded_amount),
+    }));
+  }
+
+  async function listUsage({ userId: rawUserId = null, limit: rawLimit = 50 } = {}) {
+    const userId = rawUserId === null || rawUserId === undefined ? null : normalizeTelegramUserId(rawUserId);
+    const limit = normalizeHistoryLimit(rawLimit);
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:list-usage */
+       SELECT reservation_id, user_id::text, cost, status, created_at, completed_at, restored_at, updated_at
+       FROM telegram_star_prompt_reservations
+       WHERE ($1::bigint IS NULL OR user_id = $1::bigint)
+       ORDER BY created_at DESC, reservation_id DESC
+       LIMIT $2`,
+      [userId, limit],
+    );
+    return result.rows.map((row) => ({
+      reservationId: row.reservation_id,
+      userId: normalizeDbInt(row.user_id, 'usage user_id'),
+      cost: Number(row.cost),
+      status: row.status,
+      createdAt: row.created_at,
+      completedAt: row.completed_at || null,
+      restoredAt: row.restored_at || null,
+      updatedAt: row.updated_at,
+    }));
+  }
+
   async function reserveProviderCapacity({
     providerKey: rawProviderKey = 'nvidia',
     limit: rawLimit,
@@ -1037,6 +1098,8 @@ export function createStarLedger({
     refundStaleReservations,
     reserveProviderCapacity,
     getStats,
+    listPayments,
+    listUsage,
     getModeSettings,
     setModeEnabled,
     getUserControl,

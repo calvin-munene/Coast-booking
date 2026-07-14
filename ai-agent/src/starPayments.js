@@ -132,12 +132,13 @@ export function validateStarPurchasePayload(payload, {
   };
 }
 
-export function telegramStarTerms(adminUserId = process.env.TELEGRAM_ADMIN_USER_ID) {
+export function telegramStarTerms(adminUserId = process.env.TELEGRAM_ADMIN_USER_ID, aiChatCreditCost = 1) {
+  const promptCost = Number.isSafeInteger(aiChatCreditCost) && aiChatCreditCost >= 1 ? aiChatCreditCost : 1;
   return [
     `NvidBot Telegram Stars Terms (version ${STAR_TERMS_VERSION})`,
     "",
     "- One Telegram Star purchases one NvidBot AI-message credit.",
-    "- Each accepted non-command AI prompt uses one credit. Bot commands are free.",
+    `- Each accepted non-command AI prompt currently uses ${promptCost} credit${promptCost === 1 ? "" : "s"}. Bot commands are free.`,
     "- If NVIDIA generation or final Telegram delivery fails, the reserved credit is restored.",
     "- Credits are tied to the purchasing Telegram account and cannot be transferred.",
     "- Use /balance to view credits and /paysupport for payment help.",

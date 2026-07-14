@@ -1,3 +1,5 @@
+import { recordNvidiaCatalog, recordNvidiaRequest } from "./providerHealth.js";
+
 const conversations = new Map();
 const conversationLocks = new Map();
 const MAX_TURNS = 12;
@@ -5,6 +7,12 @@ const MAX_CONVERSATIONS = 1000;
 const CONVERSATION_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_DEADLINE_MS = 90 * 1000;
 const RETRYABLE_NVIDIA_STATUS = new Set([429, 500, 502, 503, 504]);
+const MODEL_CATALOG_TTL_MS = 15 * 60 * 1000;
+const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{1,199}$/;
+let discoveredModels = [];
+let catalogExpiresAt = 0;
+let catalogRefreshPromise = null;
+let runtimeEnabledModelIds = null;
 
 const MODEL_DEFINITIONS = [
   {
@@ -56,7 +64,12 @@ function configuredModelIds() {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
-  return [...new Set(fromEnvironment.length ? fromEnvironment : MODEL_DEFINITIONS.map(({ id }) => id))];
+  const source = runtimeEnabledModelIds?.length
+    ? runtimeEnabledModelIds
+    : fromEnvironment.length
+      ? fromEnvironment
+      : MODEL_DEFINITIONS.map(({ id }) => id);
+  return [...new Set(source)];
 }
 
 function definitionFor(id) {
@@ -99,25 +112,39 @@ function retryDelay(response, attempt) {
 }
 
 async function requestCompletion(url, options, { signal, deadline = Date.now() + REQUEST_DEADLINE_MS } = {}) {
+  const startedAt = Date.now();
+  const model = (() => {
+    try { return JSON.parse(options.body)?.model || null; } catch { return null; }
+  })();
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new DOMException("NVIDIA request timed out", "TimeoutError");
+    if (remaining <= 0) {
+      recordNvidiaRequest({ ok: false, latencyMs: Date.now() - startedAt, model });
+      throw new DOMException("NVIDIA request timed out", "TimeoutError");
+    }
     const timeoutSignal = AbortSignal.timeout(remaining);
     const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     let response;
     try {
       response = await fetch(url, { ...options, signal: requestSignal });
     } catch (error) {
-      if (signal?.aborted || attempt === 2 || Date.now() >= deadline) throw error;
+      if (signal?.aborted || attempt === 2 || Date.now() >= deadline) {
+        recordNvidiaRequest({ ok: false, latencyMs: Date.now() - startedAt, model });
+        throw error;
+      }
       await wait(Math.min(500 * (2 ** attempt), Math.max(0, deadline - Date.now())), signal);
       continue;
     }
-    if (response.ok) return response;
+    if (response.ok) {
+      recordNvidiaRequest({ ok: true, statusCode: response.status, latencyMs: Date.now() - startedAt, model });
+      return response;
+    }
 
     const detail = await response.text();
     if (!RETRYABLE_NVIDIA_STATUS.has(response.status) || attempt === 2) {
       const error = new Error(`NVIDIA API returned ${response.status}: ${detail.slice(0, 300)}`);
       error.statusCode = response.status;
+      recordNvidiaRequest({ ok: false, statusCode: response.status, latencyMs: Date.now() - startedAt, model });
       throw error;
     }
 
@@ -125,6 +152,92 @@ async function requestCompletion(url, options, { signal, deadline = Date.now() +
     await wait(delay, signal);
   }
   throw new Error("NVIDIA request could not be completed");
+}
+
+function modelApiUrl() {
+  return `${(process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "")}/models`;
+}
+
+function completionApiUrl() {
+  return `${(process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "")}/chat/completions`;
+}
+
+function catalogEntry(value) {
+  const id = typeof value?.id === "string" ? value.id.trim() : "";
+  if (!MODEL_ID_PATTERN.test(id)) return null;
+  const known = definitionFor(id);
+  return {
+    id,
+    label: known.label,
+    tag: known.tag,
+    description: known.description,
+    ownedBy: typeof value.owned_by === "string" ? value.owned_by.slice(0, 100) : null
+  };
+}
+
+export async function refreshNvidiaModelCatalog({ force = false, fetchImpl = globalThis.fetch, now = Date.now } = {}) {
+  if (!force && catalogExpiresAt > now() && discoveredModels.length) {
+    return { refreshed: false, cached: true, models: discoveredModels.map((model) => ({ ...model })) };
+  }
+  if (catalogRefreshPromise) return catalogRefreshPromise;
+  catalogRefreshPromise = (async () => {
+    const apiKey = required("NVIDIA_API_KEY");
+    try {
+      const response = await fetchImpl(modelApiUrl(), {
+        method: "GET",
+        headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" },
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!response.ok) {
+        const error = new Error(`NVIDIA model catalog returned ${response.status}`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      const data = await response.json();
+      const models = [...new Map((Array.isArray(data?.data) ? data.data : [])
+        .map(catalogEntry)
+        .filter(Boolean)
+        .map((model) => [model.id, model])).values()];
+      if (!models.length) throw new Error("NVIDIA model catalog returned no usable model IDs");
+      discoveredModels = models;
+      catalogExpiresAt = now() + MODEL_CATALOG_TTL_MS;
+      recordNvidiaCatalog({ ok: true, modelCount: models.length });
+      return { refreshed: true, cached: false, models: models.map((model) => ({ ...model })) };
+    } catch (error) {
+      recordNvidiaCatalog({ ok: false });
+      return {
+        refreshed: false,
+        cached: Boolean(discoveredModels.length),
+        error: "catalog_unavailable",
+        models: discoveredModels.map((model) => ({ ...model }))
+      };
+    } finally {
+      catalogRefreshPromise = null;
+    }
+  })();
+  return catalogRefreshPromise;
+}
+
+export function discoveredNvidiaModels() {
+  return discoveredModels.map((model) => ({ ...model }));
+}
+
+export function setRuntimeEnabledModels(modelIds) {
+  if (modelIds === null) {
+    runtimeEnabledModelIds = null;
+    return;
+  }
+  if (!Array.isArray(modelIds) || !modelIds.length || modelIds.some((id) => !MODEL_ID_PATTERN.test(String(id)))) {
+    throw new TypeError("At least one valid enabled NVIDIA model is required");
+  }
+  runtimeEnabledModelIds = [...new Set(modelIds.map(String))];
+}
+
+export function resetNvidiaModelCatalogForTests() {
+  discoveredModels = [];
+  catalogExpiresAt = 0;
+  catalogRefreshPromise = null;
+  runtimeEnabledModelIds = null;
 }
 
 async function withConversationLock(key, task) {
@@ -170,7 +283,36 @@ function completionContext(conversationId, text, model) {
   const selectedModel = selectModel(model);
   const modelDefinition = definitionFor(selectedModel);
   const conversationKey = `${conversationId}:${selectedModel}`;
-  return { selectedModel, modelDefinition, conversationKey, text };
+  return { conversationId, selectedModel, modelDefinition, conversationKey, text };
+}
+
+function modelUnavailable(error) {
+  return Number(error?.statusCode) === 404
+    || (Number(error?.statusCode) === 400 && /model.{0,80}(not found|unavailable|not supported|does not exist)/i.test(error?.message || ""));
+}
+
+async function completionResponseWithFallback(context, history, apiKey, stream, { signal, deadline, onModelSelected } = {}) {
+  await onModelSelected?.(context.selectedModel);
+  try {
+    const response = await requestCompletion(
+      completionApiUrl(),
+      completionOptions(context, history, apiKey, stream),
+      { signal, deadline }
+    );
+    return { response, context, history };
+  } catch (error) {
+    const fallbackModel = defaultModel();
+    if (!modelUnavailable(error) || fallbackModel === context.selectedModel) throw error;
+    const fallbackContext = completionContext(context.conversationId, context.text, fallbackModel);
+    const fallbackHistory = historyFor(fallbackContext.conversationKey);
+    await onModelSelected?.(fallbackContext.selectedModel);
+    const response = await requestCompletion(
+      completionApiUrl(),
+      completionOptions(fallbackContext, fallbackHistory, apiKey, stream),
+      { signal, deadline }
+    );
+    return { response, context: fallbackContext, history: fallbackHistory };
+  }
 }
 
 function completionOptions(context, history, apiKey, stream) {
@@ -284,32 +426,30 @@ export async function reply({ conversationId, text, model, signal }) {
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   return withConversationLock(context.conversationKey, async () => {
     const history = historyFor(context.conversationKey);
-    const response = await requestCompletion(
-      `${process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1"}/chat/completions`,
-      completionOptions(context, history, apiKey, false),
-      { signal, deadline }
-    );
+    const completed = await completionResponseWithFallback(context, history, apiKey, false, { signal, deadline });
+    const { response } = completed;
     const data = await response.json();
     const answer = data.choices?.[0]?.message?.content?.trim();
     if (!answer) throw new Error("NVIDIA API returned an empty response");
-    saveHistory(context.conversationKey, history, text, answer);
+    saveHistory(completed.context.conversationKey, completed.history, text, answer);
     return answer;
   });
 }
 
-export async function streamReply({ conversationId, text, model, signal, onDelta }) {
+export async function streamReply({ conversationId, text, model, signal, onDelta, onModelSelected }) {
   const apiKey = required("NVIDIA_API_KEY");
   const context = completionContext(conversationId, text, model);
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   return withConversationLock(context.conversationKey, async () => {
     const history = historyFor(context.conversationKey);
-    const response = await requestCompletion(
-      `${process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1"}/chat/completions`,
-      completionOptions(context, history, apiKey, true),
-      { signal, deadline }
-    );
+    const completed = await completionResponseWithFallback(context, history, apiKey, true, {
+      signal,
+      deadline,
+      onModelSelected
+    });
+    const { response } = completed;
     const answer = await consumeNvidiaStream(response, onDelta);
-    saveHistory(context.conversationKey, history, text, answer);
+    saveHistory(completed.context.conversationKey, completed.history, text, answer);
     return answer;
   });
 }

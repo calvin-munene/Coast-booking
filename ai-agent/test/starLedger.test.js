@@ -486,3 +486,47 @@ test('returns aggregate counters as BIGINT-safe strings', async () => {
   });
   pool.assertDone();
 });
+
+test('lists auditable payment and usage history without exposing invoice payloads', async () => {
+  const creditedAt = new Date('2026-07-14T12:00:00.000Z');
+  const createdAt = new Date('2026-07-14T12:01:00.000Z');
+  const pool = new ScriptedPool([
+    {
+      tag: 'list-payments',
+      params: ['6643462826', 25],
+      result: result([{
+        telegram_payment_charge_id: 'charge-1',
+        user_id: '6643462826',
+        amount: 10,
+        currency: 'XTR',
+        provider_payment_charge_id: '',
+        credited_at: creditedAt,
+        refunded_at: null,
+        refunded_amount: null,
+        invoice_payload: 'must-not-be-returned',
+      }]),
+    },
+    {
+      tag: 'list-usage',
+      params: ['6643462826', 25],
+      result: result([{
+        reservation_id: 'telegram:6643462826:1',
+        user_id: '6643462826',
+        cost: 1,
+        status: 'completed',
+        created_at: createdAt,
+        completed_at: createdAt,
+        restored_at: null,
+        updated_at: createdAt,
+      }]),
+    },
+  ]);
+  const ledger = createStarLedger({ pool });
+  const payments = await ledger.listPayments({ userId: '6643462826', limit: 25 });
+  const usage = await ledger.listUsage({ userId: '6643462826', limit: 25 });
+  assert.equal(payments[0].amount, 10);
+  assert.equal(Object.hasOwn(payments[0], 'invoicePayload'), false);
+  assert.equal(usage[0].status, 'completed');
+  assert.equal(usage[0].cost, 1);
+  pool.assertDone();
+});

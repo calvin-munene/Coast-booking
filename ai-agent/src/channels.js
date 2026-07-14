@@ -8,6 +8,7 @@ import {
   streamReply
 } from "./agent.js";
 import { logger } from "./logger.js";
+import { aiChatStarCost } from "./pricing.js";
 import { createStarLedger } from "./starLedger.js";
 import {
   MAX_STAR_TOPUP,
@@ -31,12 +32,15 @@ let telegramStarLedger = null;
 let telegramStarSweepTimer = null;
 let telegramStarSweepInFlight = false;
 const TELEGRAM_BOT_SHORT_DESCRIPTION = "Hacker-style NVIDIA AI assistant for code, strategy, and fast answers.";
-const TELEGRAM_BOT_DESCRIPTION = [
-  "NvidBot is a hacker-style AI assistant powered by NVIDIA models.",
-  "Use it for coding help, debugging, research, planning, content, and technical answers.",
-  "On Telegram, each accepted non-command AI prompt costs 1 prepaid credit.",
-  "Use /topup to buy credits with Telegram Stars, /models to switch models, and /help for the full command list."
-].join(" ");
+function telegramBotDescription() {
+  const cost = aiChatStarCost();
+  return [
+    "NvidBot is a hacker-style AI assistant powered by NVIDIA models.",
+    "Use it for coding help, debugging, research, planning, content, and technical answers.",
+    `On Telegram, each accepted non-command AI prompt costs ${cost} prepaid credit${cost === 1 ? "" : "s"}.`,
+    "Use /topup to buy credits with Telegram Stars, /models to switch models, and /help for the full command list."
+  ].join(" ");
+}
 const TELEGRAM_WELCOME_IMAGE_PATH = "/telegram/welcome-banner.png";
 const MODE_DEFINITIONS = Object.freeze({
   chat: {
@@ -184,7 +188,7 @@ function modeListText(settings = defaultModeSettings(), { admin = false } = {}) 
     lines.push(
       "",
       `${enabled ? "ON" : "OFF"} ${mode} - ${definition.label}`,
-      `${definition.description}${definition.billable ? " Credit cost: 1 per accepted prompt." : " Credit cost: free."}`
+      `${definition.description}${definition.billable ? ` Credit cost: ${aiChatStarCost()} per accepted prompt.` : " Credit cost: free."}`
     );
   }
   if (admin) lines.push("", "Admin usage: /mode <mode> on|off");
@@ -407,7 +411,7 @@ function helpText() {
   lines.push(
     "",
     telegramStarsRequired()
-      ? "Each non-command AI prompt costs 1 message credit. One Telegram Star buys one credit."
+      ? `Each non-command AI prompt costs ${aiChatStarCost()} message credit${aiChatStarCost() === 1 ? "" : "s"}. One Telegram Star buys one credit.`
       : "Send a message to chat with the active NVIDIA model."
   );
   return lines.join("\n");
@@ -429,7 +433,7 @@ function welcomeText() {
   lines.push(
     "",
     telegramStarsRequired()
-      ? "Telegram pricing: each accepted non-command AI prompt costs 1 credit. Use /topup <amount> to buy credits with Telegram Stars."
+      ? `Telegram pricing: each accepted non-command AI prompt costs ${aiChatStarCost()} credit${aiChatStarCost() === 1 ? "" : "s"}. Use /topup <amount> to buy credits with Telegram Stars.`
       : "Send any message to start chatting with the active NVIDIA model."
   );
   return lines.join("\n");
@@ -567,7 +571,7 @@ async function sendTopupOffer(message, amount) {
     text: [
       `Buy ${amount} AI message credit${amount === 1 ? "" : "s"} for ${amount} Telegram Star${amount === 1 ? "" : "s"}.`,
       "",
-      "One accepted AI prompt costs 1 credit. Commands are free. Read /terms for the full terms.",
+      `One accepted AI prompt costs ${aiChatStarCost()} credit${aiChatStarCost() === 1 ? "" : "s"}. Commands are free. Read /terms for the full terms.`,
       "",
       "Tap the button below to confirm the terms and open Telegram's secure Stars checkout."
     ].join("\n"),
@@ -615,7 +619,7 @@ async function handleStarPurchaseCallback(callback) {
   await telegramApi("sendInvoice", {
     chat_id: message.chat.id,
     title: "NvidBot AI credits",
-    description: `${purchase.amount} prepaid AI message credit${purchase.amount === 1 ? "" : "s"}. One credit is used per accepted prompt.`,
+    description: `${purchase.amount} prepaid AI message credit${purchase.amount === 1 ? "" : "s"}. ${aiChatStarCost()} credit${aiChatStarCost() === 1 ? " is" : "s are"} used per accepted prompt.`,
     payload: purchase.payload,
     currency: "XTR",
     prices: [{
@@ -1082,7 +1086,7 @@ async function handleTelegramCommand(command, message) {
       const balance = await requireStarLedger().getBalance(String(message.from?.id));
       await sendTelegramText(
         message,
-        `Your NvidBot balance is ${balanceValue(balance)} AI message credit${balanceValue(balance) === "1" ? "" : "s"}.\n\nEach non-command AI prompt costs 1 credit. Use /topup <amount> to buy more.`
+        `Your NvidBot balance is ${balanceValue(balance)} AI message credit${balanceValue(balance) === "1" ? "" : "s"}.\n\nEach non-command AI prompt costs ${aiChatStarCost()} credit${aiChatStarCost() === 1 ? "" : "s"}. Use /topup <amount> to buy more.`
       );
       return true;
     }
@@ -1099,7 +1103,7 @@ async function handleTelegramCommand(command, message) {
       return true;
     }
     case "terms":
-      await sendTelegramText(message, telegramStarTerms());
+      await sendTelegramText(message, telegramStarTerms(undefined, aiChatStarCost()));
       return true;
     case "paysupport":
     case "support":
@@ -1226,13 +1230,14 @@ export async function handleTelegram(update) {
   if (telegramStarsRequired() && !unlimitedCredits) {
     try {
       const ledger = requireStarLedger();
-      const reservation = await ledger.reservePrompt(String(message.from?.id), { reservationId, cost: 1 });
+      const promptCost = aiChatStarCost();
+      const reservation = await ledger.reservePrompt(String(message.from?.id), { reservationId, cost: promptCost });
       if (!reservation?.reserved) {
         telegramChatsInFlight.delete(chatKey);
         if (["reserved", "completed", "restored"].includes(reservation?.state)) return;
         await sendTelegramText(
           message,
-          `You need 1 AI message credit for this prompt. Your balance is ${balanceValue(reservation)}.\n\nUse /topup <amount> to buy credits with Telegram Stars. Example: /topup 10`
+          `You need ${promptCost} AI message credit${promptCost === 1 ? "" : "s"} for this prompt. Your balance is ${balanceValue(reservation)}.\n\nUse /topup <amount> to buy credits with Telegram Stars. Example: /topup 10`
         );
         return;
       }
@@ -1403,6 +1408,22 @@ export async function telegramDashboardState({ userId } = {}) {
   };
 }
 
+export async function telegramBillingHistory({ userId = null, limit = 50 } = {}) {
+  if (!telegramStarLedger
+      || typeof telegramStarLedger.listPayments !== "function"
+      || typeof telegramStarLedger.listUsage !== "function") {
+    const error = new Error("Telegram billing history is temporarily unavailable");
+    error.statusCode = 503;
+    throw error;
+  }
+  const options = { userId, limit };
+  const [payments, usage] = await Promise.all([
+    telegramStarLedger.listPayments(options),
+    telegramStarLedger.listUsage(options)
+  ]);
+  return { payments, usage };
+}
+
 function nvidiaHourlyRequestLimit() {
   const parsed = Number(process.env.NVIDIA_GLOBAL_REQUESTS_PER_HOUR || 300);
   return Number.isSafeInteger(parsed) && parsed >= 10 && parsed <= 1_000_000 ? parsed : 300;
@@ -1433,7 +1454,8 @@ export async function reserveTelegramWebAiUsage({ userId, requestId, model } = {
   const unlimitedCredits = isAdmin || userControl?.unlimitedCredits === true;
   let creditReserved = false;
   if (telegramStarsRequired() && !unlimitedCredits) {
-    const reservation = await telegramStarLedger.reservePrompt(resolvedUserId, { reservationId, cost: 1 });
+    const promptCost = aiChatStarCost();
+    const reservation = await telegramStarLedger.reservePrompt(resolvedUserId, { reservationId, cost: promptCost });
     if (!reservation?.reserved) {
       const duplicate = ["reserved", "completed", "restored"].includes(reservation?.state);
       return {
@@ -1441,7 +1463,7 @@ export async function reserveTelegramWebAiUsage({ userId, requestId, model } = {
         status: duplicate ? 409 : 402,
         error: duplicate
           ? "This AI request has already been processed"
-          : `You need 1 AI message credit. Current balance: ${balanceValue(reservation)}`
+          : `You need ${promptCost} AI message credit${promptCost === 1 ? "" : "s"}. Current balance: ${balanceValue(reservation)}`
       };
     }
     creditReserved = true;
@@ -1517,7 +1539,7 @@ export async function configureTelegramBot() {
       short_description: TELEGRAM_BOT_SHORT_DESCRIPTION
     });
     await telegramApi("setMyDescription", {
-      description: TELEGRAM_BOT_DESCRIPTION
+      description: telegramBotDescription()
     });
     await telegramApi("setChatMenuButton", {
       menu_button: {

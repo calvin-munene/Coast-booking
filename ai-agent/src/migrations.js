@@ -71,6 +71,52 @@ export const PLATFORM_MIGRATIONS = Object.freeze([
         ('bot_management', FALSE, 'Managed bot profiles and encrypted credentials')
       ON CONFLICT (feature_key) DO NOTHING;
     `
+  }),
+  Object.freeze({
+    version: "2026071503_nvidia_model_controls",
+    sql: `
+      CREATE TABLE IF NOT EXISTS ai_models (
+        model_id TEXT PRIMARY KEY
+          CHECK (model_id ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{1,199}$'),
+        label TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 200),
+        description TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 1000),
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        featured BOOLEAN NOT NULL DEFAULT FALSE,
+        provider_available BOOLEAN NOT NULL DEFAULT TRUE,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+        last_seen_at TIMESTAMPTZ,
+        updated_by BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS ai_models_enabled_featured_idx
+        ON ai_models(enabled, featured DESC, model_id);
+
+      INSERT INTO ai_models (model_id, label, description, enabled, featured, metadata)
+      VALUES
+        ('meta/llama-3.3-70b-instruct', 'Llama 3.3 70B', 'Strong general reasoning and multilingual chat', TRUE, TRUE, '{"tag":"GENERAL"}'::jsonb),
+        ('nvidia/llama-3.3-nemotron-super-49b-v1.5', 'Nemotron Super 49B', 'NVIDIA reasoning model for complex questions and planning', TRUE, TRUE, '{"tag":"REASONING"}'::jsonb),
+        ('meta/llama-3.1-70b-instruct', 'Llama 3.1 70B', 'Reliable assistant for everyday work', TRUE, FALSE, '{"tag":"BALANCED"}'::jsonb),
+        ('meta/llama-3.1-8b-instruct', 'Llama 3.1 8B', 'Lower-latency answers for simple tasks', TRUE, FALSE, '{"tag":"FAST"}'::jsonb)
+      ON CONFLICT (model_id) DO NOTHING;
+    `
+  }),
+  Object.freeze({
+    version: "2026071504_billing_pricing",
+    sql: `
+      CREATE TABLE IF NOT EXISTS billing_prices (
+        feature_key TEXT PRIMARY KEY CHECK (feature_key ~ '^[a-z][a-z0-9_]{1,63}$'),
+        star_cost INTEGER NOT NULL CHECK (star_cost BETWEEN 1 AND 10000),
+        updated_by BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      INSERT INTO billing_prices (feature_key, star_cost)
+      VALUES ('ai_chat', 1)
+      ON CONFLICT (feature_key) DO NOTHING;
+    `
   })
 ]);
 

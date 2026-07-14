@@ -15,6 +15,26 @@ function platformPool() {
       updated_at: new Date()
     }]
   ]);
+  const models = new Map([
+    ["meta/model-a", {
+      model_id: "meta/model-a",
+      label: "Model A",
+      description: "Test model",
+      enabled: true,
+      featured: false,
+      provider_available: true,
+      metadata: {},
+      last_seen_at: new Date(),
+      updated_by: null,
+      updated_at: new Date()
+    }]
+  ]);
+  const prices = new Map([["ai_chat", {
+    feature_key: "ai_chat",
+    star_cost: 1,
+    updated_by: null,
+    updated_at: new Date()
+  }]]);
   const calls = [];
   const client = {
     async query(sql, values = []) {
@@ -41,6 +61,45 @@ function platformPool() {
           metadata: JSON.parse(values[3])
         });
         return { rows: [], rowCount: 1 };
+      }
+      if (text.includes("UPDATE ai_models SET") && text.includes("enabled = COALESCE")) {
+        const row = models.get(values[0]);
+        if (!row) return { rows: [], rowCount: 0 };
+        if (values[1] !== undefined && values[1] !== null) row.enabled = values[1];
+        if (values[2] !== undefined && values[2] !== null) row.featured = values[2];
+        if (values[3] !== undefined && values[3] !== null) row.label = values[3];
+        if (values[4] !== undefined && values[4] !== null) row.description = values[4];
+        row.updated_by = String(values[5]);
+        row.updated_at = new Date();
+        return { rows: [{ ...row }], rowCount: 1 };
+      }
+      if (text.includes("SELECT COUNT(*)::int AS count FROM ai_models")) {
+        return { rows: [{ count: [...models.values()].filter((model) => model.enabled).length }], rowCount: 1 };
+      }
+      if (text.includes("INSERT INTO audit_logs") && text.includes("ai_model.updated")) {
+        audit.set(values[0], { action: "ai_model.updated", target_id: values[2], metadata: JSON.parse(values[3]) });
+        return { rows: [], rowCount: 1 };
+      }
+      if (text.includes("FROM ai_models WHERE model_id")) {
+        const row = models.get(values[0]);
+        return { rows: row ? [{ ...row }] : [], rowCount: row ? 1 : 0 };
+      }
+      if (text.includes("UPDATE billing_prices SET star_cost")) {
+        const row = prices.get(values[0]);
+        if (!row) return { rows: [], rowCount: 0 };
+        Object.assign(row, { star_cost: values[1], updated_by: String(values[2]), updated_at: new Date() });
+        return { rows: [{ ...row }], rowCount: 1 };
+      }
+      if (text.includes("INSERT INTO audit_logs") && text.includes("billing_price.updated")) {
+        audit.set(values[0], { action: "billing_price.updated", target_id: values[2], metadata: JSON.parse(values[3]) });
+        return { rows: [], rowCount: 1 };
+      }
+      if (text.includes("FROM billing_prices WHERE feature_key")) {
+        const row = prices.get(values[0]);
+        return { rows: row ? [{ ...row }] : [], rowCount: row ? 1 : 0 };
+      }
+      if (text.includes("FROM billing_prices ORDER BY feature_key")) {
+        return { rows: [...prices.values()].map((row) => ({ ...row })), rowCount: prices.size };
       }
       if (text.includes("FROM feature_flags WHERE feature_key")) {
         const row = features.get(values[0]);
@@ -89,4 +148,48 @@ test("security source identifiers use a keyed one-way digest", () => {
   assert.equal(first, repeated);
   assert.notEqual(first, rotated);
   assert.doesNotMatch(first, /203\.0\.113\.10/);
+});
+
+test("model controls require one enabled model and audit idempotent changes", async () => {
+  const fake = platformPool();
+  const store = createPlatformStore({ pool: fake.pool });
+  const requestId = crypto.randomUUID();
+  const changed = await store.setAiModelControl({
+    actorUserId: "42",
+    modelId: "meta/model-a",
+    featured: true,
+    requestId
+  });
+  assert.equal(changed.duplicate, false);
+  assert.equal(changed.model.featured, true);
+  assert.equal((await store.setAiModelControl({ actorUserId: "42", modelId: "meta/model-a", featured: true, requestId })).duplicate, true);
+
+  await assert.rejects(
+    store.setAiModelControl({
+      actorUserId: "42",
+      modelId: "meta/model-a",
+      enabled: false,
+      requestId: crypto.randomUUID()
+    }),
+    (error) => error.statusCode === 409
+  );
+});
+
+test("billing price changes are transactional, audited, and idempotent", async () => {
+  const fake = platformPool();
+  const store = createPlatformStore({ pool: fake.pool });
+  const requestId = crypto.randomUUID();
+  const changed = await store.setBillingPrice({
+    actorUserId: "42",
+    featureKey: "ai_chat",
+    starCost: 2,
+    requestId
+  });
+  assert.equal(changed.price.starCost, 2);
+  assert.equal(changed.duplicate, false);
+  assert.equal((await store.setBillingPrice({ actorUserId: "42", featureKey: "ai_chat", starCost: 2, requestId })).duplicate, true);
+  await assert.rejects(
+    store.setBillingPrice({ actorUserId: "42", featureKey: "ai_chat", starCost: 3, requestId }),
+    (error) => error.statusCode === 409
+  );
 });

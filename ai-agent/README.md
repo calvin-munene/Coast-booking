@@ -31,6 +31,21 @@ Startup validates required environment configuration and runs additive, checksum
 
 Administrator API routes are under `/api/admin/*`. They require a valid Telegram session, the appropriate platform permission, request rate limits, and same-origin checks for mutations. Configuration status endpoints return presence booleans only, never secret values.
 
+## Mini App routes
+
+The Telegram-authenticated Mini App is a mobile-first single-page application. Direct links restore the correct route and the Telegram Back Button is enabled only on supported client versions.
+
+- User: `/home`, `/chat`, `/models`, `/assistants`, `/groups`, `/group/:id`, `/moderation`, `/bots`, `/guard`, `/secretary`, `/threads`, `/usage`, `/payments`, `/settings`, `/help`.
+- Administrator: `/admin`, `/admin/users`, `/admin/groups`, `/admin/models`, `/admin/features`, `/admin/pricing`, `/admin/payments`, `/admin/logs`, `/admin/system`.
+
+Chat, model selection, payment history, usage history, feature flags, pricing, provider health, and audit logs use live backend APIs. Telegram capabilities that still require a group permission, BotFather setting, encryption key, or staged rollout are shown as unavailable with the specific requirement; the UI does not pretend they are active.
+
+## NVIDIA reliability and billing
+
+Nvid AI discovers provider models from NVIDIA's OpenAI-compatible `/v1/models` endpoint with a bounded cache, while the database-backed administrator allowlist controls which models users can select. If a selected model is reported unavailable before a response starts, one approved fallback is attempted. Provider latency, failures, catalog state, and circuit status are exposed to authenticated administrators without credentials.
+
+Telegram Stars transactions and prompt reservations remain in the original transactional ledger. User and administrator history endpoints read those tables directly. The default price remains one AI credit per successful non-admin message; failed requests restore the reservation, duplicate request IDs cannot charge again, administrators remain unlimited, and price changes are permission-checked, idempotent, and audited.
+
 ## Deploy on Render
 
 The repository includes a root-level `render.yaml` Blueprint. In Render, create a new Blueprint from the GitHub repository, then provide the secret values requested during setup. Render supplies `PORT` automatically.

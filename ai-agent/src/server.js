@@ -2,7 +2,15 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { availableModels, defaultModel, selectModel, streamReply } from "./agent.js";
+import {
+  availableModels,
+  defaultModel,
+  discoveredNvidiaModels,
+  refreshNvidiaModelCatalog,
+  selectModel,
+  setRuntimeEnabledModels,
+  streamReply
+} from "./agent.js";
 import { runtimeConfig, safeConfigurationStatus, validateRuntimeConfiguration } from "./config.js";
 import {
   configureTelegramBot,
@@ -11,6 +19,7 @@ import {
   handleWhatsApp,
   reserveTelegramWebAiUsage,
   restoreTelegramWebAiUsage,
+  telegramBillingHistory,
   telegramDashboardState,
   telegramPublicStatus,
   telegramServiceReady,
@@ -31,6 +40,9 @@ import {
   platformRuntimeStatus
 } from "./platformRuntime.js";
 import { sourceIdentifierHash } from "./platformStore.js";
+import { nvidiaProviderHealth } from "./providerHealth.js";
+import { aiChatStarCost, setAiChatStarCost } from "./pricing.js";
+import { platformPrincipal } from "./rbac.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const port = Number(process.env.PORT || 3000);
@@ -152,12 +164,33 @@ async function authorizeAdminRequest(req, { permission, mutation = false } = {})
     });
     return { allowed: false, status: 403, error: "This account is banned" };
   }
-  return authorization;
+  return { ...authorization, dashboard };
 }
 
 function parseLimit(url) {
   const value = Number(url.searchParams.get("limit") || 50);
   return Number.isSafeInteger(value) && value >= 1 && value <= 250 ? value : 50;
+}
+
+async function initializeNvidiaModelControls({ forceRefresh = false } = {}) {
+  const catalog = await refreshNvidiaModelCatalog({ force: forceRefresh });
+  const store = getPlatformStore();
+  if (catalog.refreshed && store?.syncAiModels) await store.syncAiModels(catalog.models);
+  if (store?.enabledAiModelIds) {
+    const enabled = await store.enabledAiModelIds();
+    if (enabled.length) setRuntimeEnabledModels(enabled);
+  }
+  if (store?.getBillingPrice) {
+    const pricing = await store.getBillingPrice("ai_chat");
+    if (pricing) setAiChatStarCost(pricing.starCost);
+  }
+  logger.info("nvidia.model_catalog.ready", {
+    refreshed: catalog.refreshed,
+    cached: catalog.cached,
+    discoveredModels: catalog.models.length,
+    enabledModels: availableModels().length
+  });
+  return catalog;
 }
 
 function positiveEnvironmentInteger(name, fallback, minimum, maximum) {
@@ -244,9 +277,9 @@ async function streamWebChat(req, res, { authenticated, usage, message, model })
     if (!res.destroyed && !res.writableEnded) res.write(": heartbeat\n\n");
   }, 15_000);
   let responseDelivered = false;
+  let deliveredModel = model;
 
   try {
-    await writeSse(res, "meta", { model });
     await streamReply({
       conversationId: `web:${authenticated.userId}:session:${authenticated.sessionId}`,
       text: usage.persona
@@ -254,10 +287,14 @@ async function streamWebChat(req, res, { authenticated, usage, message, model })
         : message,
       model,
       signal: controller.signal,
+      onModelSelected: (selectedModel) => {
+        deliveredModel = selectedModel;
+        return writeSse(res, "meta", { model: selectedModel });
+      },
       onDelta: (text) => writeSse(res, "delta", { text })
     });
     recordProviderSuccess();
-    await writeSse(res, "done", { model });
+    await writeSse(res, "done", { model: deliveredModel });
     responseDelivered = true;
     await completeTelegramWebAiUsage(usage).catch((error) => {
       logger.error("web_ai.credit_completion_failed", { error, userId: authenticated.userId });
@@ -302,7 +339,8 @@ export function createAppServer() {
         ok,
         services: {
           telegram: { ok: telegramReady },
-          database
+          database,
+          nvidia: { ok: nvidiaProviderHealth().healthy, status: nvidiaProviderHealth().status }
         },
         deploymentVersion: runtimeConfig().deploymentVersion
       });
@@ -339,11 +377,29 @@ export function createAppServer() {
         return json(res, 403, { error: "This account is not permitted to use Nvid AI" });
       }
       const store = getPlatformStore();
-      if (store?.ensureUser) await store.ensureUser(auth.verified.userId);
+      let principal = null;
+      if (store?.ensureUser) {
+        await store.ensureUser(auth.verified.userId);
+        principal = await platformPrincipal(auth.verified.userId, store);
+        if (["banned_user", "restricted_user"].includes(principal?.role)) {
+          await recordSecurityEvent(req, {
+            eventType: "restricted_platform_user_miniapp_access",
+            severity: "medium",
+            userId: auth.verified.userId,
+            metadata: { role: principal.role }
+          });
+          return json(res, 403, { error: "This platform account is restricted" });
+        }
+      }
       return json(res, 200, {
         verified: true,
         sessionToken: auth.sessionToken,
-        dashboard
+        dashboard: {
+          ...dashboard,
+          platformRole: principal?.role || (dashboard.isAdmin ? "super_admin" : "standard_user"),
+          platformAdmin: ["super_admin", "admin"].includes(principal?.role) || dashboard.isAdmin,
+          pricing: { aiChatStarCost: aiChatStarCost() }
+        }
       });
     }
 
@@ -357,7 +413,9 @@ export function createAppServer() {
           deploymentVersion: runtimeConfig().deploymentVersion,
           uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
           telegram: telegramPublicStatus()
-        }
+        },
+        pricing: { aiChatStarCost: aiChatStarCost() },
+        billing: auth.dashboard?.stats || null
       });
     }
 
@@ -366,6 +424,68 @@ export function createAppServer() {
       const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
       if (!auth.allowed) return json(res, auth.status, { error: auth.error });
       return json(res, 200, { features: await getPlatformStore().listFeatureFlags() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/models") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, {
+        models: await getPlatformStore().listAiModels(),
+        provider: nvidiaProviderHealth(),
+        discovered: discoveredNvidiaModels().length
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/models") {
+      if (!consumeRequestBudget(req, "admin-write", { limit: 30, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "models.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 16_000 });
+      if (typeof data.modelId !== "string" || typeof data.requestId !== "string") {
+        return json(res, 400, { error: "modelId and requestId are required" });
+      }
+      const changed = await getPlatformStore().setAiModelControl({
+        actorUserId: auth.principal.userId,
+        modelId: data.modelId,
+        enabled: data.enabled,
+        featured: data.featured,
+        label: data.label,
+        description: data.description,
+        requestId: data.requestId
+      });
+      const enabled = await getPlatformStore().enabledAiModelIds();
+      setRuntimeEnabledModels(enabled);
+      return json(res, 200, changed);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/pricing") {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "billing.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { prices: await getPlatformStore().getBillingPrices() });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/pricing") {
+      if (!consumeRequestBudget(req, "admin-write", { limit: 30, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "billing.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 16_000 });
+      if (data.featureKey !== "ai_chat"
+          || !Number.isSafeInteger(data.starCost)
+          || data.starCost < 1
+          || data.starCost > 10_000
+          || typeof data.requestId !== "string") {
+        return json(res, 400, { error: "Valid featureKey, starCost, and requestId are required" });
+      }
+      const changed = await getPlatformStore().setBillingPrice({
+        actorUserId: auth.principal.userId,
+        featureKey: data.featureKey,
+        starCost: data.starCost,
+        requestId: data.requestId
+      });
+      setAiChatStarCost(changed.price.starCost);
+      return json(res, 200, changed);
     }
 
     if (req.method === "POST" && url.pathname === "/api/admin/features") {
@@ -407,7 +527,7 @@ export function createAppServer() {
         configuration: safeConfigurationStatus(),
         platform: platformRuntimeStatus(),
         telegram: telegramPublicStatus(),
-        nvidia: { circuitOpen: providerCircuitIsOpen(), activeRequests: activeWebAiRequests },
+        nvidia: { ...nvidiaProviderHealth(), circuitOpen: providerCircuitIsOpen(), activeRequests: activeWebAiRequests },
         uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000)
       });
     }
@@ -457,6 +577,25 @@ export function createAppServer() {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/api/billing/history") {
+      const authenticated = verifyTelegramWebAppSession(bearerToken(req));
+      if (!authenticated) return json(res, 401, { error: "Fresh Telegram authentication is required" });
+      if (!consumeRequestBudget(req, "billing-history", { limit: 60, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const dashboard = await telegramDashboardState({ userId: authenticated.userId });
+      if (dashboard.banned && !dashboard.isAdmin) return json(res, 403, { error: "This account is banned" });
+      return json(res, 200, await telegramBillingHistory({ userId: authenticated.userId, limit: parseLimit(url) }));
+    }
+
+    if (req.method === "GET" && ["/api/admin/payments", "/api/admin/usage"].includes(url.pathname)) {
+      if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "billing.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const userId = url.searchParams.get("userId");
+      if (userId && !/^[1-9]\d*$/.test(userId)) return json(res, 400, { error: "userId must be a Telegram user ID" });
+      const history = await telegramBillingHistory({ userId: userId || null, limit: parseLimit(url) });
+      return json(res, 200, url.pathname.endsWith("/payments") ? { payments: history.payments } : { usage: history.usage });
+    }
+
     if (req.method === "POST" && url.pathname === "/webhooks/telegram") {
       if (!process.env.TELEGRAM_WEBHOOK_SECRET || req.headers["x-telegram-bot-api-secret-token"] !== process.env.TELEGRAM_WEBHOOK_SECRET) {
         return json(res, 401, { error: "Invalid webhook secret" });
@@ -492,7 +631,8 @@ export function createAppServer() {
     }
 
     if (req.method === "GET") {
-      const name = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
+      const miniAppRoute = /^\/(home|chat|models|assistants|groups|moderation|bots|guard|secretary|threads|usage|history|payments|settings|help|admin(?:\/.*)?|group\/[^/]+)\/?$/.test(url.pathname);
+      const name = url.pathname === "/" ? "index.html" : miniAppRoute ? "miniapp.html" : decodeURIComponent(url.pathname.slice(1));
       const filePath = path.normalize(path.join(root, name));
       if (!filePath.startsWith(root + path.sep) && filePath !== root) return json(res, 404, { error: "Not found" });
       const types = {
@@ -526,6 +666,10 @@ export function createAppServer() {
     if (!res.headersSent && [413, 415].includes(error?.statusCode)) {
       return json(res, error.statusCode, { error: error.message });
     }
+    if (!res.headersSent && error instanceof TypeError) {
+      logger.warn("http.request_validation_failed", { error, method: req.method, path: url.pathname });
+      return json(res, 400, { error: "Invalid request parameters" });
+    }
     if (res.headersSent) {
       logger.error("http.request_failed_after_headers", { error, method: req.method, path: url.pathname });
       if (!res.writableEnded && !res.destroyed) res.end();
@@ -550,7 +694,9 @@ export function startAppServer(listenPort = port) {
   const server = createAppServer();
   server.listen(listenPort, () => {
     logger.info("application.listening", { port: listenPort, environment: config.environment, deploymentVersion: config.deploymentVersion });
-    initializePlatformFoundation().catch(() => {});
+    initializePlatformFoundation()
+      .then(() => initializeNvidiaModelControls())
+      .catch((error) => logger.error("platform.startup_initialization_failed", { error }));
     configureTelegramBot().catch((error) => logger.error("telegram.setup_failed", { error }));
   });
   return server;

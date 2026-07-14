@@ -167,11 +167,23 @@ test("configures Telegram commands and a protected Render webhook", async () => 
   };
 
   const status = await configureTelegramBot();
-  assert.deepEqual(calls.map(({ method }) => method), ["getMe", "setMyCommands", "setWebhook", "getWebhookInfo"]);
-  assert.deepEqual(calls[1].payload.commands.map(({ command }) => command), [
+  assert.deepEqual(calls.map(({ method }) => method), [
+    "getMe",
+    "setMyShortDescription",
+    "setMyDescription",
+    "setMyCommands",
+    "setWebhook",
+    "getWebhookInfo"
+  ]);
+  assert.equal(
+    calls[1].payload.short_description,
+    "Hacker-style NVIDIA AI assistant for code, strategy, and fast answers."
+  );
+  assert.match(calls[2].payload.description, /NvidBot is a hacker-style AI assistant powered by NVIDIA models\./);
+  assert.deepEqual(calls[3].payload.commands.map(({ command }) => command), [
     "start", "help", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "starbalance", "whoami"
   ]);
-  assert.deepEqual(calls[2].payload, {
+  assert.deepEqual(calls[4].payload, {
     url: "https://nvidbot.onrender.com/webhooks/telegram",
     secret_token: "valid_secret-123",
     allowed_updates: ["message", "pre_checkout_query", "callback_query"],
@@ -181,6 +193,29 @@ test("configures Telegram commands and a protected Render webhook", async () => 
   assert.equal(status.username, "NvidBotAI");
   assert.equal(status.link, "https://t.me/NvidBotAI");
   assert.deepEqual(telegramPublicStatus(), status);
+});
+
+test("start sends the welcome image with setup guidance", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({
+      method: new URL(url).pathname.split("/").at(-1),
+      payload: JSON.parse(options.body)
+    });
+    return telegramSuccess();
+  };
+
+  await handleTelegram(telegramUpdate({ text: "/start", chatId: 555, messageId: 44, updateId: 66 }));
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "sendPhoto");
+  assert.equal(calls[0].payload.photo, "https://nvidbot.onrender.com/telegram/welcome-banner.png");
+  assert.match(calls[0].payload.caption, /NvidBot/);
+  assert.match(calls[0].payload.caption, /Quick start:/);
+  assert.deepEqual(calls[0].payload.reply_parameters, { message_id: 44, allow_sending_without_reply: true });
 });
 
 test("rejects an invalid Telegram webhook secret before making API calls", async () => {

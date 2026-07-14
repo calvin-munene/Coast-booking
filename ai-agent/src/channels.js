@@ -29,6 +29,14 @@ let telegramStatus = Object.freeze({ enabled: false, configured: false });
 let telegramStarLedger = null;
 let telegramStarSweepTimer = null;
 let telegramStarSweepInFlight = false;
+const TELEGRAM_BOT_SHORT_DESCRIPTION = "Hacker-style NVIDIA AI assistant for code, strategy, and fast answers.";
+const TELEGRAM_BOT_DESCRIPTION = [
+  "NvidBot is a hacker-style AI assistant powered by NVIDIA models.",
+  "Use it for coding help, debugging, research, planning, content, and technical answers.",
+  "On Telegram, each accepted non-command AI prompt costs 1 prepaid credit.",
+  "Use /topup to buy credits with Telegram Stars, /models to switch models, and /help for the full command list."
+].join(" ");
+const TELEGRAM_WELCOME_IMAGE_PATH = "/telegram/welcome-banner.png";
 
 const TELEGRAM_COMMANDS = [
   { command: "start", description: "Start NvidBot" },
@@ -286,6 +294,26 @@ function helpText() {
   return lines.join("\n");
 }
 
+function welcomeText() {
+  const lines = [
+    "NvidBot",
+    "Hacker-style NVIDIA AI assistant for code, debugging, research, and rapid answers.",
+    "",
+    "Quick start:",
+    "/models - browse available NVIDIA models",
+    "/model <number or name> - switch the active model",
+    "/reset - clear this chat's memory",
+    "/help - show all commands"
+  ];
+  lines.push(
+    "",
+    telegramStarsRequired()
+      ? "Telegram pricing: each accepted non-command AI prompt costs 1 credit. Use /topup <amount> to buy credits with Telegram Stars."
+      : "Send any message to start chatting with the active NVIDIA model."
+  );
+  return lines.join("\n");
+}
+
 function whoAmIText(message) {
   return [
     "Telegram identity:",
@@ -335,6 +363,32 @@ async function sendTelegramText(message, text) {
         ? { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } }
         : {})
     });
+  }
+}
+
+async function sendTelegramPhoto(message, photo, caption) {
+  await telegramApi("sendPhoto", {
+    chat_id: message.chat.id,
+    photo,
+    caption,
+    ...messageThreadPayload(message),
+    ...(message.message_id
+      ? { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } }
+      : {})
+  });
+}
+
+function telegramPublicAssetUrl(pathname) {
+  return `${telegramPublicBaseUrl()}${pathname.startsWith("/") ? pathname : `/${pathname}`}`;
+}
+
+async function sendTelegramWelcome(message) {
+  const caption = welcomeText();
+  try {
+    await sendTelegramPhoto(message, telegramPublicAssetUrl(TELEGRAM_WELCOME_IMAGE_PATH), caption);
+  } catch (error) {
+    console.error(`Telegram welcome image failed: ${error.message}`);
+    await sendTelegramText(message, caption);
   }
 }
 
@@ -623,7 +677,7 @@ async function handleTelegramCommand(command, message) {
   const chatId = message.chat.id;
   switch (command.name) {
     case "start":
-      await sendTelegramText(message, `Welcome to NvidBot.\n\n${helpText()}`);
+      await sendTelegramWelcome(message);
       return true;
     case "help":
       await sendTelegramText(message, helpText());
@@ -920,6 +974,12 @@ export async function configureTelegramBot() {
     starLedgerReady = await initializeTelegramStars();
     const webhookUrl = `${telegramPublicBaseUrl()}/webhooks/telegram`;
     const me = await telegramApi("getMe");
+    await telegramApi("setMyShortDescription", {
+      short_description: TELEGRAM_BOT_SHORT_DESCRIPTION
+    });
+    await telegramApi("setMyDescription", {
+      description: TELEGRAM_BOT_DESCRIPTION
+    });
     await telegramApi("setMyCommands", { commands: TELEGRAM_COMMANDS });
     await telegramApi("setWebhook", {
       url: webhookUrl,

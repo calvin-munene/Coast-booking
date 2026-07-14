@@ -107,6 +107,36 @@ test('initializes lazily once and preserves BIGINT balance as a decimal string',
   assert.equal(pool.endCalls, 0, 'an injected shared pool is not owned by the ledger');
 });
 
+test('reserves a durable global provider budget with an atomic database upsert', async () => {
+  const bucketStart = new Date('2026-07-14T12:00:00.000Z');
+  const pool = new ScriptedPool([
+    {
+      tag: 'reserve-provider-capacity',
+      params: ['nvidia', bucketStart, 2, 300],
+      result: result([{ used: 42 }]),
+    },
+    {
+      tag: 'reserve-provider-capacity',
+      params: ['nvidia', bucketStart, 2, 300],
+      result: result([], 0),
+    },
+  ]);
+  const ledger = createStarLedger({ pool, now: () => new Date('2026-07-14T12:34:56.000Z') });
+
+  const accepted = await ledger.reserveProviderCapacity({ providerKey: 'nvidia', limit: 300, cost: 2 });
+  const denied = await ledger.reserveProviderCapacity({ providerKey: 'nvidia', limit: 300, cost: 2 });
+  assert.deepEqual(accepted, {
+    reserved: true,
+    providerKey: 'nvidia',
+    used: 42,
+    limit: 300,
+    resetAt: new Date('2026-07-14T13:00:00.000Z'),
+  });
+  assert.equal(denied.reserved, false);
+  assert.equal(denied.used, null);
+  pool.assertDone();
+});
+
 test('credits a Telegram payment exactly once and rejects charge-id collisions', async () => {
   const payment = {
     userId: '6643462826',

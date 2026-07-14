@@ -52,13 +52,14 @@ function telegramSuccess(result = true) {
   });
 }
 
-function telegramUpdate({ text, userId = 123, chatId = 456, type = "private", messageId = 7, updateId = 9 }) {
+function telegramUpdate({ text, userId = 123, chatId = 456, type = "private", messageId = 7, updateId = 9, threadId }) {
   return {
     update_id: updateId,
     message: {
       message_id: messageId,
       from: { id: userId, first_name: "Ada" },
       chat: { id: chatId, type },
+      ...(threadId === undefined ? {} : { message_thread_id: threadId }),
       text
     }
   };
@@ -344,6 +345,123 @@ test("uses typing and a final reply without drafts in a group", async () => {
   await handleTelegram(telegramUpdate({ text: "Question", chatId: -900, type: "supergroup", messageId: 22, updateId: 32 }));
 
   assert.deepEqual(telegramMethods, ["sendChatAction", "sendMessage"]);
+});
+
+test("isolates Telegram AI history by group user and forum thread", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+  const nvidiaRequests = [];
+  global.fetch = async (url, options) => {
+    if (new URL(url).hostname === "api.telegram.org") return telegramSuccess();
+    const request = JSON.parse(options.body);
+    nvidiaRequests.push(request.messages.map(({ content }) => content).join("\n"));
+    return new Response('data: {"choices":[{"delta":{"content":"answer"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  };
+
+  await handleTelegram(telegramUpdate({
+    text: "user-one-secret-alpha",
+    userId: 101,
+    chatId: -9101,
+    type: "supergroup",
+    threadId: 11,
+    messageId: 1,
+    updateId: 1
+  }));
+  await handleTelegram(telegramUpdate({
+    text: "user-two-question",
+    userId: 202,
+    chatId: -9101,
+    type: "supergroup",
+    threadId: 11,
+    messageId: 2,
+    updateId: 2
+  }));
+  await handleTelegram(telegramUpdate({
+    text: "user-one-other-thread",
+    userId: 101,
+    chatId: -9101,
+    type: "supergroup",
+    threadId: 22,
+    messageId: 3,
+    updateId: 3
+  }));
+
+  assert.equal(nvidiaRequests.length, 3);
+  assert.doesNotMatch(nvidiaRequests[1], /user-one-secret-alpha/);
+  assert.doesNotMatch(nvidiaRequests[2], /user-one-secret-alpha/);
+  assert.match(nvidiaRequests[1], /user-two-question/);
+  assert.match(nvidiaRequests[2], /user-one-other-thread/);
+});
+
+test("Guard callbacks verify mode, requester authority, and current bot permissions", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.TELEGRAM_ADMIN_USER_ID = "6643462826";
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async getModeSettings(defaultModes) { return { ...defaultModes, guard: true }; }
+  }));
+  const calls = [];
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    calls.push({ method, payload });
+    if (method === "getMe") return telegramSuccess({ id: 999, is_bot: true });
+    if (method === "getChatMember") {
+      return telegramSuccess({ status: "administrator", can_invite_users: true });
+    }
+    return telegramSuccess();
+  };
+
+  await handleTelegram({
+    callback_query: {
+      id: "guard-ok",
+      from: { id: 6643462826 },
+      data: "g1.approve.-100123.321"
+    }
+  });
+
+  assert.equal(calls.filter(({ method }) => method === "getChatMember").length, 2);
+  assert.deepEqual(calls.find(({ method }) => method === "approveChatJoinRequest").payload, {
+    chat_id: "-100123",
+    user_id: "321"
+  });
+  assert.equal(calls.at(-1).method, "answerCallbackQuery");
+  assert.equal(calls.at(-1).payload.show_alert, false);
+});
+
+test("Guard callbacks fail closed when Telegram no longer grants authority", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.TELEGRAM_ADMIN_USER_ID = "6643462826";
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async getModeSettings(defaultModes) { return { ...defaultModes, guard: true }; }
+  }));
+  const methods = [];
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    methods.push(method);
+    if (method === "getMe") return telegramSuccess({ id: 999, is_bot: true });
+    if (method === "getChatMember") {
+      const payload = JSON.parse(options.body);
+      return telegramSuccess(payload.user_id === 6643462826
+        ? { status: "member" }
+        : { status: "administrator", can_invite_users: true });
+    }
+    return telegramSuccess();
+  };
+
+  await handleTelegram({
+    callback_query: {
+      id: "guard-denied",
+      from: { id: 6643462826 },
+      data: "g1.deny.-100123.321"
+    }
+  });
+
+  assert.equal(methods.includes("declineChatJoinRequest"), false);
+  assert.equal(methods.at(-1), "answerCallbackQuery");
 });
 
 test("admin AI chat does not consume Stars credits", async () => {

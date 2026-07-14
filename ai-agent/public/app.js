@@ -11,10 +11,29 @@ const modelSelect = document.querySelector("#model-select");
 const activeModel = document.querySelector("#active-model");
 const telegramLink = document.querySelector("#telegram-link");
 const sessionId = localStorage.aiSessionId ||= crypto.randomUUID();
+const telegram = window.Telegram?.WebApp;
 const startedAt = Date.now();
 const modelsById = new Map();
 let activeChatController = null;
 let channelLoadAttempts = 0;
+let telegramSessionToken = sessionStorage.getItem("nvidbotTelegramSession") || "";
+
+async function loadTelegramSession() {
+  if (telegramSessionToken) return telegramSessionToken;
+  if (!telegram?.initData) return "";
+  telegram.ready();
+  telegram.expand();
+  const response = await fetch("/api/miniapp/state", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ initData: telegram.initData })
+  });
+  if (!response.ok) return "";
+  const data = await response.json();
+  telegramSessionToken = data.sessionToken || "";
+  if (telegramSessionToken) sessionStorage.setItem("nvidbotTelegramSession", telegramSessionToken);
+  return telegramSessionToken;
+}
 
 sessionCode.textContent = sessionId.slice(0, 8).toUpperCase();
 
@@ -207,10 +226,15 @@ form.addEventListener("submit", async (event) => {
   }
 
   try {
+    const authentication = await loadTelegramSession();
+    if (!authentication) throw new Error("AI chat is available from the NvidBot Telegram Mini App. Use OPEN TELEGRAM to continue.");
     const response = await fetch("/api/chat", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, message, model: requestedModel }),
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${authentication}`
+      },
+      body: JSON.stringify({ requestId: crypto.randomUUID(), message, model: requestedModel }),
       signal: controller.signal
     });
     if (!response.ok) throw new Error(await responseError(response));

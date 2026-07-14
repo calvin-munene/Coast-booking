@@ -1,40 +1,64 @@
 import http from "node:http";
-import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { availableModels, defaultModel, selectModel, streamReply } from "./agent.js";
 import {
   configureTelegramBot,
+  completeTelegramWebAiUsage,
   handleTelegram,
   handleWhatsApp,
+  reserveTelegramWebAiUsage,
+  restoreTelegramWebAiUsage,
   telegramDashboardState,
   telegramPublicStatus,
   telegramServiceReady,
   telegramUpdateRequiresSynchronousAck,
   validMetaSignature
 } from "./channels.js";
+import {
+  consumeTelegramWebAppInitData,
+  issueTelegramWebAppSession,
+  verifyTelegramWebAppSession
+} from "./telegramWebAuth.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const port = Number(process.env.PORT || 3000);
-const chatRateLimits = new Map();
-const RATE_WINDOW_MS = 10 * 60 * 1000;
-const RATE_BUDGET = 30;
+const requestRateLimits = new Map();
+const webUsersInFlight = new Set();
+let activeWebAiRequests = 0;
+let providerFailures = [];
+let providerCircuitOpenUntil = 0;
 
 function json(res, status, value) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(value));
 }
 
-async function body(req) {
+function httpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+async function body(req, { maxBytes = 1_000_000 } = {}) {
+  const declaredLength = Number(req.headers["content-length"]);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw httpError(413, "Request body too large");
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1_000_000) throw new Error("Request body too large");
+    if (size > maxBytes) throw httpError(413, "Request body too large");
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
+}
+
+async function jsonBody(req, options) {
+  const raw = await body(req, options);
+  return JSON.parse(raw.toString("utf8") || "{}");
 }
 
 function chatClient(req) {
@@ -42,49 +66,76 @@ function chatClient(req) {
   return (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim()) || req.socket.remoteAddress || "unknown";
 }
 
-function consumeChatBudget(req, model) {
+function consumeRequestBudget(req, route, { limit, windowMs, cost = 1 }) {
   const now = Date.now();
-  if (chatRateLimits.size > 1000) {
-    for (const [client, bucket] of chatRateLimits) {
-      if (bucket.resetAt <= now) chatRateLimits.delete(client);
+  if (requestRateLimits.size > 5000) {
+    for (const [key, bucket] of requestRateLimits) {
+      if (bucket.resetAt <= now) requestRateLimits.delete(key);
     }
   }
-  const client = chatClient(req);
-  const current = chatRateLimits.get(client);
-  const bucket = !current || current.resetAt <= now ? { used: 0, resetAt: now + RATE_WINDOW_MS } : current;
-  const cost = model === "nvidia/llama-3.3-nemotron-super-49b-v1.5" ? 2 : 1;
-  if (bucket.used + cost > RATE_BUDGET) return false;
+  const key = `${route}:${chatClient(req)}`;
+  const current = requestRateLimits.get(key);
+  const bucket = !current || current.resetAt <= now ? { used: 0, resetAt: now + windowMs } : current;
+  if (bucket.used + cost > limit) return false;
   bucket.used += cost;
-  chatRateLimits.set(client, bucket);
+  requestRateLimits.set(key, bucket);
   return true;
 }
 
-function validSessionId(value) {
-  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+function bearerToken(req) {
+  const value = req.headers.authorization;
+  const match = typeof value === "string" ? value.match(/^Bearer\s+([^\s]+)$/i) : null;
+  return match?.[1] || "";
 }
 
-function validateTelegramWebAppInitData(initData) {
-  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  if (!token || typeof initData !== "string" || !initData) return null;
-  const params = new URLSearchParams(initData);
-  const hash = params.get("hash");
-  if (!hash || !/^[a-f0-9]{64}$/i.test(hash)) return null;
-  params.delete("hash");
-  const dataCheckString = [...params.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => `${key}=${value}`)
-    .join("\n");
-  const secret = crypto.createHmac("sha256", "WebAppData").update(token).digest();
-  const expected = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
-  const left = Buffer.from(expected, "hex");
-  const right = Buffer.from(hash, "hex");
-  if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) return null;
-  try {
-    const user = JSON.parse(params.get("user") || "{}");
-    return user?.id ? { userId: String(user.id), user } : null;
-  } catch {
-    return null;
+function authenticateTelegramWebRequest(req, data, { allowLaunch = false } = {}) {
+  const existing = verifyTelegramWebAppSession(bearerToken(req));
+  if (existing) return { verified: existing, sessionToken: null };
+  if (!allowLaunch) return { verified: null, sessionToken: null, code: "missing" };
+  const launch = consumeTelegramWebAppInitData(data?.initData);
+  if (!launch.ok) return { verified: null, sessionToken: null, code: launch.code };
+  return {
+    verified: launch,
+    sessionToken: issueTelegramWebAppSession(launch)
+  };
+}
+
+function positiveEnvironmentInteger(name, fallback, minimum, maximum) {
+  const parsed = Number(process.env[name] || fallback);
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function providerCircuitIsOpen() {
+  return providerCircuitOpenUntil > Date.now();
+}
+
+function recordProviderSuccess() {
+  providerFailures = [];
+  providerCircuitOpenUntil = 0;
+}
+
+function recordProviderFailure(error) {
+  if (![429, 500, 502, 503, 504].includes(Number(error?.statusCode || 0))) return;
+  const now = Date.now();
+  providerFailures = providerFailures.filter((timestamp) => now - timestamp < 60_000);
+  providerFailures.push(now);
+  const threshold = positiveEnvironmentInteger("NVIDIA_CIRCUIT_FAILURE_THRESHOLD", 5, 2, 50);
+  if (providerFailures.length >= threshold) {
+    providerCircuitOpenUntil = now + positiveEnvironmentInteger("NVIDIA_CIRCUIT_COOLDOWN_SECONDS", 60, 10, 900) * 1000;
   }
+}
+
+function acquireWebAiConcurrency(userId) {
+  const maximum = positiveEnvironmentInteger("NVIDIA_MAX_CONCURRENT_REQUESTS", 4, 1, 100);
+  if (activeWebAiRequests >= maximum || webUsersInFlight.has(userId)) return false;
+  activeWebAiRequests += 1;
+  webUsersInFlight.add(userId);
+  return true;
+}
+
+function releaseWebAiConcurrency(userId) {
+  webUsersInFlight.delete(userId);
+  activeWebAiRequests = Math.max(0, activeWebAiRequests - 1);
 }
 
 function streamErrorMessage(error) {
@@ -115,7 +166,7 @@ function writeSse(res, event, data) {
   });
 }
 
-async function streamWebChat(req, res, { sessionId, message, model }) {
+async function streamWebChat(req, res, { authenticated, usage, message, model }) {
   const controller = new AbortController();
   const abort = () => controller.abort(new DOMException("Client disconnected", "AbortError"));
   const close = () => { if (!res.writableEnded) abort(); };
@@ -132,20 +183,34 @@ async function streamWebChat(req, res, { sessionId, message, model }) {
   const heartbeat = setInterval(() => {
     if (!res.destroyed && !res.writableEnded) res.write(": heartbeat\n\n");
   }, 15_000);
+  let responseDelivered = false;
 
   try {
     await writeSse(res, "meta", { model });
     await streamReply({
-      conversationId: `web:${sessionId}`,
-      text: message,
+      conversationId: `web:${authenticated.userId}:session:${authenticated.sessionId}`,
+      text: usage.persona
+        ? `User customization:\n${usage.persona}\n\nUser message:\n${message}`
+        : message,
       model,
       signal: controller.signal,
       onDelta: (text) => writeSse(res, "delta", { text })
     });
+    recordProviderSuccess();
     await writeSse(res, "done", { model });
+    responseDelivered = true;
+    await completeTelegramWebAiUsage(usage).catch((error) => {
+      console.error(`Web AI credit completion failed: ${error.message}`);
+    });
   } catch (error) {
+    recordProviderFailure(error);
+    if (!responseDelivered) {
+      await restoreTelegramWebAiUsage(usage).catch((restoreError) => {
+        console.error(`Web AI credit restoration failed: ${restoreError.message}`);
+      });
+    }
     if (!controller.signal.aborted) {
-      console.error(error);
+      console.error(`Web AI generation failed: ${error.message}`);
       try {
         await writeSse(res, "error", { error: streamErrorMessage(error) });
       } catch {
@@ -156,6 +221,7 @@ async function streamWebChat(req, res, { sessionId, message, model }) {
     clearInterval(heartbeat);
     req.off("aborted", abort);
     res.off("close", close);
+    releaseWebAiConcurrency(authenticated.userId);
     if (!res.writableEnded && !res.destroyed) res.end();
   }
 }
@@ -178,17 +244,35 @@ export function createAppServer() {
     }
 
     if (req.method === "POST" && url.pathname === "/api/miniapp/state") {
-      const data = JSON.parse((await body(req)).toString("utf8") || "{}");
-      const verified = validateTelegramWebAppInitData(data.initData);
-      if (!verified) return json(res, 401, { error: "Telegram mini app authentication is required" });
+      if (!consumeRequestBudget(req, "miniapp-state", { limit: 60, windowMs: 60_000 })) {
+        return json(res, 429, { error: "Request limit reached. Please try again shortly." });
+      }
+      const data = await jsonBody(req, { maxBytes: 64_000 });
+      const auth = authenticateTelegramWebRequest(req, data, { allowLaunch: true });
+      if (!auth.verified) {
+        return json(res, 401, {
+          error: auth.code === "replayed"
+            ? "This Telegram launch was already used. Reopen the Mini App to continue."
+            : "Fresh Telegram Mini App authentication is required"
+        });
+      }
       return json(res, 200, {
         verified: true,
-        dashboard: await telegramDashboardState({ userId: verified.userId })
+        sessionToken: auth.sessionToken,
+        dashboard: await telegramDashboardState({ userId: auth.verified.userId })
       });
     }
 
     if (req.method === "POST" && url.pathname === "/api/chat") {
-      const data = JSON.parse((await body(req)).toString("utf8"));
+      const authenticated = verifyTelegramWebAppSession(bearerToken(req));
+      if (!authenticated) return json(res, 401, { error: "Open NvidBot inside Telegram to use AI chat" });
+      if (!consumeRequestBudget(req, "web-chat", { limit: 30, windowMs: 10 * 60_000 })) {
+        return json(res, 429, { error: "Request limit reached. Please try again in a few minutes." });
+      }
+      if (providerCircuitIsOpen()) {
+        return json(res, 503, { error: "NVIDIA is temporarily paused after repeated provider failures" });
+      }
+      const data = await jsonBody(req, { maxBytes: 32_000 });
       if (typeof data.message !== "string" || !data.message.trim() || data.message.length > 8000) {
         return json(res, 400, { error: "Message must contain 1-8000 characters" });
       }
@@ -198,20 +282,40 @@ export function createAppServer() {
       } catch (error) {
         return json(res, 400, { error: error.message });
       }
-      if (!validSessionId(data.sessionId)) {
-        return json(res, 400, { error: "A valid browser session is required" });
+      if (!acquireWebAiConcurrency(authenticated.userId)) {
+        return json(res, 429, { error: "An AI response is already running or the service is at capacity" });
       }
-      if (!consumeChatBudget(req, model)) {
-        return json(res, 429, { error: "Request limit reached. Please try again in a few minutes." });
+      let usage;
+      try {
+        usage = await reserveTelegramWebAiUsage({
+          userId: authenticated.userId,
+          requestId: data.requestId,
+          model
+        });
+      } catch (error) {
+        releaseWebAiConcurrency(authenticated.userId);
+        throw error;
       }
-      return streamWebChat(req, res, { sessionId: data.sessionId, message: data.message.trim(), model });
+      if (!usage.allowed) {
+        releaseWebAiConcurrency(authenticated.userId);
+        return json(res, usage.status, { error: usage.error });
+      }
+      return streamWebChat(req, res, {
+        authenticated,
+        usage,
+        message: data.message.trim(),
+        model
+      });
     }
 
     if (req.method === "POST" && url.pathname === "/webhooks/telegram") {
       if (!process.env.TELEGRAM_WEBHOOK_SECRET || req.headers["x-telegram-bot-api-secret-token"] !== process.env.TELEGRAM_WEBHOOK_SECRET) {
         return json(res, 401, { error: "Invalid webhook secret" });
       }
-      const data = JSON.parse((await body(req)).toString("utf8"));
+      if (!consumeRequestBudget(req, "telegram-webhook", { limit: 600, windowMs: 60_000 })) {
+        return json(res, 429, { error: "Webhook request limit reached" });
+      }
+      const data = await jsonBody(req, { maxBytes: 1_000_000 });
       if (telegramUpdateRequiresSynchronousAck(data)) {
         await handleTelegram(data);
         return json(res, 200, { ok: true });
@@ -229,7 +333,10 @@ export function createAppServer() {
     }
 
     if (req.method === "POST" && url.pathname === "/webhooks/whatsapp") {
-      const raw = await body(req);
+      if (!consumeRequestBudget(req, "whatsapp-webhook", { limit: 600, windowMs: 60_000 })) {
+        return json(res, 429, { error: "Webhook request limit reached" });
+      }
+      const raw = await body(req, { maxBytes: 1_000_000 });
       if (!validMetaSignature(raw, req.headers["x-hub-signature-256"])) return json(res, 401, { error: "Invalid signature" });
       handleWhatsApp(JSON.parse(raw.toString("utf8"))).catch(console.error);
       return json(res, 200, { ok: true });
@@ -261,11 +368,15 @@ export function createAppServer() {
     if (!res.headersSent && error instanceof SyntaxError) {
       return json(res, 400, { error: "Request body must be valid JSON" });
     }
-    console.error(error);
+    if (!res.headersSent && error?.statusCode === 413) {
+      return json(res, 413, { error: "Request body too large" });
+    }
     if (res.headersSent) {
+      console.error(error);
       if (!res.writableEnded && !res.destroyed) res.end();
       return;
     }
+    console.error(error);
     const providerUnavailable = [429, 500, 502, 503, 504].includes(error.statusCode);
     json(res, providerUnavailable ? 503 : 500, {
       error: providerUnavailable

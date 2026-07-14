@@ -10,13 +10,21 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: NODE_VERSION
-        value: 22.16.0
+        value: 22.22.2
       - key: NVIDIA_API_KEY
         sync: false
       - key: NVIDIA_MODEL
         value: meta/llama-3.1-70b-instruct
       - key: NVIDIA_BASE_URL
         value: https://integrate.api.nvidia.com/v1
+      - key: NVIDIA_GLOBAL_REQUESTS_PER_HOUR
+        value: "300"
+      - key: NVIDIA_MAX_CONCURRENT_REQUESTS
+        value: "4"
+      - key: NVIDIA_CIRCUIT_FAILURE_THRESHOLD
+        value: "5"
+      - key: NVIDIA_CIRCUIT_COOLDOWN_SECONDS
+        value: "60"
       - key: SYSTEM_PROMPT
         value: You are a helpful, concise AI assistant.
       - key: TELEGRAM_BOT_TOKEN
@@ -29,6 +37,10 @@ services:
         sync: false
       - key: TELEGRAM_STARS_REQUIRED
         value: "true"
+      - key: TELEGRAM_WEBAPP_MAX_AGE_SECONDS
+        value: "300"
+      - key: TELEGRAM_WEBAPP_SESSION_TTL_SECONDS
+        value: "3600"
       - key: DATABASE_URL
         sync: false
       - key: TELEGRAM_ALLOWED_USER_IDS

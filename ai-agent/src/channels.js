@@ -324,16 +324,25 @@ function parseTelegramCommand(text) {
   return { name: match[1].toLowerCase(), botUsername: match[2]?.toLowerCase(), argument: match[3]?.trim() || "" };
 }
 
-function conversationId(chatId) {
-  return `telegram:${chatId}`;
+function telegramConversationScope(message) {
+  const chatId = String(message?.chat?.id ?? "unknown");
+  const userId = String(message?.from?.id ?? "unknown");
+  const threadId = String(message?.message_thread_id ?? "main");
+  if (message?.chat?.type === "private") return `chat:${chatId}:user:${userId}`;
+  return `chat:${chatId}:thread:${threadId}:user:${userId}`;
 }
 
-function preferredTelegramModel(chatId) {
-  const stored = telegramModelPreferences.get(String(chatId));
+function conversationId(message) {
+  return `telegram:${telegramConversationScope(message)}`;
+}
+
+function preferredTelegramModel(message) {
+  const preferenceKey = telegramConversationScope(message);
+  const stored = telegramModelPreferences.get(preferenceKey);
   try {
     return selectModel(stored || defaultModel());
   } catch {
-    telegramModelPreferences.delete(String(chatId));
+    telegramModelPreferences.delete(preferenceKey);
     return selectModel(defaultModel());
   }
 }
@@ -368,8 +377,8 @@ function resolveTelegramModel(value) {
   return { model: matches.length === 1 ? matches[0] : null, matches };
 }
 
-function modelListText(chatId) {
-  const current = preferredTelegramModel(chatId);
+function modelListText(message) {
+  const current = preferredTelegramModel(message);
   const lines = availableModels().map((model, index) => {
     const selected = model.id === current ? "  <- active" : "";
     return `${index + 1}. ${model.label} [${model.tag}]\n   ${model.id}${selected}`;
@@ -618,24 +627,66 @@ async function handleStarPurchaseCallback(callback) {
   return true;
 }
 
+function memberCanManageJoinRequests(member) {
+  if (member?.status === "creator") return true;
+  return member?.status === "administrator" && member?.can_invite_users === true;
+}
+
+async function guardPermissionState(chatId, requesterId) {
+  const bot = await telegramApi("getMe");
+  const [requester, botMember] = await Promise.all([
+    requesterId ? telegramApi("getChatMember", { chat_id: chatId, user_id: requesterId }) : null,
+    telegramApi("getChatMember", { chat_id: chatId, user_id: bot.id })
+  ]);
+  return {
+    requesterAllowed: requesterId ? memberCanManageJoinRequests(requester) : true,
+    botAllowed: memberCanManageJoinRequests(botMember)
+  };
+}
+
+async function answerGuardCallback(callback, text, showAlert = true) {
+  await telegramApi("answerCallbackQuery", {
+    callback_query_id: callback.id,
+    text,
+    show_alert: showAlert
+  });
+}
+
 async function handleGuardCallback(callback) {
   const match = String(callback?.data || "").match(/^g1\.(approve|deny)\.(-?\d+)\.(\d+)$/);
   if (!match) return false;
+  if (!(await modeEnabled("guard"))) {
+    await answerGuardCallback(callback, "Guard Mode is disabled. No join-request action was taken.");
+    return true;
+  }
   if (!telegramUserIsAdmin(callback.from?.id)) {
-    await telegramApi("answerCallbackQuery", {
-      callback_query_id: callback.id,
-      text: "Only the bot administrator can manage join requests.",
-      show_alert: true
-    });
+    await answerGuardCallback(callback, "Only the bot administrator can manage join requests.");
     return true;
   }
   const [, action, chatId, userId] = match;
+  let permissions;
+  try {
+    permissions = await guardPermissionState(chatId, callback.from.id);
+  } catch {
+    await answerGuardCallback(callback, "Telegram permissions could not be verified. No action was taken.");
+    return true;
+  }
+  if (!permissions.requesterAllowed) {
+    await answerGuardCallback(callback, "You must currently be a group administrator with invite-user permission.");
+    return true;
+  }
+  if (!permissions.botAllowed) {
+    await answerGuardCallback(callback, "Promote NvidBot and grant invite-user permission before managing join requests.");
+    return true;
+  }
   const method = action === "approve" ? "approveChatJoinRequest" : "declineChatJoinRequest";
-  await telegramApi(method, { chat_id: chatId, user_id: userId });
-  await telegramApi("answerCallbackQuery", {
-    callback_query_id: callback.id,
-    text: action === "approve" ? "Join request approved." : "Join request denied."
-  });
+  try {
+    await telegramApi(method, { chat_id: chatId, user_id: userId });
+  } catch {
+    await answerGuardCallback(callback, "Telegram rejected the join-request action. Check current group permissions.");
+    return true;
+  }
+  await answerGuardCallback(callback, action === "approve" ? "Join request approved." : "Join request denied.", false);
   return true;
 }
 
@@ -685,10 +736,23 @@ async function handleTelegramJoinRequest(joinRequest) {
     ? await telegramStarLedger.getUserControl(String(joinRequest.from.id)).catch(() => null)
     : null;
   if (userControl?.banned) {
-    await telegramApi("declineChatJoinRequest", {
-      chat_id: joinRequest.chat.id,
-      user_id: joinRequest.from.id
-    });
+    let botAllowed = false;
+    try {
+      botAllowed = (await guardPermissionState(joinRequest.chat.id, null)).botAllowed;
+    } catch {
+      // Permission verification must fail closed for an automatic moderation action.
+    }
+    if (botAllowed) {
+      await telegramApi("declineChatJoinRequest", {
+        chat_id: joinRequest.chat.id,
+        user_id: joinRequest.from.id
+      });
+    } else if (telegramAdminUserId()) {
+      await telegramApi("sendMessage", {
+        chat_id: telegramAdminUserId(),
+        text: `Guard Mode did not decline banned user ${joinRequest.from.id} in ${joinRequest.chat.title || joinRequest.chat.id} because NvidBot's invite-user permission could not be verified.`
+      }).catch(() => undefined);
+    }
     return true;
   }
   const adminId = telegramAdminUserId();
@@ -981,14 +1045,14 @@ async function handleTelegramCommand(command, message) {
       return true;
     }
     case "models":
-      await sendTelegramText(message, modelListText(chatId));
+      await sendTelegramText(message, modelListText(message));
       return true;
     case "model": {
       if (!command.argument) {
-        const current = availableModels().find((model) => model.id === preferredTelegramModel(chatId));
+        const current = availableModels().find((model) => model.id === preferredTelegramModel(message));
         await sendTelegramText(
           message,
-          `Active model: ${current?.label || preferredTelegramModel(chatId)}\n\nUse /model <number or model name>. See /models for choices.`
+          `Active model: ${current?.label || preferredTelegramModel(message)}\n\nUse /model <number or model name>. See /models for choices.`
         );
         return true;
       }
@@ -1001,12 +1065,12 @@ async function handleTelegramCommand(command, message) {
         return true;
       }
       const selected = selectModel(model.id);
-      telegramModelPreferences.set(String(chatId), selected);
+      telegramModelPreferences.set(telegramConversationScope(message), selected);
       await sendTelegramText(message, `Model changed to ${model.label} [${model.tag}].\n${model.id}`);
       return true;
     }
     case "reset":
-      await resetConversation(conversationId(chatId));
+      await resetConversation(conversationId(message));
       await sendTelegramText(message, "Conversation memory cleared. Your selected model is unchanged.");
       return true;
     case "balance": {
@@ -1148,7 +1212,7 @@ export async function handleTelegram(update) {
     return;
   }
 
-  const chatKey = String(message.chat.id);
+  const chatKey = telegramConversationScope(message);
   if (telegramChatsInFlight.has(chatKey)) {
     await sendTelegramText(message, "I am still generating the previous answer. Please wait for it to finish.");
     return;
@@ -1181,7 +1245,7 @@ export async function handleTelegram(update) {
   }
 
   const isPrivateChat = message.chat.type === "private";
-  const model = preferredTelegramModel(message.chat.id);
+  const model = preferredTelegramModel(message);
   const aiText = chatPromptWithPersona(text, userControl?.persona);
   const draftId = telegramDraftId(update, message);
   let streamedText = "";
@@ -1227,7 +1291,7 @@ export async function handleTelegram(update) {
 
   try {
     const answer = await streamReply({
-      conversationId: conversationId(message.chat.id),
+      conversationId: conversationId(message),
       text: aiText,
       model,
       onDelta(delta) {
@@ -1336,6 +1400,84 @@ export async function telegramDashboardState({ userId } = {}) {
     stats,
     telegram: telegramPublicStatus()
   };
+}
+
+function nvidiaHourlyRequestLimit() {
+  const parsed = Number(process.env.NVIDIA_GLOBAL_REQUESTS_PER_HOUR || 300);
+  return Number.isSafeInteger(parsed) && parsed >= 10 && parsed <= 1_000_000 ? parsed : 300;
+}
+
+export async function reserveTelegramWebAiUsage({ userId, requestId, model } = {}) {
+  const resolvedUserId = String(userId ?? "");
+  if (!/^[1-9]\d*$/.test(resolvedUserId)
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(requestId || ""))) {
+    return { allowed: false, status: 400, error: "A valid authenticated request ID is required" };
+  }
+  if (!(await modeEnabled("chat"))) {
+    return { allowed: false, status: 403, error: "AI Chat Mode is currently disabled" };
+  }
+  if (!telegramStarLedger
+      || typeof telegramStarLedger.getUserControl !== "function"
+      || typeof telegramStarLedger.reserveProviderCapacity !== "function") {
+    return { allowed: false, status: 503, error: "AI usage controls are temporarily unavailable" };
+  }
+
+  const userControl = await telegramStarLedger.getUserControl(resolvedUserId);
+  const isAdmin = telegramUserIsAdmin(resolvedUserId);
+  if (userControl?.banned && !isAdmin) {
+    return { allowed: false, status: 403, error: "This account is not permitted to use NvidBot" };
+  }
+
+  const reservationId = `web:${resolvedUserId}:${requestId}`;
+  const unlimitedCredits = isAdmin || userControl?.unlimitedCredits === true;
+  let creditReserved = false;
+  if (telegramStarsRequired() && !unlimitedCredits) {
+    const reservation = await telegramStarLedger.reservePrompt(resolvedUserId, { reservationId, cost: 1 });
+    if (!reservation?.reserved) {
+      const duplicate = ["reserved", "completed", "restored"].includes(reservation?.state);
+      return {
+        allowed: false,
+        status: duplicate ? 409 : 402,
+        error: duplicate
+          ? "This AI request has already been processed"
+          : `You need 1 AI message credit. Current balance: ${balanceValue(reservation)}`
+      };
+    }
+    creditReserved = true;
+  }
+
+  try {
+    const providerBudget = await telegramStarLedger.reserveProviderCapacity({
+      providerKey: "nvidia",
+      limit: nvidiaHourlyRequestLimit(),
+      cost: model === "nvidia/llama-3.3-nemotron-super-49b-v1.5" ? 2 : 1,
+      windowSeconds: 3600
+    });
+    if (!providerBudget?.reserved) {
+      if (creditReserved) await telegramStarLedger.restorePrompt(reservationId);
+      return { allowed: false, status: 429, error: "The NVIDIA hourly safety limit has been reached. Try again later." };
+    }
+  } catch (error) {
+    if (creditReserved) await telegramStarLedger.restorePrompt(reservationId).catch(() => undefined);
+    throw error;
+  }
+
+  return {
+    allowed: true,
+    userId: resolvedUserId,
+    reservationId,
+    creditReserved,
+    unlimitedCredits,
+    persona: userControl?.persona ?? null
+  };
+}
+
+export async function completeTelegramWebAiUsage(usage) {
+  if (usage?.creditReserved) await requireStarLedger().completePrompt(usage.reservationId);
+}
+
+export async function restoreTelegramWebAiUsage(usage) {
+  if (usage?.creditReserved) await requireStarLedger().restorePrompt(usage.reservationId);
 }
 
 export function telegramServiceReady() {

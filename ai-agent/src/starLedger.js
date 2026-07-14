@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS telegram_user_controls (
   persona TEXT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS ai_provider_usage_buckets (
+  provider_key TEXT NOT NULL,
+  bucket_start TIMESTAMPTZ NOT NULL,
+  used INTEGER NOT NULL CHECK (used >= 0),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (provider_key, bucket_start)
+);
 `;
 
 export class StarLedgerValidationError extends TypeError {
@@ -854,6 +862,45 @@ export function createStarLedger({
     };
   }
 
+  async function reserveProviderCapacity({
+    providerKey: rawProviderKey = 'nvidia',
+    limit: rawLimit,
+    cost: rawCost = 1,
+    windowSeconds: rawWindowSeconds = 3600,
+  } = {}) {
+    const providerKey = normalizeNonEmptyString(rawProviderKey, 'providerKey', 64);
+    const limit = assertPositiveInteger(rawLimit, 'limit', 1_000_000);
+    const cost = assertPositiveInteger(rawCost, 'cost', 100);
+    const windowSeconds = assertPositiveInteger(rawWindowSeconds, 'windowSeconds', 86_400);
+    if (cost > limit) {
+      return { reserved: false, providerKey, used: null, limit, resetAt: null };
+    }
+
+    const date = normalizeDateFromClock(now);
+    const windowMs = windowSeconds * 1000;
+    const bucketStart = new Date(Math.floor(date.getTime() / windowMs) * windowMs);
+    const resetAt = new Date(bucketStart.getTime() + windowMs);
+    await init();
+    const resolvedPool = await resolvePool();
+    const reserved = await resolvedPool.query(
+      `/* star-ledger:reserve-provider-capacity */
+       INSERT INTO ai_provider_usage_buckets (provider_key, bucket_start, used, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (provider_key, bucket_start)
+       DO UPDATE SET used = ai_provider_usage_buckets.used + EXCLUDED.used, updated_at = NOW()
+       WHERE ai_provider_usage_buckets.used + EXCLUDED.used <= $4
+       RETURNING used`,
+      [providerKey, bucketStart, cost, limit],
+    );
+    return {
+      reserved: reserved.rowCount === 1,
+      providerKey,
+      used: reserved.rowCount === 1 ? Number(reserved.rows[0].used) : null,
+      limit,
+      resetAt,
+    };
+  }
+
   async function getModeSettings(defaultModes = {}) {
     if (typeof defaultModes !== 'object' || defaultModes === null) {
       throw new StarLedgerValidationError('defaultModes must be an object');
@@ -988,6 +1035,7 @@ export function createStarLedger({
     completePrompt,
     restorePrompt,
     refundStaleReservations,
+    reserveProviderCapacity,
     getStats,
     getModeSettings,
     setModeEnabled,

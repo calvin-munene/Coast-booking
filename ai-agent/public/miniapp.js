@@ -22,10 +22,14 @@ function modeCard([key, mode]) {
 async function loadDashboard() {
   tg?.ready();
   tg?.expand();
+  const storedSession = sessionStorage.getItem("nvidbotTelegramSession") || "";
   const response = await fetch("/api/miniapp/state", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ initData: tg?.initData || "" })
+    headers: {
+      "content-type": "application/json",
+      ...(storedSession ? { authorization: `Bearer ${storedSession}` } : {})
+    },
+    body: JSON.stringify(storedSession ? {} : { initData: tg?.initData || "" })
   });
   if (!response.ok) {
     setText("role", "Telegram only");
@@ -34,7 +38,8 @@ async function loadDashboard() {
     document.getElementById("modes").innerHTML = '<p class="copy">Launch this dashboard from /dashboard inside Telegram.</p>';
     return;
   }
-  const { dashboard } = await response.json();
+  const { dashboard, sessionToken } = await response.json();
+  if (sessionToken) sessionStorage.setItem("nvidbotTelegramSession", sessionToken);
   botLink = dashboard.telegram?.link || "/";
   setText("role", dashboard.isAdmin ? "Admin" : "User");
   setText("credits", dashboard.unlimitedCredits ? "Unlimited" : String(dashboard.balance ?? "0"));

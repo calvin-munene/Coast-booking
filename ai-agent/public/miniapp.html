@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NvidBot Control</title>
+  <link rel="stylesheet" href="/miniapp.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <img class="avatar" src="/telegram/profile-picture.png" alt="NvidBot">
+      <div>
+        <p class="eyebrow">NVIDIA AI OPERATIONS</p>
+        <h1>NvidBot Control</h1>
+      </div>
+    </section>
+
+    <section class="status-grid">
+      <article class="stat">
+        <span>Role</span>
+        <strong id="role">Loading</strong>
+      </article>
+      <article class="stat">
+        <span>Credits</span>
+        <strong id="credits">...</strong>
+      </article>
+      <article class="stat">
+        <span>Access</span>
+        <strong id="access">Checking</strong>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">
+        <h2>Modes</h2>
+        <span>Admin controls run in Telegram</span>
+      </div>
+      <div id="modes" class="mode-list"></div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">
+        <h2>Personal AI Style</h2>
+        <span>Use /persona in chat</span>
+      </div>
+      <p id="persona" class="copy">Loading your customization.</p>
+    </section>
+
+    <section id="admin-panel" class="panel hidden">
+      <div class="section-title">
+        <h2>Admin Console</h2>
+        <span>Full control</span>
+      </div>
+      <div class="admin-grid">
+        <article>
+          <span>Total users</span>
+          <strong id="total-users">0</strong>
+        </article>
+        <article>
+          <span>Credits in wallets</span>
+          <strong id="total-balance">0</strong>
+        </article>
+        <article>
+          <span>Paid prompts</span>
+          <strong id="paid-prompts">0</strong>
+        </article>
+      </div>
+      <p class="copy">
+        Admin commands: /mode &lt;mode&gt; on|off, /ban &lt;user-id&gt; reason, /unban &lt;user-id&gt;, /starbalance.
+      </p>
+    </section>
+
+    <section class="actions">
+      <button id="open-bot" type="button">Open Bot</button>
+      <button id="close-app" type="button">Close</button>
+    </section>
+  </main>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="/miniapp.js"></script>
+</body>
+</html>

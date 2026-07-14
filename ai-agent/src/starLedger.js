@@ -56,6 +56,21 @@ CREATE TABLE IF NOT EXISTS telegram_star_prompt_reservations (
 CREATE INDEX IF NOT EXISTS telegram_star_prompt_reservations_stale_idx
   ON telegram_star_prompt_reservations(created_at)
   WHERE status = 'reserved';
+
+CREATE TABLE IF NOT EXISTS telegram_bot_modes (
+  mode TEXT PRIMARY KEY,
+  enabled BOOLEAN NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS telegram_user_controls (
+  user_id BIGINT PRIMARY KEY REFERENCES telegram_star_accounts(user_id),
+  banned BOOLEAN NOT NULL DEFAULT FALSE,
+  ban_reason TEXT,
+  unlimited_credits BOOLEAN NOT NULL DEFAULT FALSE,
+  persona TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 `;
 
 export class StarLedgerValidationError extends TypeError {
@@ -132,6 +147,11 @@ function normalizeNonEmptyString(value, fieldName, maxLength = 256) {
 function normalizeOptionalString(value, fieldName, maxLength) {
   if (value === undefined || value === null || value === '') return null;
   return normalizeNonEmptyString(value, fieldName, maxLength);
+}
+
+function normalizeBoolean(value, fieldName) {
+  if (typeof value !== 'boolean') throw new StarLedgerValidationError(`${fieldName} must be a boolean`);
+  return value;
 }
 
 function normalizeDbInt(value, fieldName = 'database integer') {
@@ -834,6 +854,116 @@ export function createStarLedger({
     };
   }
 
+  async function getModeSettings(defaultModes = {}) {
+    if (typeof defaultModes !== 'object' || defaultModes === null) {
+      throw new StarLedgerValidationError('defaultModes must be an object');
+    }
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:get-mode-settings */
+       SELECT mode, enabled FROM telegram_bot_modes`,
+    );
+    const modes = { ...defaultModes };
+    for (const row of result.rows) {
+      if (Object.hasOwn(defaultModes, row.mode)) modes[row.mode] = row.enabled === true;
+    }
+    return modes;
+  }
+
+  async function setModeEnabled(rawMode, rawEnabled) {
+    const mode = normalizeNonEmptyString(rawMode, 'mode', 64);
+    const enabled = normalizeBoolean(rawEnabled, 'enabled');
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:set-mode-enabled */
+       INSERT INTO telegram_bot_modes (mode, enabled, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (mode)
+       DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
+       RETURNING mode, enabled, updated_at`,
+      [mode, enabled],
+    );
+    return {
+      mode: result.rows[0].mode,
+      enabled: result.rows[0].enabled === true,
+      updatedAt: result.rows[0].updated_at,
+    };
+  }
+
+  async function getUserControl(rawUserId) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:get-user-control */
+       SELECT banned, ban_reason, unlimited_credits, persona
+       FROM telegram_user_controls
+       WHERE user_id = $1`,
+      [userId],
+    );
+    const row = result.rows[0] || {};
+    return {
+      userId,
+      banned: row.banned === true,
+      banReason: row.ban_reason ?? null,
+      unlimitedCredits: row.unlimited_credits === true,
+      persona: row.persona ?? null,
+    };
+  }
+
+  async function setUserBan(rawUserId, rawBanned, rawReason = null) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const banned = normalizeBoolean(rawBanned, 'banned');
+    const reason = normalizeOptionalString(rawReason, 'banReason', 500);
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const result = await client.query(
+        `/* star-ledger:set-user-ban */
+         INSERT INTO telegram_user_controls (user_id, banned, ban_reason, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (user_id)
+         DO UPDATE SET banned = EXCLUDED.banned, ban_reason = EXCLUDED.ban_reason, updated_at = NOW()
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona`,
+        [userId, banned, reason],
+      );
+      const row = result.rows[0];
+      return {
+        userId: normalizeDbInt(row.user_id, 'user_id'),
+        banned: row.banned === true,
+        banReason: row.ban_reason ?? null,
+        unlimitedCredits: row.unlimited_credits === true,
+        persona: row.persona ?? null,
+      };
+    });
+  }
+
+  async function setUserPersona(rawUserId, rawPersona) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const persona = normalizeOptionalString(rawPersona, 'persona', 1000);
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const result = await client.query(
+        `/* star-ledger:set-user-persona */
+         INSERT INTO telegram_user_controls (user_id, persona, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id)
+         DO UPDATE SET persona = EXCLUDED.persona, updated_at = NOW()
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona`,
+        [userId, persona],
+      );
+      const row = result.rows[0];
+      return {
+        userId: normalizeDbInt(row.user_id, 'user_id'),
+        banned: row.banned === true,
+        banReason: row.ban_reason ?? null,
+        unlimitedCredits: row.unlimited_credits === true,
+        persona: row.persona ?? null,
+      };
+    });
+  }
+
   async function close() {
     if (closed) return;
     closed = true;
@@ -859,6 +989,11 @@ export function createStarLedger({
     restorePrompt,
     refundStaleReservations,
     getStats,
+    getModeSettings,
+    setModeEnabled,
+    getUserControl,
+    setUserBan,
+    setUserPersona,
     close,
   };
 }

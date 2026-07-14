@@ -1,4 +1,5 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ import {
   configureTelegramBot,
   handleTelegram,
   handleWhatsApp,
+  telegramDashboardState,
   telegramPublicStatus,
   telegramServiceReady,
   telegramUpdateRequiresSynchronousAck,
@@ -59,6 +61,30 @@ function consumeChatBudget(req, model) {
 
 function validSessionId(value) {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function validateTelegramWebAppInitData(initData) {
+  const token = process.env.TELEGRAM_BOT_TOKEN?.trim();
+  if (!token || typeof initData !== "string" || !initData) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get("hash");
+  if (!hash || !/^[a-f0-9]{64}$/i.test(hash)) return null;
+  params.delete("hash");
+  const dataCheckString = [...params.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+  const secret = crypto.createHmac("sha256", "WebAppData").update(token).digest();
+  const expected = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+  const left = Buffer.from(expected, "hex");
+  const right = Buffer.from(hash, "hex");
+  if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) return null;
+  try {
+    const user = JSON.parse(params.get("user") || "{}");
+    return user?.id ? { userId: String(user.id), user } : null;
+  } catch {
+    return null;
+  }
 }
 
 function streamErrorMessage(error) {
@@ -151,6 +177,16 @@ export function createAppServer() {
       return json(res, 200, { telegram: telegramPublicStatus() });
     }
 
+    if (req.method === "POST" && url.pathname === "/api/miniapp/state") {
+      const data = JSON.parse((await body(req)).toString("utf8") || "{}");
+      const verified = validateTelegramWebAppInitData(data.initData);
+      if (!verified) return json(res, 401, { error: "Telegram mini app authentication is required" });
+      return json(res, 200, {
+        verified: true,
+        dashboard: await telegramDashboardState({ userId: verified.userId })
+      });
+    }
+
     if (req.method === "POST" && url.pathname === "/api/chat") {
       const data = JSON.parse((await body(req)).toString("utf8"));
       if (typeof data.message !== "string" || !data.message.trim() || data.message.length > 8000) {
@@ -199,11 +235,26 @@ export function createAppServer() {
       return json(res, 200, { ok: true });
     }
 
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/app.js" || url.pathname === "/styles.css" || url.pathname === "/og.png")) {
-      const name = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
-      const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png" };
-      res.writeHead(200, { "content-type": types[path.extname(name)] });
-      return res.end(await fs.readFile(path.join(root, name)));
+    if (req.method === "GET") {
+      const name = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname.slice(1));
+      const filePath = path.normalize(path.join(root, name));
+      if (!filePath.startsWith(root + path.sep) && filePath !== root) return json(res, 404, { error: "Not found" });
+      const types = {
+        ".html": "text/html; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".svg": "image/svg+xml; charset=utf-8"
+      };
+      try {
+        const content = await fs.readFile(filePath);
+        res.writeHead(200, { "content-type": types[path.extname(filePath).toLowerCase()] || "application/octet-stream" });
+        return res.end(content);
+      } catch (error) {
+        if (error?.code !== "ENOENT" && error?.code !== "EISDIR") throw error;
+      }
     }
     json(res, 404, { error: "Not found" });
   } catch (error) {

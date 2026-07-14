@@ -79,6 +79,11 @@ function starLedgerDouble(overrides = {}) {
     async restorePrompt() {},
     async refundStaleReservations() { return { restoredCount: 0, refundedAmount: "0" }; },
     async getStats() { return { totalBalance: "0", paymentCount: "0", completedPrompts: "0" }; },
+    async getModeSettings(defaultModes) { return { ...defaultModes }; },
+    async setModeEnabled(mode, enabled) { return { mode, enabled, updatedAt: new Date() }; },
+    async getUserControl(userId) { return { userId: String(userId), banned: false, banReason: null, unlimitedCredits: false, persona: null }; },
+    async setUserBan(userId, banned, reason) { return { userId: String(userId), banned, banReason: reason, unlimitedCredits: false, persona: null }; },
+    async setUserPersona(userId, persona) { return { userId: String(userId), banned: false, banReason: null, unlimitedCredits: false, persona }; },
     ...overrides
   };
 }
@@ -171,6 +176,7 @@ test("configures Telegram commands and a protected Render webhook", async () => 
     "getMe",
     "setMyShortDescription",
     "setMyDescription",
+    "setChatMenuButton",
     "setMyCommands",
     "setWebhook",
     "getWebhookInfo"
@@ -180,13 +186,14 @@ test("configures Telegram commands and a protected Render webhook", async () => 
     "Hacker-style NVIDIA AI assistant for code, strategy, and fast answers."
   );
   assert.match(calls[2].payload.description, /NvidBot is a hacker-style AI assistant powered by NVIDIA models\./);
-  assert.deepEqual(calls[3].payload.commands.map(({ command }) => command), [
-    "start", "help", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "starbalance", "whoami"
+  assert.equal(calls[3].payload.menu_button.web_app.url, "https://nvidbot.onrender.com/miniapp.html");
+  assert.deepEqual(calls[4].payload.commands.map(({ command }) => command), [
+    "start", "help", "dashboard", "modes", "mode", "persona", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "ban", "unban", "starbalance", "whoami"
   ]);
-  assert.deepEqual(calls[4].payload, {
+  assert.deepEqual(calls[5].payload, {
     url: "https://nvidbot.onrender.com/webhooks/telegram",
     secret_token: "valid_secret-123",
-    allowed_updates: ["message", "pre_checkout_query", "callback_query"],
+    allowed_updates: ["message", "pre_checkout_query", "callback_query", "inline_query", "chat_join_request"],
     max_connections: 10
   });
   assert.equal(status.configured, true);
@@ -337,6 +344,84 @@ test("uses typing and a final reply without drafts in a group", async () => {
   await handleTelegram(telegramUpdate({ text: "Question", chatId: -900, type: "supergroup", messageId: 22, updateId: 32 }));
 
   assert.deepEqual(telegramMethods, ["sendChatAction", "sendMessage"]);
+});
+
+test("admin AI chat does not consume Stars credits", async () => {
+  enableStarTestEnvironment();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  let reserved = false;
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async reservePrompt() {
+      reserved = true;
+      return { reserved: false, balance: "0" };
+    }
+  }));
+  const telegramCalls = [];
+  global.fetch = async (url, options) => {
+    if (new URL(url).hostname === "api.telegram.org") {
+      telegramCalls.push(new URL(url).pathname.split("/").at(-1));
+      return telegramSuccess();
+    }
+    return new Response('data: {"choices":[{"delta":{"content":"Admin answer"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  };
+
+  await handleTelegram(telegramUpdate({ text: "Admin prompt", userId: 6643462826, chatId: 6643462826 }));
+
+  assert.equal(reserved, false);
+  assert.ok(telegramCalls.includes("sendMessage"));
+});
+
+test("banned users are blocked before AI inference", async () => {
+  enableStarTestEnvironment();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  let nvidiaCalled = false;
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async getUserControl(userId) {
+      return { userId: String(userId), banned: true, banReason: "abuse", unlimitedCredits: false, persona: null };
+    }
+  }));
+  const messages = [];
+  global.fetch = async (url, options) => {
+    if (new URL(url).hostname !== "api.telegram.org") nvidiaCalled = true;
+    else messages.push(JSON.parse(options.body));
+    return telegramSuccess();
+  };
+
+  await handleTelegram(telegramUpdate({ text: "Blocked prompt", userId: 123, chatId: 123 }));
+
+  assert.equal(nvidiaCalled, false);
+  assert.match(messages[0].text, /banned from NvidBot/);
+});
+
+test("disabled chat mode stops paid AI inference without charging", async () => {
+  enableStarTestEnvironment();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  let reserved = false;
+  let nvidiaCalled = false;
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async getModeSettings(defaultModes) {
+      return { ...defaultModes, chat: false };
+    },
+    async reservePrompt() {
+      reserved = true;
+      return { reserved: true, balance: "0" };
+    }
+  }));
+  const messages = [];
+  global.fetch = async (url, options) => {
+    if (new URL(url).hostname !== "api.telegram.org") nvidiaCalled = true;
+    else messages.push(JSON.parse(options.body));
+    return telegramSuccess();
+  };
+
+  await handleTelegram(telegramUpdate({ text: "Should not run", userId: 123, chatId: 123 }));
+
+  assert.equal(reserved, false);
+  assert.equal(nvidiaCalled, false);
+  assert.match(messages[0].text, /AI Chat Mode is currently disabled/);
 });
 
 test("top-up confirmation records terms acceptance and sends an XTR invoice", async () => {

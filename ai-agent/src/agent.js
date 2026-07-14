@@ -1,5 +1,6 @@
 const conversations = new Map();
 const MAX_TURNS = 12;
+const RETRYABLE_NVIDIA_STATUS = new Set([429, 502, 503, 504]);
 
 const MODEL_DEFINITIONS = [
   {
@@ -66,6 +67,30 @@ function definitionFor(id) {
   };
 }
 
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function requestCompletion(url, options) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(60000) });
+    if (response.ok) return response;
+
+    const detail = await response.text();
+    if (!RETRYABLE_NVIDIA_STATUS.has(response.status) || attempt === 2) {
+      const error = new Error(`NVIDIA API returned ${response.status}: ${detail.slice(0, 300)}`);
+      error.statusCode = response.status;
+      throw error;
+    }
+
+    const retryAfterSeconds = Number(response.headers.get("retry-after"));
+    const delay = Number.isFinite(retryAfterSeconds)
+      ? Math.min(retryAfterSeconds * 1000, 5000)
+      : 500 * (2 ** attempt);
+    await wait(delay);
+  }
+}
+
 export function availableModels() {
   return configuredModelIds().map((id) => {
     const { label, tag, description } = definitionFor(id);
@@ -99,7 +124,7 @@ export async function reply({ conversationId, text, model }) {
     { role: "user", content: text }
   ];
 
-  const response = await fetch(`${process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1"}/chat/completions`, {
+  const response = await requestCompletion(`${process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1"}/chat/completions`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${apiKey}`,
@@ -111,14 +136,8 @@ export async function reply({ conversationId, text, model }) {
       temperature: modelDefinition.temperature,
       top_p: modelDefinition.topP,
       max_tokens: modelDefinition.maxTokens
-    }),
-    signal: AbortSignal.timeout(60000)
+    })
   });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`NVIDIA API returned ${response.status}: ${detail.slice(0, 300)}`);
-  }
 
   const data = await response.json();
   const answer = data.choices?.[0]?.message?.content?.trim();

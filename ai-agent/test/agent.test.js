@@ -72,3 +72,28 @@ test("sends the selected approved model to NVIDIA", async () => {
   if (previousModels === undefined) delete process.env.NVIDIA_MODELS;
   else process.env.NVIDIA_MODELS = previousModels;
 });
+
+test("retries temporary NVIDIA capacity errors", async () => {
+  const previousKey = process.env.NVIDIA_API_KEY;
+  const previousFetch = globalThis.fetch;
+  process.env.NVIDIA_API_KEY = "test-key";
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests += 1;
+    if (requests === 1) {
+      return new Response("busy", { status: 503, headers: { "retry-after": "0" } });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: "recovered" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+
+  const answer = await reply({ conversationId: "test-retry", text: "hello" });
+  assert.equal(answer, "recovered");
+  assert.equal(requests, 2);
+
+  globalThis.fetch = previousFetch;
+  if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;
+  else process.env.NVIDIA_API_KEY = previousKey;
+});

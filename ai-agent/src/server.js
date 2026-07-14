@@ -109,7 +109,12 @@ const server = http.createServer(async (req, res) => {
     json(res, 404, { error: "Not found" });
   } catch (error) {
     console.error(error);
-    json(res, 500, { error: "The assistant could not complete that request" });
+    const providerUnavailable = [429, 502, 503, 504].includes(error.statusCode);
+    json(res, providerUnavailable ? 503 : 500, {
+      error: providerUnavailable
+        ? "NVIDIA is temporarily busy. Please try again in a moment."
+        : "The assistant could not complete that request"
+    });
   }
 });
 

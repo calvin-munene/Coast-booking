@@ -11,6 +11,10 @@ One Node.js service powers a browser chat, Telegram bot, and WhatsApp Cloud API 
 
 Never put API keys in browser code or commit `.env`.
 
+## Browser model selector
+
+The browser can switch between the server-approved NVIDIA models returned by `/api/models`. Set `NVIDIA_MODEL` for the preferred default and optionally set `NVIDIA_MODELS` to an authoritative comma-separated allowlist. If the preferred default is not in that allowlist, the first allowed model becomes the default. The NVIDIA API key remains server-side, and model IDs submitted by the browser are rejected unless they are allowed.
+
 ## Deploy on Render
 
 The repository includes a root-level `render.yaml` Blueprint. In Render, create a new Blueprint from the GitHub repository, then provide the secret values requested during setup. Render supplies `PORT` automatically.

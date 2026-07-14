@@ -2,11 +2,14 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { reply } from "./agent.js";
+import { availableModels, defaultModel, reply, selectModel } from "./agent.js";
 import { handleTelegram, handleWhatsApp, validMetaSignature } from "./channels.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const port = Number(process.env.PORT || 3000);
+const chatRateLimits = new Map();
+const RATE_WINDOW_MS = 10 * 60 * 1000;
+const RATE_BUDGET = 30;
 
 function json(res, status, value) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -24,18 +27,53 @@ async function body(req) {
   return Buffer.concat(chunks);
 }
 
+function chatClient(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  return (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim()) || req.socket.remoteAddress || "unknown";
+}
+
+function consumeChatBudget(req, model) {
+  const now = Date.now();
+  if (chatRateLimits.size > 1000) {
+    for (const [client, bucket] of chatRateLimits) {
+      if (bucket.resetAt <= now) chatRateLimits.delete(client);
+    }
+  }
+  const client = chatClient(req);
+  const current = chatRateLimits.get(client);
+  const bucket = !current || current.resetAt <= now ? { used: 0, resetAt: now + RATE_WINDOW_MS } : current;
+  const cost = model === "openai/gpt-oss-120b" ? 3 : 1;
+  if (bucket.used + cost > RATE_BUDGET) return false;
+  bucket.used += cost;
+  chatRateLimits.set(client, bucket);
+  return true;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   try {
     if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true });
+
+    if (req.method === "GET" && url.pathname === "/api/models") {
+      return json(res, 200, { models: availableModels(), defaultModel: defaultModel() });
+    }
 
     if (req.method === "POST" && url.pathname === "/api/chat") {
       const data = JSON.parse((await body(req)).toString("utf8"));
       if (typeof data.message !== "string" || !data.message.trim() || data.message.length > 8000) {
         return json(res, 400, { error: "Message must contain 1-8000 characters" });
       }
-      const answer = await reply({ conversationId: `web:${data.sessionId || "anonymous"}`, text: data.message.trim() });
-      return json(res, 200, { answer });
+      let model;
+      try {
+        model = selectModel(data.model);
+      } catch (error) {
+        return json(res, 400, { error: error.message });
+      }
+      if (!consumeChatBudget(req, model)) {
+        return json(res, 429, { error: "Request limit reached. Please try again in a few minutes." });
+      }
+      const answer = await reply({ conversationId: `web:${data.sessionId || "anonymous"}`, text: data.message.trim(), model });
+      return json(res, 200, { answer, model });
     }
 
     if (req.method === "POST" && url.pathname === "/webhooks/telegram") {

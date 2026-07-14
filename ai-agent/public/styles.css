@@ -21,6 +21,8 @@
 html { min-width: 320px; background: var(--bg); scroll-behavior: smooth; }
 
 body {
+  position: relative;
+  isolation: isolate;
   margin: 0;
   min-height: 100vh;
   overflow-x: hidden;
@@ -31,6 +33,16 @@ body {
     var(--bg);
   font-family: var(--sans);
   -webkit-font-smoothing: antialiased;
+}
+
+.hacker-canvas {
+  position: fixed;
+  z-index: -3;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  opacity: 0.72;
 }
 
 button, textarea { font: inherit; }
@@ -88,6 +100,8 @@ button { color: inherit; }
 }
 
 .site-frame {
+  position: relative;
+  z-index: 1;
   width: min(1480px, calc(100% - 48px));
   min-height: 100vh;
   margin: 0 auto;
@@ -230,7 +244,8 @@ h1 em { color: var(--green-bright); font-style: normal; font-weight: 720; text-s
   grid-template-rows: auto 1fr auto auto auto;
   overflow: hidden;
   border: 1px solid var(--line-strong);
-  background: linear-gradient(150deg, rgba(17, 25, 19, 0.96), rgba(7, 11, 8, 0.98) 68%);
+  background: linear-gradient(150deg, rgba(17, 25, 19, 0.91), rgba(7, 11, 8, 0.95) 68%);
+  backdrop-filter: blur(16px);
   box-shadow: 0 38px 110px rgba(0, 0, 0, 0.52), 0 0 60px rgba(93, 165, 18, 0.06);
   clip-path: polygon(0 0, calc(100% - 22px) 0, 100% 22px, 100% 100%, 22px 100%, 0 calc(100% - 22px));
 }
@@ -266,6 +281,41 @@ h1 em { color: var(--green-bright); font-style: normal; font-weight: 720; text-s
 .terminal-header p { margin: 6px 0 0; color: #657068; font-family: var(--mono); font-size: 9px; letter-spacing: 0.06em; }
 .session-code { color: #5c675f; font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em; white-space: nowrap; }
 .session-code b { color: #8b968e; font-weight: 500; }
+
+.terminal-controls { justify-content: flex-end; }
+.model-picker {
+  min-width: 188px;
+  display: grid;
+  gap: 5px;
+  color: #5f6b62;
+  font-family: var(--mono);
+  font-size: 7px;
+  letter-spacing: 0.16em;
+}
+
+.model-picker select {
+  width: 100%;
+  min-height: 32px;
+  padding: 0 30px 0 10px;
+  border: 1px solid rgba(142, 234, 34, 0.18);
+  border-radius: 0;
+  outline: none;
+  appearance: none;
+  background:
+    linear-gradient(45deg, transparent 50%, var(--green) 50%) calc(100% - 13px) 13px / 5px 5px no-repeat,
+    linear-gradient(135deg, var(--green) 50%, transparent 50%) calc(100% - 8px) 13px / 5px 5px no-repeat,
+    rgba(5, 10, 6, 0.86);
+  color: #c2ccc4;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.model-picker select:hover,
+.model-picker select:focus { border-color: var(--green); }
+.model-picker select:disabled { cursor: wait; color: #5f695f; }
+.model-picker option { background: #080d09; color: #dce3dd; }
 
 .messages {
   min-height: 250px;
@@ -449,8 +499,12 @@ a:focus-visible { outline: 2px solid var(--green-bright); outline-offset: 3px; }
   .capability div { display: flex; }
   .capability small { text-align: right; }
   .system-metrics div { padding: 12px 9px; }
-  .chat-terminal { min-height: 680px; max-height: none; clip-path: none; }
+  .chat-terminal { min-height: 680px; max-height: none; clip-path: none; backdrop-filter: none; }
   .terminal-header { padding: 16px; }
+  .terminal-header > div:first-child { min-width: 0; }
+  .terminal-header h2 { white-space: nowrap; }
+  .terminal-controls { gap: 0; }
+  .model-picker { min-width: 164px; }
   .session-code { display: none; }
   .messages { padding: 24px 16px 18px; }
   .message { width: 95%; }
@@ -469,6 +523,11 @@ a:focus-visible { outline: 2px solid var(--green-bright); outline-offset: 3px; }
 @media (max-width: 430px) {
   .topbar-actions { gap: 0; }
   .connection-pill { border: 0; background: transparent; padding-right: 0; }
+  .terminal-header { align-items: flex-start; }
+  .terminal-header > div:first-child { align-items: flex-start; }
+  .terminal-dots { display: none; }
+  .model-picker { min-width: 142px; }
+  .model-picker select { font-size: 8px; }
   .capability div { display: grid; }
   .capability small { text-align: left; }
   .suggestions button { flex-basis: 100%; text-align: left; }

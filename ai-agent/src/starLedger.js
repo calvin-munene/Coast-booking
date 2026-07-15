@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { normalizeAssistantMode } from './assistantModes.js';
 
 const MAX_INT64 = 9_223_372_036_854_775_807n;
 const MAX_STAR_AMOUNT = 10_000;
@@ -69,8 +70,12 @@ CREATE TABLE IF NOT EXISTS telegram_user_controls (
   ban_reason TEXT,
   unlimited_credits BOOLEAN NOT NULL DEFAULT FALSE,
   persona TEXT,
+  selected_mode TEXT NOT NULL DEFAULT 'chat',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE telegram_user_controls
+  ADD COLUMN IF NOT EXISTS selected_mode TEXT NOT NULL DEFAULT 'chat';
 
 CREATE TABLE IF NOT EXISTS ai_provider_usage_buckets (
   provider_key TEXT NOT NULL,
@@ -1006,7 +1011,7 @@ export function createStarLedger({
     const resolvedPool = await resolvePool();
     const result = await resolvedPool.query(
       `/* star-ledger:get-user-control */
-       SELECT banned, ban_reason, unlimited_credits, persona
+       SELECT banned, ban_reason, unlimited_credits, persona, selected_mode
        FROM telegram_user_controls
        WHERE user_id = $1`,
       [userId],
@@ -1018,6 +1023,7 @@ export function createStarLedger({
       banReason: row.ban_reason ?? null,
       unlimitedCredits: row.unlimited_credits === true,
       persona: row.persona ?? null,
+      selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
     };
   }
 
@@ -1033,7 +1039,7 @@ export function createStarLedger({
          VALUES ($1, $2, $3, NOW())
          ON CONFLICT (user_id)
          DO UPDATE SET banned = EXCLUDED.banned, ban_reason = EXCLUDED.ban_reason, updated_at = NOW()
-         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona`,
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode`,
         [userId, banned, reason],
       );
       const row = result.rows[0];
@@ -1043,6 +1049,7 @@ export function createStarLedger({
         banReason: row.ban_reason ?? null,
         unlimitedCredits: row.unlimited_credits === true,
         persona: row.persona ?? null,
+        selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
       };
     });
   }
@@ -1058,7 +1065,7 @@ export function createStarLedger({
          VALUES ($1, $2, NOW())
          ON CONFLICT (user_id)
          DO UPDATE SET persona = EXCLUDED.persona, updated_at = NOW()
-         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona`,
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode`,
         [userId, persona],
       );
       const row = result.rows[0];
@@ -1068,6 +1075,33 @@ export function createStarLedger({
         banReason: row.ban_reason ?? null,
         unlimitedCredits: row.unlimited_credits === true,
         persona: row.persona ?? null,
+        selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
+      };
+    });
+  }
+
+  async function setUserMode(rawUserId, rawMode) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const selectedMode = normalizeAssistantMode(rawMode);
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const result = await client.query(
+        `/* star-ledger:set-user-mode */
+         INSERT INTO telegram_user_controls (user_id, selected_mode, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id)
+         DO UPDATE SET selected_mode = EXCLUDED.selected_mode, updated_at = NOW()
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode`,
+        [userId, selectedMode],
+      );
+      const row = result.rows[0];
+      return {
+        userId: normalizeDbInt(row.user_id, 'user_id'),
+        banned: row.banned === true,
+        banReason: row.ban_reason ?? null,
+        unlimitedCredits: row.unlimited_credits === true,
+        persona: row.persona ?? null,
+        selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
       };
     });
   }
@@ -1105,6 +1139,7 @@ export function createStarLedger({
     getUserControl,
     setUserBan,
     setUserPersona,
+    setUserMode,
     close,
   };
 }

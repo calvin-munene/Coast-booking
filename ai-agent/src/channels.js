@@ -11,6 +11,12 @@ import { logger } from "./logger.js";
 import { aiChatStarCost } from "./pricing.js";
 import { createStarLedger } from "./starLedger.js";
 import {
+  ASSISTANT_MODE_DEFINITIONS,
+  assistantModeList,
+  assistantSystemPrompt,
+  normalizeAssistantMode
+} from "./assistantModes.js";
+import {
   MAX_STAR_TOPUP,
   MIN_STAR_TOPUP,
   STAR_TERMS_VERSION,
@@ -47,6 +53,7 @@ const MODE_DEFINITIONS = Object.freeze({
     label: "AI Chat Mode",
     defaultEnabled: true,
     billable: true,
+    selectable: true,
     description: "Normal AI conversations. This is the only mode that consumes credits."
   },
   inline: {
@@ -77,7 +84,8 @@ const MODE_DEFINITIONS = Object.freeze({
     label: "Secretary Mode",
     defaultEnabled: true,
     billable: false,
-    description: "Free command assistant for account status, support, and operational actions."
+    selectable: true,
+    description: "Adapts AI Chat into an executive assistant for permitted messages, tasks, notes, and drafts."
   },
   bot_to_bot: {
     label: "Bot to Bot Communication Mode",
@@ -90,6 +98,34 @@ const MODE_DEFINITIONS = Object.freeze({
     defaultEnabled: true,
     billable: false,
     description: "Keeps replies in Telegram forum topics and message threads."
+  },
+  coding: {
+    label: "Coding Mode",
+    defaultEnabled: true,
+    billable: false,
+    selectable: true,
+    description: "Tunes AI Chat for implementation, debugging, review, and architecture."
+  },
+  research: {
+    label: "Research Mode",
+    defaultEnabled: true,
+    billable: false,
+    selectable: true,
+    description: "Tunes AI Chat for structured analysis, comparisons, and uncertainty checks."
+  },
+  translation: {
+    label: "Translation Mode",
+    defaultEnabled: true,
+    billable: false,
+    selectable: true,
+    description: "Tunes AI Chat for faithful translation and localization."
+  },
+  documents: {
+    label: "Documents Mode",
+    defaultEnabled: true,
+    billable: false,
+    selectable: true,
+    description: "Tunes AI Chat to analyze, summarize, and draft text supplied in the chat."
   }
 });
 const DEFAULT_MODE_SETTINGS = Object.freeze(Object.fromEntries(
@@ -102,6 +138,7 @@ const TELEGRAM_COMMANDS = [
   { command: "dashboard", description: "Open the NvidBot mini app" },
   { command: "modes", description: "Show enabled bot modes" },
   { command: "mode", description: "Admin: turn a bot mode on or off" },
+  { command: "use", description: "Select your active AI assistant mode" },
   { command: "persona", description: "Customize how the AI answers you" },
   { command: "models", description: "List available NVIDIA models" },
   { command: "model", description: "View or change the active model" },
@@ -156,6 +193,11 @@ function modeExists(mode) {
   return Object.hasOwn(MODE_DEFINITIONS, mode);
 }
 
+function selectedAssistantMode(userControl, settings) {
+  const requested = normalizeAssistantMode(userControl?.selectedMode || "chat", { fallback: "chat" });
+  return settings[requested] === false ? "chat" : requested;
+}
+
 async function currentModeSettings() {
   if (!telegramStarLedger || typeof telegramStarLedger.getModeSettings !== "function") return defaultModeSettings();
   return telegramStarLedger.getModeSettings(defaultModeSettings());
@@ -192,6 +234,7 @@ function modeListText(settings = defaultModeSettings(), { admin = false } = {}) 
     );
   }
   if (admin) lines.push("", "Admin usage: /mode <mode> on|off");
+  lines.push("", `Choose your assistant behavior with /use <${Object.keys(ASSISTANT_MODE_DEFINITIONS).join("|")}>.`);
   return lines.join("\n");
 }
 
@@ -397,6 +440,7 @@ function helpText() {
     "",
     "/dashboard - open the Telegram mini app",
     "/modes - show active bot modes",
+    "/use <mode> - tune the assistant for chat, coding, research, translation, documents, or secretary work",
     "/persona <instructions> - customize how the AI answers you",
     "/models - list available NVIDIA models",
     "/model <number or name> - change the model for this chat",
@@ -424,6 +468,7 @@ function welcomeText() {
     "",
     "Quick start:",
     "/dashboard - open your NvidBot control panel",
+    "/use <mode> - choose how Nvid AI should work for you",
     "/persona <instructions> - customize the bot's style for you",
     "/models - browse available NVIDIA models",
     "/model <number or name> - switch the active model",
@@ -441,18 +486,6 @@ function welcomeText() {
 
 function miniAppUrl() {
   return `${telegramPublicBaseUrl()}/miniapp.html`;
-}
-
-function chatPromptWithPersona(text, persona) {
-  const cleanPersona = typeof persona === "string" ? persona.trim() : "";
-  if (!cleanPersona) return text;
-  return [
-    "User customization for this Telegram chat:",
-    cleanPersona,
-    "",
-    "Answer the following user message while respecting that customization:",
-    text
-  ].join("\n");
 }
 
 function whoAmIText(message) {
@@ -1020,6 +1053,36 @@ async function handleTelegramCommand(command, message) {
       );
       return true;
     }
+    case "use": {
+      if (!telegramStarLedger || typeof telegramStarLedger.setUserMode !== "function") {
+        await sendTelegramText(message, "Assistant mode selection is temporarily unavailable.");
+        return true;
+      }
+      const settings = await currentModeSettings();
+      if (!command.argument) {
+        const control = await telegramStarLedger.getUserControl(String(message.from?.id));
+        const active = selectedAssistantMode(control, settings);
+        const choices = assistantModeList(settings)
+          .map((mode) => `${mode.enabled ? "ON" : "OFF"} ${mode.id} - ${mode.label}${mode.id === active ? " <- active" : ""}`)
+          .join("\n");
+        await sendTelegramText(message, `Your active assistant mode is ${active}.\n\n${choices}\n\nUse /use <mode> to switch.`);
+        return true;
+      }
+      let requested;
+      try {
+        requested = normalizeAssistantMode(command.argument);
+      } catch {
+        await sendTelegramText(message, `Unknown assistant mode. Choose: ${Object.keys(ASSISTANT_MODE_DEFINITIONS).join(", ")}.`);
+        return true;
+      }
+      if (settings[requested] === false) {
+        await sendTelegramText(message, `${ASSISTANT_MODE_DEFINITIONS[requested].label} is disabled by the administrator.`);
+        return true;
+      }
+      await telegramStarLedger.setUserMode(String(message.from?.id), requested);
+      await sendTelegramText(message, `${ASSISTANT_MODE_DEFINITIONS[requested].label} is now active. Future AI Chat answers will use this mode.`);
+      return true;
+    }
     case "persona": {
       if (!(await modeEnabled("secretary"))) {
         await sendTelegramText(message, "Secretary Mode is currently disabled.");
@@ -1252,7 +1315,8 @@ export async function handleTelegram(update) {
 
   const isPrivateChat = message.chat.type === "private";
   const model = preferredTelegramModel(message);
-  const aiText = chatPromptWithPersona(text, userControl?.persona);
+  const settings = await currentModeSettings();
+  const activeAssistantMode = selectedAssistantMode(userControl, settings);
   const draftId = telegramDraftId(update, message);
   let streamedText = "";
   let lastDraftAt = 0;
@@ -1298,8 +1362,9 @@ export async function handleTelegram(update) {
   try {
     const answer = await streamReply({
       conversationId: conversationId(message),
-      text: aiText,
+      text,
       model,
+      systemPrompt: assistantSystemPrompt({ mode: activeAssistantMode, persona: userControl?.persona }),
       onDelta(delta) {
         streamedText += String(delta || "");
         void queueDraft(false);
@@ -1394,6 +1459,8 @@ export async function telegramDashboardState({ userId } = {}) {
     banned: userControl?.banned === true,
     banReason: userControl?.banReason ?? null,
     persona: userControl?.persona ?? null,
+    selectedMode: selectedAssistantMode(userControl, modes),
+    assistantModes: assistantModeList(modes),
     modes: Object.fromEntries(Object.entries(MODE_DEFINITIONS).map(([mode, definition]) => [
       mode,
       {
@@ -1445,6 +1512,8 @@ export async function reserveTelegramWebAiUsage({ userId, requestId, model } = {
   }
 
   const userControl = await telegramStarLedger.getUserControl(resolvedUserId);
+  const modeSettings = await currentModeSettings();
+  const activeAssistantMode = selectedAssistantMode(userControl, modeSettings);
   const isAdmin = telegramUserIsAdmin(resolvedUserId);
   if (userControl?.banned && !isAdmin) {
     return { allowed: false, status: 403, error: "This account is not permitted to use NvidBot" };
@@ -1491,8 +1560,28 @@ export async function reserveTelegramWebAiUsage({ userId, requestId, model } = {
     reservationId,
     creditReserved,
     unlimitedCredits,
-    persona: userControl?.persona ?? null
+    persona: userControl?.persona ?? null,
+    selectedMode: activeAssistantMode,
+    systemPrompt: assistantSystemPrompt({ mode: activeAssistantMode, persona: userControl?.persona })
   };
+}
+
+export async function setTelegramAssistantMode({ userId, mode } = {}) {
+  const resolvedUserId = String(userId ?? "");
+  if (!/^[1-9]\d*$/.test(resolvedUserId)) throw new TypeError("userId must be a Telegram user ID");
+  const selectedMode = normalizeAssistantMode(mode);
+  const settings = await currentModeSettings();
+  if (settings[selectedMode] === false) {
+    const error = new Error("That assistant mode is disabled by the administrator");
+    error.statusCode = 403;
+    throw error;
+  }
+  if (!telegramStarLedger || typeof telegramStarLedger.setUserMode !== "function") {
+    const error = new Error("Assistant mode selection is temporarily unavailable");
+    error.statusCode = 503;
+    throw error;
+  }
+  return telegramStarLedger.setUserMode(resolvedUserId, selectedMode);
 }
 
 export async function completeTelegramWebAiUsage(usage) {

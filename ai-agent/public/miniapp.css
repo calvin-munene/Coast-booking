@@ -166,6 +166,30 @@ a { color: inherit; text-decoration: none; }
 .chat-output { min-height: 180px; max-height: 46vh; overflow: auto; margin-bottom: 12px; padding: 14px; border-radius: 13px; color: var(--text); background: color-mix(in srgb, var(--bg) 72%, transparent); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
 .chat-output:empty::before { content: "Your NVIDIA response will stream here."; color: var(--muted); }
 
+.mode-stack { display: grid; gap: 11px; }
+.mode-profile {
+  position: relative;
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  gap: 13px;
+  align-items: center;
+  overflow: hidden;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 19px;
+  background: linear-gradient(135deg, var(--surface-strong), var(--surface));
+  box-shadow: 0 18px 60px rgba(0,0,0,.13);
+}
+.mode-profile::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: transparent; }
+.mode-profile.active { border-color: color-mix(in srgb, var(--accent) 52%, transparent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent), 0 22px 70px color-mix(in srgb, var(--accent) 8%, transparent); }
+.mode-profile.active::before { background: var(--accent); box-shadow: 0 0 18px var(--accent); }
+.mode-icon { display: grid; place-items: center; width: 48px; height: 48px; border: 1px solid var(--line); border-radius: 16px; color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--surface)); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; font-weight: 900; }
+.mode-copy { min-width: 0; }
+.mode-title { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.mode-title h3 { margin: 0; font-size: 15px; }
+.mode-copy p { margin: 5px 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.mode-copy small { color: color-mix(in srgb, var(--muted) 82%, transparent); font-size: 10px; }
+
 .toggle { position: relative; width: 46px; height: 27px; border: 0; border-radius: 999px; background: color-mix(in srgb, var(--danger) 72%, transparent); cursor: pointer; }
 .toggle::after { content: ""; position: absolute; top: 4px; left: 4px; width: 19px; height: 19px; border-radius: 50%; background: white; transition: transform .18s ease; }
 .toggle.on { background: var(--accent); }
@@ -201,5 +225,5 @@ a { color: inherit; text-decoration: none; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (min-width: 720px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .page { padding-inline: 24px; } }
-@media (max-width: 460px) { .stats { grid-template-columns: 1fr 1fr; } .stats .stat:first-child { grid-column: 1 / -1; } .grid { grid-template-columns: 1fr; } .connection-state { font-size: 0; } }
+@media (max-width: 460px) { .stats { grid-template-columns: 1fr 1fr; } .stats .stat:first-child { grid-column: 1 / -1; } .grid { grid-template-columns: 1fr; } .connection-state { font-size: 0; } .mode-profile { grid-template-columns: 44px minmax(0, 1fr); } .mode-profile > .button { grid-column: 1 / -1; width: 100%; } .mode-icon { width: 44px; height: 44px; border-radius: 14px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; } #matrix-canvas { display: none; } }

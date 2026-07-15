@@ -82,9 +82,10 @@ function starLedgerDouble(overrides = {}) {
     async getStats() { return { totalBalance: "0", paymentCount: "0", completedPrompts: "0" }; },
     async getModeSettings(defaultModes) { return { ...defaultModes }; },
     async setModeEnabled(mode, enabled) { return { mode, enabled, updatedAt: new Date() }; },
-    async getUserControl(userId) { return { userId: String(userId), banned: false, banReason: null, unlimitedCredits: false, persona: null }; },
+    async getUserControl(userId) { return { userId: String(userId), banned: false, banReason: null, unlimitedCredits: false, persona: null, selectedMode: "chat" }; },
     async setUserBan(userId, banned, reason) { return { userId: String(userId), banned, banReason: reason, unlimitedCredits: false, persona: null }; },
     async setUserPersona(userId, persona) { return { userId: String(userId), banned: false, banReason: null, unlimitedCredits: false, persona }; },
+    async setUserMode(userId, selectedMode) { return { userId: String(userId), banned: false, unlimitedCredits: false, persona: null, selectedMode }; },
     ...overrides
   };
 }
@@ -189,7 +190,7 @@ test("configures Telegram commands and a protected Render webhook", async () => 
   assert.match(calls[2].payload.description, /NvidBot is a hacker-style AI assistant powered by NVIDIA models\./);
   assert.equal(calls[3].payload.menu_button.web_app.url, "https://nvidbot.onrender.com/miniapp.html");
   assert.deepEqual(calls[4].payload.commands.map(({ command }) => command), [
-    "start", "help", "dashboard", "modes", "mode", "persona", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "ban", "unban", "starbalance", "whoami"
+    "start", "help", "dashboard", "modes", "mode", "use", "persona", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "ban", "unban", "starbalance", "whoami"
   ]);
   assert.deepEqual(calls[5].payload, {
     url: "https://nvidbot.onrender.com/webhooks/telegram",
@@ -287,6 +288,41 @@ test("changes and reports the per-chat NVIDIA model by list number", async () =>
   assert.match(sent[0].text, /Llama 3\.1 8B/);
   assert.match(sent[0].text, /meta\/llama-3\.1-8b-instruct/);
   assert.match(sent[1].text, /meta\/llama-3\.1-8b-instruct  <- active/);
+});
+
+test("persists a selected assistant mode and applies its system instructions to NVIDIA", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+  let selectedMode = "chat";
+  const nvidiaRequests = [];
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async getUserControl(userId) {
+      return { userId: String(userId), banned: false, unlimitedCredits: false, persona: "Use concise answers", selectedMode };
+    },
+    async setUserMode(userId, mode) {
+      selectedMode = mode;
+      return { userId: String(userId), banned: false, unlimitedCredits: false, persona: "Use concise answers", selectedMode };
+    }
+  }));
+  global.fetch = async (url, options) => {
+    if (new URL(url).hostname === "api.telegram.org") return telegramSuccess();
+    nvidiaRequests.push(JSON.parse(options.body));
+    return new Response('data: {"choices":[{"delta":{"content":"mode answer"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  };
+
+  await handleTelegram(telegramUpdate({ text: "/use coding", chatId: 710, messageId: 1, updateId: 1 }));
+  await handleTelegram(telegramUpdate({ text: "Build an API", chatId: 710, messageId: 2, updateId: 2 }));
+
+  assert.equal(selectedMode, "coding");
+  assert.equal(nvidiaRequests.length, 1);
+  assert.match(nvidiaRequests[0].messages[0].content, /Active mode: Code Studio/);
+  assert.match(nvidiaRequests[0].messages[0].content, /senior software engineer/);
+  assert.match(nvidiaRequests[0].messages[0].content, /Use concise answers/);
+  assert.equal(nvidiaRequests[0].messages.at(-1).content, "Build an API");
 });
 
 test("streams stable Telegram drafts in a private chat and sends a final reply", async () => {

@@ -38,7 +38,11 @@ The Telegram-authenticated Mini App is a mobile-first single-page application. D
 - User: `/home`, `/chat`, `/models`, `/assistants`, `/groups`, `/group/:id`, `/moderation`, `/bots`, `/guard`, `/secretary`, `/threads`, `/usage`, `/payments`, `/settings`, `/help`.
 - Administrator: `/admin`, `/admin/users`, `/admin/groups`, `/admin/models`, `/admin/features`, `/admin/pricing`, `/admin/payments`, `/admin/logs`, `/admin/system`.
 
-Chat, model selection, payment history, usage history, feature flags, pricing, provider health, and audit logs use live backend APIs. Telegram capabilities that still require a group permission, BotFather setting, encryption key, or staged rollout are shown as unavailable with the specific requirement; the UI does not pretend they are active.
+Chat, assistant mode selection, model selection, payment history, usage history, feature flags, pricing, provider health, and audit logs use live backend APIs. Telegram capabilities that still require a group permission, BotFather setting, encryption key, or staged rollout are shown as unavailable with the specific requirement; the UI does not pretend they are active.
+
+## Adaptive assistant modes
+
+Each user has a durable assistant mode shared by Telegram and the Mini App. Available modes are Adaptive AI, Code Studio, Research Lab, Language Engine, Document Intelligence, and Executive Secretary. The selected mode changes the validated system instruction sent to NVIDIA while preserving user persona preferences and Telegram access boundaries. Administrators can disable a mode globally; disabled modes cannot be selected through either the API or interface. Switching modes is free, while an actual successful NVIDIA AI Chat response keeps the configured AI Chat credit price.
 
 ## NVIDIA reliability and billing
 
@@ -69,6 +73,7 @@ Bot commands:
 - `/start` and `/help` show usage.
 - `/models` lists server-approved NVIDIA models.
 - `/model 2` or `/model <model-id>` changes the model for that Telegram chat.
+- `/use coding` (or `chat`, `research`, `translation`, `documents`, `secretary`) changes the user's durable assistant mode.
 - `/reset` clears that chat's in-memory AI context.
 - `/balance` shows the user's prepaid AI-message credits.
 - `/topup 25` buys any whole number of credits from 1 to 10,000 with Telegram Stars.

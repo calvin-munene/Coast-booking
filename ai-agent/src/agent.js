@@ -264,6 +264,18 @@ function historyFor(key) {
   return entry.messages;
 }
 
+function completionHistory(value) {
+  if (!Array.isArray(value)) return null;
+  return value.slice(-MAX_TURNS * 2).map((message) => {
+    const role = String(message?.role || "");
+    const content = String(message?.content || "").trim();
+    if (!(["user", "assistant"].includes(role)) || !content || content.length > 20_000) {
+      throw new TypeError("Conversation history contains an invalid message");
+    }
+    return { role, content };
+  });
+}
+
 function saveHistory(key, history, text, answer) {
   conversations.set(key, {
     updatedAt: Date.now(),
@@ -279,11 +291,14 @@ function saveHistory(key, history, text, answer) {
   }
 }
 
-function completionContext(conversationId, text, model) {
+function completionContext(conversationId, text, model, systemPrompt) {
   const selectedModel = selectModel(model);
   const modelDefinition = definitionFor(selectedModel);
   const conversationKey = `${conversationId}:${selectedModel}`;
-  return { conversationId, selectedModel, modelDefinition, conversationKey, text };
+  const resolvedSystemPrompt = typeof systemPrompt === "string" && systemPrompt.trim()
+    ? systemPrompt.trim().slice(0, 5000)
+    : null;
+  return { conversationId, selectedModel, modelDefinition, conversationKey, text, systemPrompt: resolvedSystemPrompt };
 }
 
 function modelUnavailable(error) {
@@ -303,8 +318,8 @@ async function completionResponseWithFallback(context, history, apiKey, stream, 
   } catch (error) {
     const fallbackModel = defaultModel();
     if (!modelUnavailable(error) || fallbackModel === context.selectedModel) throw error;
-    const fallbackContext = completionContext(context.conversationId, context.text, fallbackModel);
-    const fallbackHistory = historyFor(fallbackContext.conversationKey);
+    const fallbackContext = completionContext(context.conversationId, context.text, fallbackModel, context.systemPrompt);
+    const fallbackHistory = history;
     await onModelSelected?.(fallbackContext.selectedModel);
     const response = await requestCompletion(
       completionApiUrl(),
@@ -326,7 +341,7 @@ function completionOptions(context, history, apiKey, stream) {
     body: JSON.stringify({
       model: context.selectedModel,
       messages: [
-        { role: "system", content: process.env.SYSTEM_PROMPT || "You are a helpful, concise AI assistant." },
+        { role: "system", content: context.systemPrompt || process.env.SYSTEM_PROMPT || "You are a helpful, concise AI assistant." },
         ...history,
         { role: "user", content: context.text }
       ],
@@ -420,36 +435,38 @@ export function resetConversation(conversationId) {
   }
 }
 
-export async function reply({ conversationId, text, model, signal }) {
+export async function reply({ conversationId, text, model, signal, systemPrompt, history }) {
   const apiKey = required("NVIDIA_API_KEY");
-  const context = completionContext(conversationId, text, model);
+  const context = completionContext(conversationId, text, model, systemPrompt);
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   return withConversationLock(context.conversationKey, async () => {
-    const history = historyFor(context.conversationKey);
-    const completed = await completionResponseWithFallback(context, history, apiKey, false, { signal, deadline });
+    const suppliedHistory = completionHistory(history);
+    const resolvedHistory = suppliedHistory || historyFor(context.conversationKey);
+    const completed = await completionResponseWithFallback(context, resolvedHistory, apiKey, false, { signal, deadline });
     const { response } = completed;
     const data = await response.json();
     const answer = data.choices?.[0]?.message?.content?.trim();
     if (!answer) throw new Error("NVIDIA API returned an empty response");
-    saveHistory(completed.context.conversationKey, completed.history, text, answer);
+    if (!suppliedHistory) saveHistory(completed.context.conversationKey, completed.history, text, answer);
     return answer;
   });
 }
 
-export async function streamReply({ conversationId, text, model, signal, onDelta, onModelSelected }) {
+export async function streamReply({ conversationId, text, model, signal, onDelta, onModelSelected, systemPrompt, history }) {
   const apiKey = required("NVIDIA_API_KEY");
-  const context = completionContext(conversationId, text, model);
+  const context = completionContext(conversationId, text, model, systemPrompt);
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   return withConversationLock(context.conversationKey, async () => {
-    const history = historyFor(context.conversationKey);
-    const completed = await completionResponseWithFallback(context, history, apiKey, true, {
+    const suppliedHistory = completionHistory(history);
+    const resolvedHistory = suppliedHistory || historyFor(context.conversationKey);
+    const completed = await completionResponseWithFallback(context, resolvedHistory, apiKey, true, {
       signal,
       deadline,
       onModelSelected
     });
     const { response } = completed;
     const answer = await consumeNvidiaStream(response, onDelta);
-    saveHistory(completed.context.conversationKey, completed.history, text, answer);
+    if (!suppliedHistory) saveHistory(completed.context.conversationKey, completed.history, text, answer);
     return answer;
   });
 }

@@ -487,6 +487,30 @@ test('returns aggregate counters as BIGINT-safe strings', async () => {
   pool.assertDone();
 });
 
+test('stores only validated assistant mode selections', async () => {
+  const pool = new ScriptedPool([
+    { tag: 'BEGIN' },
+    { tag: 'ensure-account' },
+    {
+      tag: 'set-user-mode',
+      params: ['123', 'coding'],
+      result: result([{
+        user_id: '123',
+        banned: false,
+        ban_reason: null,
+        unlimited_credits: false,
+        persona: null,
+        selected_mode: 'coding',
+      }]),
+    },
+    { tag: 'COMMIT' },
+  ]);
+  const ledger = createStarLedger({ pool });
+  assert.equal((await ledger.setUserMode('123', 'coding')).selectedMode, 'coding');
+  await assert.rejects(ledger.setUserMode('123', 'not-a-mode'), /Unknown assistant mode/);
+  pool.assertDone();
+});
+
 test('lists auditable payment and usage history without exposing invoice payloads', async () => {
   const creditedAt = new Date('2026-07-14T12:00:00.000Z');
   const createdAt = new Date('2026-07-14T12:01:00.000Z');

@@ -181,7 +181,7 @@ function webLedgerDouble(overrides = {}) {
   return {
     async getModeSettings(defaultModes) { return { ...defaultModes }; },
     async getUserControl(userId) {
-      return { userId: String(userId), banned: false, unlimitedCredits: false, persona: null };
+      return { userId: String(userId), banned: false, unlimitedCredits: false, persona: null, selectedMode: "chat" };
     },
     async getBalance(userId) { return { userId: String(userId), balance: "2" }; },
     async reservePrompt(userId, { reservationId, cost }) {
@@ -192,6 +192,7 @@ function webLedgerDouble(overrides = {}) {
     async restorePrompt() {},
     async listPayments() { return []; },
     async listUsage() { return []; },
+    async setUserMode(userId, selectedMode) { return { userId: String(userId), selectedMode }; },
     ...overrides
   };
 }
@@ -355,6 +356,47 @@ test("public chat authenticates before JSON parsing and large public bodies are 
     assert.equal((await requestRaw(port, "/api/chat", "{broken")).status, 401);
     const oversized = JSON.stringify({ initData: "x".repeat(65_000) });
     assert.equal((await requestRaw(port, "/api/miniapp/state", oversized)).status, 413);
+  } finally {
+    await close(server);
+  }
+});
+
+test("Mini App assistant modes are authenticated, durable, and origin protected", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  let selectedMode = "chat";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getUserControl(userId) {
+      return { userId: String(userId), banned: false, unlimitedCredits: false, persona: null, selectedMode };
+    },
+    async setUserMode(userId, mode) {
+      selectedMode = mode;
+      return { userId: String(userId), selectedMode };
+    }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    assert.equal((await requestGet(port, "/api/modes")).status, 401);
+    const session = await launchWebSession(port, 123);
+    const headers = { authorization: `Bearer ${session}` };
+    const catalog = await requestGet(port, "/api/modes", headers);
+    assert.equal(catalog.status, 200, catalog.text);
+    assert.ok(JSON.parse(catalog.text).modes.some((mode) => mode.id === "coding" && mode.enabled));
+
+    const forged = await requestJson(port, "/api/modes/selection", { mode: "coding" }, {
+      ...headers,
+      origin: "https://attacker.example"
+    });
+    assert.equal(forged.status, 403);
+    assert.equal(selectedMode, "chat");
+
+    const changed = await requestJson(port, "/api/modes/selection", { mode: "coding" }, {
+      ...headers,
+      origin: process.env.PUBLIC_URL
+    });
+    assert.equal(changed.status, 200, changed.text);
+    assert.equal(selectedMode, "coding");
   } finally {
     await close(server);
   }

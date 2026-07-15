@@ -19,6 +19,7 @@ import {
   handleWhatsApp,
   reserveTelegramWebAiUsage,
   restoreTelegramWebAiUsage,
+  setTelegramAssistantMode,
   telegramBillingHistory,
   telegramDashboardState,
   telegramPublicStatus,
@@ -31,7 +32,7 @@ import {
   issueTelegramWebAppSession,
   verifyTelegramWebAppSession
 } from "./telegramWebAuth.js";
-import { authorizeHttpRequest, bearerToken } from "./httpAuth.js";
+import { authorizeHttpRequest, bearerToken, mutationOriginAllowed } from "./httpAuth.js";
 import { logger } from "./logger.js";
 import {
   getPlatformStore,
@@ -167,6 +168,31 @@ async function authorizeAdminRequest(req, { permission, mutation = false } = {})
   return { ...authorization, dashboard };
 }
 
+async function authorizeUserRequest(req, { mutation = false } = {}) {
+  const session = verifyTelegramWebAppSession(bearerToken(req));
+  if (!session) return { allowed: false, status: 401, error: "Fresh Telegram authentication is required" };
+  if (mutation && !mutationOriginAllowed(req, runtimeConfig().publicOrigin)) {
+    await recordSecurityEvent(req, {
+      eventType: "user_mutation_origin_denied",
+      severity: "medium",
+      userId: session.userId
+    });
+    return { allowed: false, status: 403, error: "The request origin is not allowed" };
+  }
+  const dashboard = await telegramDashboardState({ userId: session.userId });
+  if (dashboard.banned && !dashboard.isAdmin) return { allowed: false, status: 403, error: "This account is banned" };
+  const store = getPlatformStore();
+  if (store?.ensureUser) {
+    await store.ensureUser(session.userId);
+    const principal = await platformPrincipal(session.userId, store);
+    if (["banned_user", "restricted_user"].includes(principal?.role)) {
+      return { allowed: false, status: 403, error: "This platform account is restricted" };
+    }
+    return { allowed: true, session, dashboard, principal };
+  }
+  return { allowed: true, session, dashboard, principal: null };
+}
+
 function parseLimit(url) {
   const value = Number(url.searchParams.get("limit") || 50);
   return Number.isSafeInteger(value) && value >= 1 && value <= 250 ? value : 50;
@@ -282,19 +308,18 @@ async function streamWebChat(req, res, { authenticated, usage, message, model })
   try {
     await streamReply({
       conversationId: `web:${authenticated.userId}:session:${authenticated.sessionId}`,
-      text: usage.persona
-        ? `User customization:\n${usage.persona}\n\nUser message:\n${message}`
-        : message,
+      text: message,
       model,
+      systemPrompt: usage.systemPrompt,
       signal: controller.signal,
       onModelSelected: (selectedModel) => {
         deliveredModel = selectedModel;
-        return writeSse(res, "meta", { model: selectedModel });
+        return writeSse(res, "meta", { model: selectedModel, mode: usage.selectedMode });
       },
       onDelta: (text) => writeSse(res, "delta", { text })
     });
     recordProviderSuccess();
-    await writeSse(res, "done", { model: deliveredModel });
+    await writeSse(res, "done", { model: deliveredModel, mode: usage.selectedMode });
     responseDelivered = true;
     await completeTelegramWebAiUsage(usage).catch((error) => {
       logger.error("web_ai.credit_completion_failed", { error, userId: authenticated.userId });
@@ -352,6 +377,27 @@ export function createAppServer() {
 
     if (req.method === "GET" && url.pathname === "/api/channels") {
       return json(res, 200, { telegram: telegramPublicStatus() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/modes") {
+      if (!consumeRequestBudget(req, "user-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeUserRequest(req);
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, {
+        selectedMode: auth.dashboard.selectedMode,
+        modes: auth.dashboard.assistantModes,
+        aiChatStarCost: aiChatStarCost()
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/modes/selection") {
+      if (!consumeRequestBudget(req, "user-write", { limit: 30, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeUserRequest(req, { mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 8_000 });
+      if (typeof data.mode !== "string") return json(res, 400, { error: "mode is required" });
+      const control = await setTelegramAssistantMode({ userId: auth.session.userId, mode: data.mode });
+      return json(res, 200, { selectedMode: control.selectedMode });
     }
 
     if (req.method === "POST" && url.pathname === "/api/miniapp/state") {

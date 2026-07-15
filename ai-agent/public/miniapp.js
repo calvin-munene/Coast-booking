@@ -12,7 +12,6 @@ const state = {
 };
 
 const unavailableRoutes = {
-  "/assistants": ["Assistants", "Structured assistant profiles are being migrated from /persona. Use the Telegram command until the persistent assistant editor is enabled.", "Telegram authorization"],
   "/groups": ["Groups", "Add Nvid AI to a group and promote it with the permissions you want it to use. Managed groups will appear after Telegram sends the bot group events.", "Group administrator permissions"],
   "/moderation": ["Moderation", "Moderation controls require Nvid AI to be an administrator in the target group. No action is shown as available until Telegram confirms the permissions.", "Delete and restrict permissions"],
   "/bots": ["Bot Manager", "Managed bot credentials remain disabled until encrypted credential storage is configured by the platform administrator.", "Encryption key and role access"],
@@ -159,10 +158,11 @@ function renderHome() {
       node("p", { text: `Authenticated as Telegram user ${dashboard.userId}. Model controls, billing history, and AI operations stay bound to this verified session.` }),
       node("div", { className: "button-row" }, [routeLink("Start AI chat", "/chat", "button primary"), routeLink("View usage", "/usage", "button")])
     ]),
-    node("section", { className: "stats" }, [stat("Platform role", role), stat("AI credits", credits), stat("Active modes", `${modes.filter(([, value]) => value.enabled).length}/${modes.length}`)]),
+    node("section", { className: "stats" }, [stat("Platform role", role), stat("AI credits", credits), stat("Assistant mode", dashboard.selectedMode || "chat")]),
     node("section", { className: "section" }, [sectionTitle("Operational modes", "View all", "/settings"), node("div", { className: "grid" }, modes.slice(0, 6).map(modeCard))]),
     node("section", { className: "section" }, [sectionTitle("Quick actions"), node("div", { className: "grid" }, [
       quickAction("NVIDIA Models", "Choose from administrator-approved models.", "/models"),
+      quickAction("Mode Studio", "Tune Nvid AI for coding, research, documents, translation, or executive work.", "/assistants"),
       quickAction("Payments", "Review your Telegram Stars payment ledger.", "/payments"),
       quickAction("Managed Groups", "Configure after live group permissions are detected.", "/groups", "SETUP"),
       ...(dashboard.platformAdmin ? [quickAction("Admin Console", "Platform health, models, features, billing, and logs.", "/admin")] : [])
@@ -172,12 +172,31 @@ function renderHome() {
 }
 
 async function renderChat() {
-  const data = await api("/api/models");
+  const [data, modeData] = await Promise.all([api("/api/models"), api("/api/modes")]);
   const output = node("div", { className: "chat-output", role: "log", "aria-live": "polite" });
   const message = node("textarea", { placeholder: "Ask Nvid AI anything…", maxlength: "8000" });
   const model = node("select");
   for (const item of data.models) model.append(node("option", { value: item.id, text: `${item.label} · ${item.tag}` }));
   model.value = data.defaultModel;
+  const assistantMode = node("select");
+  for (const item of modeData.modes.filter((item) => item.enabled)) {
+    assistantMode.append(node("option", { value: item.id, text: item.label }));
+  }
+  assistantMode.value = modeData.selectedMode;
+  assistantMode.addEventListener("change", async () => {
+    assistantMode.disabled = true;
+    try {
+      await api("/api/modes/selection", { method: "POST", body: { mode: assistantMode.value } });
+      state.dashboard.selectedMode = assistantMode.value;
+      showToast(`${assistantMode.selectedOptions[0]?.text || assistantMode.value} activated`);
+      haptic("medium");
+    } catch (error) {
+      assistantMode.value = modeData.selectedMode;
+      showToast(error.message);
+    } finally {
+      assistantMode.disabled = false;
+    }
+  });
   const send = node("button", { className: "button primary", type: "button", text: "Generate" });
   const stop = node("button", { className: "button danger", type: "button", text: "Stop", disabled: "" });
   stop.disabled = true;
@@ -215,7 +234,10 @@ async function renderChat() {
           if (!raw) continue;
           const payload = JSON.parse(raw);
           if (event === "delta") output.textContent += payload.text || "";
-          if (event === "meta" && payload.model) model.value = payload.model;
+          if (event === "meta" && payload.model) {
+            model.value = payload.model;
+            if (payload.mode) assistantMode.value = payload.mode;
+          }
           if (event === "error") throw new Error(payload.error || "AI generation failed");
         }
         if (done) break;
@@ -235,11 +257,51 @@ async function renderChat() {
   app.replaceChildren(
     pageHead("AI Chat", "Stream a response from an approved NVIDIA model. A successful non-admin request uses the displayed AI credit price."),
     node("section", { className: "chat-console" }, [
+      node("div", { className: "field" }, [node("label", { text: "Assistant mode" }), assistantMode]),
       node("div", { className: "field" }, [node("label", { text: "NVIDIA model" }), model]),
       output,
       node("div", { className: "field" }, [node("label", { text: "Message" }), message]),
       node("div", { className: "button-row" }, [send, stop])
     ])
+  );
+}
+
+async function renderAssistantModes() {
+  const data = await api("/api/modes");
+  const cards = data.modes.map((mode) => {
+    const active = mode.id === data.selectedMode;
+    const action = node("button", {
+      className: `button ${active ? "primary" : ""}`.trim(),
+      type: "button",
+      text: active ? "Active" : mode.enabled ? "Activate" : "Unavailable",
+      disabled: mode.enabled ? null : ""
+    });
+    action.disabled = !mode.enabled || active;
+    if (mode.enabled && !active) action.addEventListener("click", async () => {
+      action.disabled = true;
+      try {
+        await api("/api/modes/selection", { method: "POST", body: { mode: mode.id } });
+        state.dashboard.selectedMode = mode.id;
+        haptic("medium");
+        await renderAssistantModes();
+      } catch (error) {
+        showToast(error.message);
+        action.disabled = false;
+      }
+    });
+    return node("article", { className: `mode-profile ${active ? "active" : ""}`.trim() }, [
+      node("div", { className: "mode-icon", text: mode.icon }),
+      node("div", { className: "mode-copy" }, [
+        node("div", { className: "mode-title" }, [node("h3", { text: mode.label }), badge(active ? "ACTIVE" : mode.enabled ? "READY" : "OFF", mode.enabled ? "" : "off")]),
+        node("p", { text: mode.description }),
+        node("small", { text: `AI Chat billing: ${data.aiChatStarCost} credit${data.aiChatStarCost === 1 ? "" : "s"} only after a successful answer.` })
+      ]),
+      action
+    ]);
+  });
+  app.replaceChildren(
+    pageHead("Mode Studio", "Switch the behavior layer used by the NVIDIA assistant. Modes change the system instructions; they do not grant unsupported Telegram access."),
+    node("section", { className: "mode-stack" }, cards)
   );
 }
 
@@ -395,6 +457,7 @@ async function render(path = currentPath()) {
     if (path === "/home") renderHome();
     else if (path === "/chat") await renderChat();
     else if (path === "/models") await renderModels();
+    else if (path === "/assistants") await renderAssistantModes();
     else if (path === "/usage" || path === "/history" || path === "/payments") await renderBilling(path === "/payments" ? "payments" : "usage");
     else if (path === "/settings") renderSettings();
     else if (path === "/help") renderHelp();
@@ -492,7 +555,7 @@ function setupMatrixCanvas() {
 function startParamPath() {
   const value = tg?.initDataUnsafe?.start_param || new URLSearchParams(location.search).get("startapp") || "";
   const mapped = `/${value.replaceAll("_", "/")}`;
-  return ["/chat", "/models", "/usage", "/payments", "/admin", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system"].includes(mapped) ? mapped : null;
+  return ["/chat", "/models", "/assistants", "/usage", "/payments", "/admin", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system"].includes(mapped) ? mapped : null;
 }
 
 async function start() {

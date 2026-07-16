@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow"><title>Admin Login | DemoCard</title>
+  <link rel="stylesheet" href="/assets/globals.css"><script src="/login.js" defer></script>
+</head>
+<body>
+<main class="access-denied">
+  <section class="access-card">
+    <span class="brand-icon">D</span><p class="login-eyebrow">SECURE ADMINISTRATION</p><h1>Welcome back</h1>
+    <p>Sign in to issue DemoCards and manage their balances.</p>
+    <form id="loginForm">
+      <label for="password">Administrator password</label>
+      <input id="password" type="password" autocomplete="current-password" minlength="12" required>
+      <button class="primary-button" id="loginButton" type="submit">Sign in <span>→</span></button>
+    </form>
+    <div id="loginError" class="login-error" role="alert" aria-live="polite"></div>
+    <a class="back-link" href="/">← Return to balance checker</a>
+  </section>
+</main>
+</body>
+</html>

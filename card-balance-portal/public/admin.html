@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow"><title>Card Operations | DemoCard</title>
+  <link rel="stylesheet" href="/assets/globals.css"><script src="/admin.js" defer></script>
+</head>
+<body>
+<main class="admin-shell">
+  <aside class="sidebar">
+    <a class="brandmark" href="/"><span class="brand-icon">D</span><span>DemoCard</span></a>
+    <nav aria-label="Admin"><a class="nav-item active" href="#cards"><span>▦</span> Cards</a><a class="nav-item" href="#issue"><span>＋</span> Issue card</a></nav>
+    <div class="admin-account"><small>SECURE SESSION</small><strong>Administrator</strong><button id="logoutButton">Sign out</button></div>
+  </aside>
+  <div class="admin-main">
+    <header class="admin-header"><div><p>ADMINISTRATION</p><h1>Card operations</h1></div><a class="secondary-button" href="/">Open checker ↗</a></header>
+    <div id="adminError" class="admin-error" role="alert" hidden></div>
+    <div id="secretBanner"></div>
+    <section class="metrics" aria-label="Card summary">
+      <article><span>Total demo float</span><strong id="totalFloat">KES 0</strong><small>Across all issued cards</small></article>
+      <article><span>Active cards</span><strong id="activeCards">0</strong><small id="frozenCards">0 frozen</small></article>
+      <article><span>Total issued</span><strong id="totalCards">0</strong><small>Synthetic cards only</small></article>
+    </section>
+    <section class="admin-grid">
+      <div class="table-panel" id="cards">
+        <div class="section-heading"><div><p>MANAGE</p><h2>Issued cards</h2></div><button class="text-button" id="refreshButton">Refresh</button></div>
+        <div id="cardsTable" class="loading-table">Loading card records…</div>
+      </div>
+      <section class="issue-panel" id="issue">
+        <div class="section-heading"><div><p>NEW CARD</p><h2>Issue demo card</h2></div><span class="secure-tag">Synthetic</span></div>
+        <form id="issueForm">
+          <label for="label">Card label</label><input id="label" name="label" placeholder="e.g. Customer rewards" maxlength="60" required>
+          <label for="balance">Opening balance (KES)</label><input id="balance" name="balance" type="number" min="0" max="10000000" step="0.01" placeholder="5000.00" required>
+          <label for="expiresAt">Expiry date <span>Optional</span></label><input id="expiresAt" name="expiresAt" type="date">
+          <button class="primary-button" type="submit">Generate card and access code <span>→</span></button>
+        </form>
+        <p class="form-footnote">Generated IDs begin with DEMO and cannot be used on payment networks.</p>
+      </section>
+    </section>
+  </div>
+</main>
+</body>
+</html>

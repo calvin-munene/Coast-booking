@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="description" content="Check balances for synthetic DemoCard prepaid cards.">
+  <meta name="theme-color" content="#154f3a">
+  <title>DemoCard | Balance Checker</title>
+  <link rel="stylesheet" href="/assets/globals.css">
+  <script src="/checker.js" defer></script>
+</head>
+<body>
+<main class="public-shell">
+  <nav class="topbar" aria-label="Primary navigation">
+    <a class="brandmark" href="/" aria-label="DemoCard home"><span class="brand-icon">D</span><span>DemoCard</span></a>
+    <a class="admin-link" href="/admin">Admin portal <span aria-hidden="true">→</span></a>
+  </nav>
+  <section class="checker-layout">
+    <div class="checker-copy">
+      <div class="demo-badge"><span></span> Prepaid card simulation</div>
+      <h1>Know your demo balance in seconds.</h1>
+      <p>Enter the DemoCard ID and six-digit access code supplied by the administrator.</p>
+      <div class="visual-card" id="visualCard" aria-hidden="true">
+        <div class="visual-card-top"><span class="visual-logo">DemoCard</span><span class="contactless">)))</span></div>
+        <div class="chip"><i></i><i></i><i></i></div>
+        <div class="visual-number" id="visualNumber">DEMO •••• •••• ••••</div>
+        <div class="visual-card-bottom">
+          <div><small>CARD LABEL</small><strong id="visualLabel">PREPAID DEMO</strong></div>
+          <div><small>STATUS</small><strong id="visualStatus">READY</strong></div>
+        </div>
+      </div>
+      <p class="simulation-note">Synthetic cards only. This service is not connected to any bank or payment network.</p>
+    </div>
+    <div class="checker-panel">
+      <div class="panel-heading"><span class="panel-step">01</span><div><h2>Check card balance</h2><p>Your balance appears after secure verification.</p></div></div>
+      <form id="balanceForm" novalidate>
+        <label for="cardId">DemoCard ID</label>
+        <input id="cardId" name="cardId" placeholder="DEMO-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" maxlength="19" required>
+        <label for="accessCode">Access code</label>
+        <input id="accessCode" name="accessCode" type="password" inputmode="numeric" placeholder="6 digits" autocomplete="one-time-code" maxlength="6" required>
+        <button class="primary-button" id="checkButton" type="submit">View demo balance <span>→</span></button>
+      </form>
+      <div class="result-region" id="result" role="status" aria-live="polite"></div>
+      <div class="trust-row"><span><i>✓</i> Protected access code</span><span><i>✓</i> No banking data</span></div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

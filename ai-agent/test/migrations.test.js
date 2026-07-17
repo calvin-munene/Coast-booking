@@ -41,7 +41,7 @@ test("stabilization migration is additive and upgrades an existing migration his
     .map(({ values }) => ({ version: values[0], checksum: values[1] }));
   const upgrade = migrationPool(existingRows);
   const result = await runMigrations(upgrade.pool);
-  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services"]);
+  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services", "2026071702_telegram_contexts"]);
   const stabilizationSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071505_stabilization_foundation").sql;
   assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversations/);
   assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversation_messages/);
@@ -55,4 +55,11 @@ test("stabilization migration is additive and upgrades an existing migration his
   assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS secretary_reminders/);
   assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS managed_bot_credentials/);
   assert.doesNotMatch(operatingSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
+  const contextSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071702_telegram_contexts").sql;
+  assert.match(contextSql, /CREATE TABLE IF NOT EXISTS telegram_business_connections/);
+  assert.match(contextSql, /CREATE TABLE IF NOT EXISTS telegram_observed_messages/);
+  assert.match(contextSql, /CREATE TABLE IF NOT EXISTS telegram_group_bot_permissions/);
+  assert.match(contextSql, /activation_policy TEXT NOT NULL DEFAULT 'mention_only'/);
+  assert.match(contextSql, /activation_policy <> 'always_on' OR always_on_confirmed_at IS NOT NULL/);
+  assert.doesNotMatch(contextSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
 });

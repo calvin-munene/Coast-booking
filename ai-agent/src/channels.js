@@ -28,6 +28,11 @@ import {
   telegramStarTerms,
   validateStarPurchasePayload
 } from "./starPayments.js";
+import {
+  activationPolicyLabel,
+  parseTelegramCommand as parseTelegramUpdateCommand,
+  resolveTelegramUpdateContext
+} from "./telegramContext.js";
 
 const TELEGRAM_API_ROOT = "https://api.telegram.org";
 const TELEGRAM_TEXT_LIMIT = 4000;
@@ -66,8 +71,8 @@ const MODE_DEFINITIONS = Object.freeze({
   inline: {
     label: "Inline Mode",
     defaultEnabled: false,
-    billable: false,
-    description: "Allows users to invoke bot utilities from Telegram inline queries when enabled in BotFather."
+    billable: true,
+    description: "Runs explicitly addressed NVIDIA AI queries from Telegram inline mode when enabled in BotFather."
   },
   bot_management: {
     label: "Bot Management Mode",
@@ -178,6 +183,39 @@ const TELEGRAM_COMMANDS = [
   { command: "starbalance", description: "Admin Stars and credit totals" },
   { command: "whoami", description: "Show your Telegram IDs" }
 ];
+
+const TELEGRAM_GROUP_COMMANDS = Object.freeze([
+  { command: "nvid", description: "Ask Nvid AI in this group" },
+  { command: "nvid_help", description: "Show Nvid AI group help" },
+  { command: "nvid_status", description: "Show the current group mode" },
+  { command: "nvid_mode", description: "Show the active group assistant" },
+  { command: "nvid_summary", description: "Summarize authorized recent messages" },
+  { command: "nvid_reset", description: "Reset this thread's AI context" },
+  { command: "nvid_report", description: "Report a replied-to message" }
+]);
+
+const TELEGRAM_GROUP_ADMIN_COMMANDS = Object.freeze([
+  ...TELEGRAM_GROUP_COMMANDS,
+  { command: "nvid_enable", description: "Enable Nvid AI in this group" },
+  { command: "nvid_disable", description: "Disable Nvid AI in this group" },
+  { command: "nvid_setmode", description: "Set the group assistant" },
+  { command: "nvid_secretary", description: "Configure Group Secretary" },
+  { command: "nvid_guard", description: "Configure Guard Mode" },
+  { command: "nvid_settings", description: "Show group configuration" },
+  { command: "nvid_rules", description: "Show group rules" },
+  { command: "nvid_setrules", description: "Update group rules" },
+  { command: "nvid_welcome", description: "Configure the welcome message" },
+  { command: "nvid_moderation", description: "Configure moderation" },
+  { command: "nvid_permissions", description: "Verify Telegram permissions" },
+  { command: "nvid_logs", description: "Show recent Nvid AI group logs" }
+]);
+
+const TELEGRAM_ALLOWED_UPDATES = Object.freeze([
+  "message", "edited_message", "channel_post", "edited_channel_post",
+  "business_connection", "business_message", "edited_business_message", "deleted_business_messages",
+  "guest_message", "pre_checkout_query", "callback_query", "inline_query", "chat_join_request",
+  "my_chat_member", "chat_member", "managed_bot", "subscription"
+]);
 
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -425,20 +463,24 @@ function telegramAllowedUserIds() {
 }
 
 function telegramUserIsAllowed(message) {
-  const allowed = telegramAllowedUserIds();
-  return allowed.size === 0 || allowed.has(String(message.from?.id ?? ""));
+  return telegramUserIdIsAllowed(message?.from?.id);
 }
 
-function parseTelegramCommand(text) {
-  const match = text.match(/^\/([a-z0-9_]+)(?:@([a-z0-9_]+))?(?:\s+([\s\S]*))?$/i);
-  if (!match) return null;
-  return { name: match[1].toLowerCase(), botUsername: match[2]?.toLowerCase(), argument: match[3]?.trim() || "" };
+function telegramUserIdIsAllowed(userId) {
+  const allowed = telegramAllowedUserIds();
+  return allowed.size === 0 || allowed.has(String(userId ?? ""));
+}
+
+function parseTelegramCommand(messageOrText) {
+  return parseTelegramUpdateCommand(messageOrText, { botUsername: telegramStatus.username });
 }
 
 function telegramConversationScope(message) {
   const chatId = String(message?.chat?.id ?? "unknown");
   const userId = String(message?.from?.id ?? "unknown");
   const threadId = String(message?.message_thread_id ?? "main");
+  if (message?.business_connection_id) return `business:${message.business_connection_id}:chat:${chatId}:thread:${threadId}:user:${userId}`;
+  if (message?.guest_query_id) return `guest:${message.guest_query_id}:chat:${chatId}:user:${userId}`;
   if (message?.chat?.type === "private") return `chat:${chatId}:user:${userId}`;
   return `chat:${chatId}:thread:${threadId}:user:${userId}`;
 }
@@ -625,6 +667,15 @@ function miniAppUrl() {
   return `${telegramPublicBaseUrl()}/miniapp.html`;
 }
 
+function safeTelegramLaunchUrl() {
+  if (telegramStatus.link) return telegramStatus.link;
+  try {
+    return miniAppUrl();
+  } catch {
+    return "https://t.me/";
+  }
+}
+
 function whoAmIText(message) {
   return [
     "Telegram identity:",
@@ -663,12 +714,17 @@ function messageThreadPayload(message) {
   return Number.isInteger(message.message_thread_id) ? { message_thread_id: message.message_thread_id } : {};
 }
 
+function messageBusinessPayload(message) {
+  return message?.business_connection_id ? { business_connection_id: message.business_connection_id } : {};
+}
+
 async function sendTelegramText(message, text) {
   const chunks = splitTelegramText(text);
   for (let index = 0; index < chunks.length; index += 1) {
     await telegramApi("sendMessage", {
       chat_id: message.chat.id,
       text: chunks[index],
+      ...messageBusinessPayload(message),
       ...messageThreadPayload(message),
       ...(index === 0 && message.message_id
         ? { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } }
@@ -677,11 +733,28 @@ async function sendTelegramText(message, text) {
   }
 }
 
+async function deliverTelegramAiAnswer(context, message, text) {
+  if (context?.telegramTransportMode === "guest") {
+    const body = splitTelegramText(text, 4000)[0] || "I could not generate a response.";
+    return telegramApi("answerGuestQuery", {
+      guest_query_id: context.guestQueryId,
+      result: {
+        type: "article",
+        id: crypto.createHash("sha256").update(String(context.guestQueryId)).digest("hex").slice(0, 32),
+        title: "Nvid AI response",
+        input_message_content: { message_text: body }
+      }
+    });
+  }
+  return sendTelegramText(message, text);
+}
+
 async function sendTelegramPhoto(message, photo, caption) {
   await telegramApi("sendPhoto", {
     chat_id: message.chat.id,
     photo,
     caption,
+    ...messageBusinessPayload(message),
     ...messageThreadPayload(message),
     ...(message.message_id
       ? { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } }
@@ -876,7 +949,46 @@ export async function telegramGroupPermissionState({ chatId, actorUserId, action
   };
 }
 
-async function observeTelegramContext(message) {
+export async function resolveTelegramContext(update) {
+  const initial = resolveTelegramUpdateContext(update, {
+    botUsername: telegramStatus.username,
+    botId: telegramStatus.id
+  });
+  const store = getPlatformStore();
+  let groupState = null;
+  let senderMember = null;
+  if (["group", "supergroup", "channel"].includes(initial.chatType) && initial.chatId !== null && store?.getTelegramGroup) {
+    groupState = await store.getTelegramGroup(initial.chatId).catch(() => null);
+    if (initial.telegramUserId && store.getGroupMember) {
+      senderMember = await store.getGroupMember(initial.chatId, initial.telegramUserId).catch(() => null);
+    }
+    if (groupState?.settings?.activationPolicy === "administrators_only"
+        && initial.invoked && initial.telegramUserId) {
+      const liveMember = await telegramApi("getChatMember", {
+        chat_id: initial.chatId,
+        user_id: initial.telegramUserId
+      }).catch(() => null);
+      senderMember = liveMember || { status: "unknown" };
+      if (liveMember) {
+        await store.syncGroupMember?.({ chatId: initial.chatId, member: liveMember }).catch(() => undefined);
+      }
+    }
+  }
+  const botMember = groupState?.botPermissionSnapshot ? {
+    status: groupState.botPermissionSnapshot.status,
+    ...groupState.botPermissionSnapshot.permissions
+  } : null;
+  return resolveTelegramUpdateContext(update, {
+    botUsername: telegramStatus.username,
+    botId: telegramStatus.id,
+    groupState,
+    senderMember,
+    botMember,
+    assistantMode: groupState?.settings?.defaultMode || "chat"
+  });
+}
+
+async function observeTelegramContext(message, context = null) {
   const store = getPlatformStore();
   if (!store) return;
   if (message?.from?.id && store.syncUserProfile) {
@@ -885,6 +997,64 @@ async function observeTelegramContext(message) {
   if (["group", "supergroup", "channel"].includes(message?.chat?.type) && store.upsertTelegramGroup) {
     await store.upsertTelegramGroup({ chat: message.chat }).catch((error) => logger.error("telegram.group_sync_failed", { error, chatId: message.chat.id }));
   }
+  if (!context || !["group", "supergroup"].includes(message?.chat?.type)) return;
+  const settings = context.groupConfiguration || {};
+  if (!settings.secretaryEnabled || !settings.secretaryObservationEnabled || !settings.messageStorageEnabled) return;
+  if (message?.from?.is_bot || !message?.text || !store.observeTelegramMessage) return;
+  await store.observeTelegramMessage({
+    updateType: context.updateType,
+    transportMode: "group_secretary",
+    chatId: message.chat.id,
+    threadId: message.message_thread_id ?? null,
+    messageId: message.message_id,
+    senderUserId: message.from?.id ?? null,
+    content: message.text,
+    status: context.updateType === "edited_message" ? "edited" : "active",
+    retentionDays: settings.retentionDays || 7
+  }).catch((error) => logger.error("telegram.secretary_observation_failed", { error, chatId: message.chat.id }));
+}
+
+async function handleBusinessConnectionUpdate(connection) {
+  const store = getPlatformStore();
+  if (!connection || !store?.upsertBusinessConnection) return false;
+  await store.syncUserProfile?.(connection.user).catch(() => undefined);
+  await store.upsertBusinessConnection(connection);
+  await store.saveCapabilityVerification?.({
+    capabilityKey: "telegram_secretary",
+    status: connection.is_enabled ? "connected" : "not_connected",
+    metadata: { canReply: connection.rights?.can_reply === true }
+  }).catch(() => undefined);
+  return true;
+}
+
+async function businessConnectionForMessage(message) {
+  const connectionId = message?.business_connection_id;
+  const store = getPlatformStore();
+  if (!connectionId || !store?.getBusinessConnection) return null;
+  let connection = await store.getBusinessConnection(connectionId).catch(() => null);
+  if (!connection) {
+    const remote = await telegramApi("getBusinessConnection", { business_connection_id: connectionId }).catch(() => null);
+    if (remote) connection = await store.upsertBusinessConnection(remote).catch(() => null);
+  }
+  return connection;
+}
+
+async function observeBusinessMessage(message, context, connection) {
+  const store = getPlatformStore();
+  if (!store?.observeTelegramMessage || !connection?.allowedChatConfiguration?.messageStorageEnabled) return;
+  await store.syncUserProfile?.(message.from).catch(() => undefined);
+  await store.observeTelegramMessage({
+    updateType: context.updateType,
+    transportMode: "telegram_secretary",
+    chatId: message.chat.id,
+    threadId: message.message_thread_id ?? null,
+    messageId: message.message_id,
+    senderUserId: message.from?.id ?? null,
+    businessConnectionId: message.business_connection_id,
+    content: message.text || null,
+    status: context.updateType === "edited_business_message" ? "edited" : "active",
+    retentionDays: Number(connection.allowedChatConfiguration.retentionDays || 7)
+  }).catch((error) => logger.error("telegram.business_observation_failed", { error, connectionId: message.business_connection_id }));
 }
 
 function telegramActionError(message, statusCode = 403) {
@@ -1096,29 +1266,115 @@ async function handleTelegramInlineQuery(inlineQuery) {
     return true;
   }
   const query = String(inlineQuery.query || "").trim();
-  const title = query ? `Open NvidBot for: ${query.slice(0, 48)}` : "Open NvidBot";
-  await telegramApi("answerInlineQuery", {
+  const answerResults = (results, options = {}) => telegramApi("answerInlineQuery", {
     inline_query_id: inlineQuery.id,
-    cache_time: 1,
+    cache_time: options.cacheTime ?? 0,
     is_personal: true,
-    results: [{
-      type: "article",
-      id: crypto.createHash("sha256").update(`${inlineQuery.id}:${query}`).digest("hex").slice(0, 32),
-      title,
-      description: "Launch the NVIDIA AI assistant. Inline utility is free; full AI chat runs inside the bot.",
-      input_message_content: {
-        message_text: query
-          ? `NvidBot request: ${query}\n\nOpen the bot to run this through AI chat.`
-          : "Open NvidBot to use NVIDIA AI chat, modes, and the dashboard."
-      },
-      reply_markup: {
-        inline_keyboard: [[{
-          text: "Open NvidBot",
-          url: telegramStatus.link || miniAppUrl()
-        }]]
-      }
-    }]
+    results,
+    ...(options.button ? { button: options.button } : {})
   });
+  const article = ({ id, title, description, text }) => ({
+    type: "article",
+    id: crypto.createHash("sha256").update(`${inlineQuery.id}:${id}`).digest("hex").slice(0, 32),
+    title,
+    description,
+    input_message_content: { message_text: String(text).slice(0, 4096) },
+    reply_markup: { inline_keyboard: [[{ text: "Open Nvid AI", url: safeTelegramLaunchUrl() }]] }
+  });
+
+  if (!query) {
+    await answerResults([
+      article({ id: "explain", title: "Explain a topic", description: "Type a topic after the bot username.", text: "Type @NvidBot followed by the topic you want explained." }),
+      article({ id: "plan", title: "Create a plan", description: "Ask Nvid AI for a concise action plan.", text: "Type @NvidBot followed by the goal you want planned." }),
+      article({ id: "draft", title: "Draft a message", description: "Describe the message and desired tone.", text: "Type @NvidBot followed by what you want drafted." })
+    ], { cacheTime: 30 });
+    return true;
+  }
+
+  const userId = String(inlineQuery.from?.id || "");
+  const unavailable = async (message) => answerResults([
+    article({ id: "unavailable", title: "Nvid AI is unavailable for this query", description: message, text: `${message}\n\nOpen Nvid AI to review access or credits.` })
+  ], { cacheTime: 1 });
+  if (!/^[1-9]\d*$/.test(userId) || !telegramUserIdIsAllowed(userId)) {
+    await unavailable("This Telegram account is not authorized for inline AI.");
+    return true;
+  }
+  const store = getPlatformStore();
+  const principal = store?.getUserRole ? await platformPrincipal(userId, store) : null;
+  const userControl = telegramStarLedger?.getUserControl
+    ? await telegramStarLedger.getUserControl(userId).catch(() => null)
+    : null;
+  if (["banned_user", "restricted_user"].includes(principal?.role) || userControl?.banned) {
+    await store?.writeSecurityEvent?.({
+      eventType: "telegram_inline_authorization_denied",
+      severity: "medium",
+      userId,
+      metadata: { reason: "current_access_restricted" }
+    }).catch(() => undefined);
+    await unavailable("Inline AI access is restricted for this account.");
+    return true;
+  }
+
+  const reservationId = `inline:${userId}:${inlineQuery.id}`;
+  let creditReserved = false;
+  if (telegramStarsRequired() && !aiEntitlement({ userId, userControl }).unlimited) {
+    if (!telegramStarLedger?.reservePrompt) {
+      await unavailable("The AI credit ledger is temporarily unavailable.");
+      return true;
+    }
+    const cost = aiChatStarCost();
+    const reservation = await telegramStarLedger.reservePrompt(userId, { reservationId, cost });
+    if (!reservation?.reserved) {
+      await unavailable(["reserved", "generation_started", "response_produced", "delivery_attempted", "delivered", "completion_pending", "completed"].includes(reservation?.state)
+        ? "This inline query has already been processed."
+        : `You need ${cost} AI credit${cost === 1 ? "" : "s"}. Open Nvid AI and use /topup.`);
+      return true;
+    }
+    creditReserved = true;
+  }
+
+  let responseProduced = false;
+  try {
+    if (telegramStarLedger?.reserveProviderCapacity) {
+      const budget = await telegramStarLedger.reserveProviderCapacity({ providerKey: "nvidia", limit: nvidiaHourlyRequestLimit(), cost: 1, windowSeconds: 3600 });
+      if (!budget?.reserved) throw Object.assign(new Error("provider_budget"), { statusCode: 429 });
+    }
+    await telegramStarLedger?.transitionPrompt?.(reservationId, "generation_started");
+    const settings = await currentModeSettings();
+    const activeAssistantMode = selectedAssistantMode(userControl, settings);
+    const answer = await streamReply({
+      conversationId: `telegram:inline:${userId}:${inlineQuery.id}`,
+      text: query.slice(0, 4000),
+      model: selectModel(userControl?.preferredModel),
+      temperature: userControl?.creativity,
+      maxTokens: Math.min(1024, responseTokenLimit(userControl?.responseLength)),
+      systemPrompt: assistantSystemPrompt({ mode: activeAssistantMode, persona: assistantPreferences(userControl) }),
+      persistence: { userId, channel: "telegram_inline", requestId: reservationId, memoryEnabled: false }
+    });
+    await telegramStarLedger?.transitionPrompt?.(reservationId, "response_produced");
+    responseProduced = true;
+    await telegramStarLedger?.transitionPrompt?.(reservationId, "delivery_attempted");
+    await answerResults([article({ id: "answer", title: `Nvid AI · ${query.slice(0, 54)}`, description: "NVIDIA-powered inline answer", text: answer })]);
+    await telegramStarLedger?.transitionPrompt?.(reservationId, "delivered");
+    if (creditReserved) {
+      try {
+        await telegramStarLedger.completePrompt(reservationId);
+      } catch (error) {
+        logger.error("telegram.inline_credit_completion_failed", { error, reservationId });
+        await telegramStarLedger.transitionPrompt?.(reservationId, "completion_pending", { errorCode: "ledger_completion_failed" }).catch(() => undefined);
+      }
+    }
+  } catch (error) {
+    if (creditReserved && responseProduced) {
+      await telegramStarLedger.transitionPrompt?.(reservationId, "completion_pending", { errorCode: "inline_delivery_failed" }).catch(() => undefined);
+    } else if (creditReserved) {
+      await telegramStarLedger.restorePrompt?.(reservationId).catch(() => undefined);
+    }
+    logger.error("telegram.inline_ai_failed", { error, userId });
+    await unavailable(responseProduced
+      ? "The generated inline result could not be delivered. Billing finalization is being recovered safely."
+      : error?.statusCode === 429 ? "Inline AI is at its current provider limit. Try again shortly." : "NVIDIA could not complete this inline query, so no credit was charged.");
+  }
   return true;
 }
 
@@ -1586,6 +1842,233 @@ async function handleTelegramGroupCommand(command, message) {
   return true;
 }
 
+const NVID_GROUP_ADMIN_COMMANDS = new Set([
+  "nvid_enable", "nvid_disable", "nvid_setmode", "nvid_secretary", "nvid_guard",
+  "nvid_settings", "nvid_setrules", "nvid_welcome", "nvid_moderation", "nvid_permissions", "nvid_logs"
+]);
+
+function groupHelpText() {
+  return [
+    "Nvid AI group commands",
+    "",
+    "/nvid <question> - ask Nvid AI",
+    "/nvid_help - show this help",
+    "/nvid_status - show live group mode",
+    "/nvid_mode - show the active assistant",
+    "/nvid_summary - summarize stored messages in this thread",
+    "/nvid_reset - reset this thread's AI context",
+    "/nvid_report - report the replied-to message",
+    "",
+    "Group administrators can use /nvid_settings for configuration commands."
+  ].join("\n");
+}
+
+async function liveBotMember(chatId) {
+  const me = await telegramApi("getMe");
+  return telegramApi("getChatMember", { chat_id: chatId, user_id: me.id });
+}
+
+function safeGroupStatusText(context, botMember) {
+  const settings = context.groupConfiguration || {};
+  const chatLabel = context.isSupergroup ? "Supergroup" : context.isGroup ? "Group" : "Unknown";
+  const secretaryObservation = settings.secretaryEnabled && settings.secretaryObservationEnabled
+    ? settings.messageStorageEnabled ? "Active" : "Active, storage disabled"
+    : "Off";
+  return [
+    "Nvid AI Status",
+    `Chat: ${chatLabel}${context.isThread ? " topic" : ""}`,
+    `Activation: ${activationPolicyLabel(settings.activationPolicy)}`,
+    `Assistant: ${ASSISTANT_MODE_DEFINITIONS[settings.defaultMode]?.label || settings.defaultMode || "AI Chat"}`,
+    `Secretary observation: ${secretaryObservation}`,
+    `Thread isolation: ${settings.threadIsolationEnabled === false ? "Off" : "Active"}`,
+    `Bot administrator: ${["creator", "administrator"].includes(botMember?.status) ? "Yes" : "No"}`,
+    `AI replies: ${settings.enabled === false ? "Disabled" : "Enabled"}`
+  ].join("\n");
+}
+
+async function requireLiveGroupConfigurationAuthority(message, commandName) {
+  const permission = await groupCommandPermission(message, "group_settings");
+  if (!permission?.actorAllowed) {
+    await sendTelegramText(message, "This command requires your current Telegram group administrator rights.");
+    return null;
+  }
+  if (!permission?.botAllowed) {
+    await sendTelegramText(message, "Nvid AI must be a group administrator with manage-chat permission before this setting can be changed.");
+    return null;
+  }
+  const store = getPlatformStore();
+  await store?.recordModerationAction?.({
+    requestId: crypto.randomUUID(),
+    chatId: message.chat.id,
+    actorUserId: message.from.id,
+    action: "automatic_flag",
+    reason: `Group configuration command /${commandName}`,
+    result: "success",
+    metadata: { command: commandName }
+  }).catch(() => undefined);
+  return permission;
+}
+
+async function handleNvidGroupCommand(command, message, context) {
+  if (!groupMessage(message) || !command?.name?.startsWith("nvid")) return { handled: false, prompt: null };
+  const store = getPlatformStore();
+  const groupState = await store?.getTelegramGroup?.(message.chat.id).catch(() => null);
+  if (!groupState) {
+    await sendTelegramText(message, "This group is still registering with Nvid AI. Try again in a moment.");
+    return { handled: true, prompt: null };
+  }
+
+  if (command.name === "nvid") {
+    if (!command.argument) {
+      await sendTelegramText(message, groupHelpText());
+      return { handled: true, prompt: null };
+    }
+    return { handled: false, prompt: command.argument };
+  }
+  if (command.name === "nvid_help") {
+    await sendTelegramText(message, groupHelpText());
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_status" || command.name === "nvid_settings") {
+    if (command.name === "nvid_settings" && !(await requireLiveGroupConfigurationAuthority(message, command.name))) return { handled: true, prompt: null };
+    const botMember = await liveBotMember(message.chat.id).catch(() => null);
+    await sendTelegramText(message, safeGroupStatusText({ ...context, groupConfiguration: groupState.settings }, botMember));
+    if (command.name === "nvid_settings") {
+      await sendTelegramText(message, "Admin controls: /nvid_enable, /nvid_disable, /nvid_setmode, /nvid_secretary, /nvid_guard, /nvid_moderation, /nvid_setrules, /nvid_welcome, /nvid_permissions, /nvid_logs");
+    }
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_mode") {
+    const mode = groupState.settings?.defaultMode || "chat";
+    await sendTelegramText(message, `Active group assistant: ${ASSISTANT_MODE_DEFINITIONS[mode]?.label || mode}.\nChange it with /nvid_setmode <mode> as a group administrator.`);
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_reset") {
+    await resetConversation(conversationId(message), { userId: String(message.from?.id) });
+    await sendTelegramText(message, "This group thread's Nvid AI context was reset.");
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_report") {
+    await handleTelegramGroupCommand({ ...command, name: "report" }, message);
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_summary") {
+    if (!groupState.settings?.secretaryEnabled || !groupState.settings?.messageStorageEnabled) {
+      await sendTelegramText(message, "Group Secretary message storage is disabled. A group administrator can enable it with /nvid_secretary on.");
+      return { handled: true, prompt: null };
+    }
+    const observations = await store.listObservedMessages?.({
+      chatId: message.chat.id,
+      threadId: message.message_thread_id ?? null,
+      transportMode: "group_secretary",
+      limit: 120
+    }) || [];
+    if (!observations.length) {
+      await sendTelegramText(message, "There are no authorized stored messages in this thread to summarize yet.");
+      return { handled: true, prompt: null };
+    }
+    const transcript = observations.map((entry) => `[${entry.sender_user_id || "member"}] ${entry.content || ""}`).join("\n").slice(-18_000);
+    return { handled: false, prompt: `Summarize the following authorized Telegram group thread. Identify decisions, tasks, dates, and unanswered questions.\n\n${transcript}` };
+  }
+  if (command.name === "nvid_rules") {
+    await sendTelegramText(message, groupState.settings?.rules || "No group rules have been configured.");
+    return { handled: true, prompt: null };
+  }
+
+  if (!NVID_GROUP_ADMIN_COMMANDS.has(command.name)) {
+    await sendTelegramText(message, `Unknown Nvid AI group command /${command.name}.\n\n${groupHelpText()}`);
+    return { handled: true, prompt: null };
+  }
+  const permission = await requireLiveGroupConfigurationAuthority(message, command.name);
+  if (!permission) return { handled: true, prompt: null };
+  const actorIsCreator = permission.actor?.status === "creator";
+  const update = (changes) => store.updateGroupSettings({
+    actorUserId: message.from.id,
+    chatId: message.chat.id,
+    requestId: crypto.randomUUID(),
+    changes
+  });
+
+  if (command.name === "nvid_enable" || command.name === "nvid_disable") {
+    const enabled = command.name === "nvid_enable";
+    await update({ enabled });
+    await sendTelegramText(message, `Nvid AI group replies are now ${enabled ? "enabled" : "disabled"}.`);
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_setmode") {
+    let mode = null;
+    try {
+      mode = normalizeAssistantMode(command.argument);
+    } catch {
+      mode = null;
+    }
+    if (!mode || !ASSISTANT_MODE_DEFINITIONS[mode]) {
+      await sendTelegramText(message, `Usage: /nvid_setmode <${Object.keys(ASSISTANT_MODE_DEFINITIONS).join("|")}>`);
+      return { handled: true, prompt: null };
+    }
+    await update({ defaultMode: mode });
+    await sendTelegramText(message, `${ASSISTANT_MODE_DEFINITIONS[mode].label} is now the group assistant.`);
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_secretary") {
+    const state = command.argument.toLowerCase();
+    if (!["on", "off", "storage_on", "storage_off"].includes(state)) {
+      await sendTelegramText(message, "Usage: /nvid_secretary <on|off|storage_on|storage_off>");
+      return { handled: true, prompt: null };
+    }
+    const wasEnabled = groupState.settings?.secretaryEnabled === true;
+    const changes = state === "on"
+      ? { secretaryEnabled: true, secretaryObservationEnabled: true, messageStorageEnabled: true }
+      : state === "off"
+        ? { secretaryEnabled: false, secretaryObservationEnabled: false }
+        : { messageStorageEnabled: state === "storage_on" };
+    await update(changes);
+    if (state === "on" && !wasEnabled) {
+      await sendTelegramText(message, "Nvid AI Group Secretary is now active. I will observe authorized messages for summaries, but I will respond publicly only when called with /nvid, mentioned or scheduled.");
+    } else {
+      await sendTelegramText(message, `Group Secretary ${state.replace("_", " ")} saved.`);
+    }
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_guard" || command.name === "nvid_moderation") {
+    const enabled = /^(on|enable|enabled)$/i.test(command.argument);
+    if (!/^(on|off|enable|disable|enabled|disabled)$/i.test(command.argument)) {
+      await sendTelegramText(message, `Usage: /${command.name} <on|off>`);
+      return { handled: true, prompt: null };
+    }
+    await update(command.name === "nvid_guard" ? { guardEnabled: enabled } : { moderationEnabled: enabled });
+    await sendTelegramText(message, `${command.name === "nvid_guard" ? "Guard" : "Moderation"} is now ${enabled ? "enabled" : "disabled"}.`);
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_setrules") {
+    if (!command.argument) {
+      await sendTelegramText(message, "Usage: /nvid_setrules <group rules>");
+      return { handled: true, prompt: null };
+    }
+    await update({ rules: command.argument });
+    await sendTelegramText(message, "Group rules updated.");
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_welcome") {
+    const disabled = /^off$/i.test(command.argument);
+    await update(disabled ? { welcomeEnabled: false } : { welcomeEnabled: true, welcomeMessage: command.argument || "Welcome {name} to the group." });
+    await sendTelegramText(message, disabled ? "Welcome messages disabled." : "Welcome message saved and enabled.");
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_permissions") {
+    const bot = permission.botMember;
+    const rights = Object.entries(bot || {}).filter(([key, value]) => key.startsWith("can_") && value === true).map(([key]) => key.replace(/^can_/, "").replaceAll("_", " "));
+    await sendTelegramText(message, `Bot status: ${bot?.status || "unknown"}\nVerified rights: ${rights.length ? rights.join(", ") : "none"}`);
+    return { handled: true, prompt: null };
+  }
+  if (command.name === "nvid_logs") {
+    const actions = await store.listModerationActions(message.chat.id, { limit: 12 });
+    await sendTelegramText(message, actions.length ? actions.map((entry) => `${entry.action}: ${entry.result}${entry.reason ? ` - ${entry.reason}` : ""}`).join("\n") : "No Nvid AI group actions have been logged yet.");
+    return { handled: true, prompt: null };
+  }
+  return { handled: true, prompt: null };
+}
+
 async function handleTelegramCommand(command, message) {
   if (await handleTelegramGroupCommand(command, message)) return true;
   const chatId = message.chat.id;
@@ -1796,6 +2279,8 @@ async function handleTelegramCommand(command, message) {
 }
 
 export async function handleTelegram(update) {
+  const context = await resolveTelegramContext(update);
+  const store = getPlatformStore();
   if (update?.my_chat_member?.chat && getPlatformStore()?.upsertTelegramGroup) {
     const member = update.my_chat_member.new_chat_member;
     await getPlatformStore().upsertTelegramGroup({ chat: update.my_chat_member.chat, botMember: member }).catch((error) => {
@@ -1810,6 +2295,19 @@ export async function handleTelegram(update) {
     });
     return;
   }
+  if (update?.business_connection) {
+    await handleBusinessConnectionUpdate(update.business_connection);
+    return;
+  }
+  if (update?.deleted_business_messages) {
+    const deleted = update.deleted_business_messages;
+    await store?.markBusinessMessagesDeleted?.({
+      connectionId: deleted.business_connection_id,
+      chatId: deleted.chat.id,
+      messageIds: deleted.message_ids
+    }).catch((error) => logger.error("telegram.business_messages_delete_sync_failed", { error }));
+    return;
+  }
   if (update?.pre_checkout_query) {
     await handleTelegramPreCheckout(update.pre_checkout_query);
     return;
@@ -1818,9 +2316,31 @@ export async function handleTelegram(update) {
   if (await handleGuardCallback(update?.callback_query)) return;
   if (await handleTelegramInlineQuery(update?.inline_query)) return;
   if (await handleTelegramJoinRequest(update?.chat_join_request)) return;
+  if (update?.managed_bot) {
+    await store?.syncUserProfile?.(update.managed_bot.user).catch(() => undefined);
+    await store?.saveCapabilityVerification?.({
+      capabilityKey: "bot_management",
+      status: "active",
+      metadata: { managedBotObserved: true }
+    }).catch(() => undefined);
+    logger.info("telegram.managed_bot_observed", { ownerUserId: update.managed_bot.user?.id, managedBotId: update.managed_bot.bot?.id });
+    return;
+  }
 
-  const message = update?.message;
-  if (message) await observeTelegramContext(message);
+  const message = context.message;
+  if (!message) return;
+  let businessConnection = null;
+  if (["business_message", "edited_business_message"].includes(context.updateType)) {
+    businessConnection = await businessConnectionForMessage(message);
+    await observeBusinessMessage(message, context, businessConnection);
+    if (context.updateType === "edited_business_message") return;
+    if (!businessConnection?.enabled || !businessConnection.canReply) {
+      logger.info("telegram.business_message_ignored", { connectionId: message.business_connection_id, reason: "connection_or_reply_right_disabled" });
+      return;
+    }
+  }
+  await observeTelegramContext(message, context);
+  if (["edited_message", "channel_post", "edited_channel_post"].includes(context.updateType)) return;
   if (message?.successful_payment) {
     await handleSuccessfulStarPayment(message);
     return;
@@ -1844,16 +2364,36 @@ export async function handleTelegram(update) {
       await sendTelegramText(message, state.settings.goodbyeMessage.replaceAll("{name}", name).replaceAll("{user_id}", String(member.id)));
     }
   }
-  const text = message?.text?.trim();
+  let text = context.promptText?.trim();
   if (!text || message?.chat?.id === undefined || message?.chat?.id === null) return;
 
-  const command = parseTelegramCommand(text);
-  const configuredUsername = telegramStatus.username?.toLocaleLowerCase();
-  if (command?.botUsername && configuredUsername && command.botUsername !== configuredUsername) return;
-  const isAdminUser = telegramUserIsAdmin(message.from?.id);
-  const userControl = telegramStarLedger && typeof telegramStarLedger.getUserControl === "function" && message.from?.id
-    ? await telegramStarLedger.getUserControl(String(message.from.id)).catch((error) => {
-        logger.error("telegram.user_control_lookup_failed", { error, userId: message.from.id });
+  let command = context.command;
+  if (command && !command.addressedToThisBot) return;
+  const groupControlCommand = groupMessage(message)
+    && (command?.name?.startsWith("nvid") || GROUP_MODERATION_COMMANDS.has(command?.name));
+  if (groupMessage(message) && !context.invoked && !groupControlCommand) return;
+
+  if (context.senderIsBot) {
+    const settings = context.groupConfiguration || {};
+    const allowlist = new Set((settings.botToBotAllowlist || []).map((value) => String(value).toLocaleLowerCase()));
+    const senderAllowed = allowlist.has(String(message.from?.id)) || allowlist.has(String(message.from?.username || "").toLocaleLowerCase());
+    if (!settings.botToBotEnabled || !senderAllowed) return;
+    const interaction = await store?.recordBotInteraction?.({
+      chatId: message.chat.id,
+      threadId: message.message_thread_id ?? null,
+      senderBotId: message.from.id,
+      messageId: message.message_id,
+      content: message.text,
+      chainDepth: 0
+    }).catch(() => ({ accepted: false }));
+    if (!interaction?.accepted) return;
+  }
+
+  const accessUserId = businessConnection?.ownerUserId || message.from?.id;
+  const isAdminUser = telegramUserIsAdmin(accessUserId);
+  const userControl = telegramStarLedger && typeof telegramStarLedger.getUserControl === "function" && accessUserId
+    ? await telegramStarLedger.getUserControl(String(accessUserId)).catch((error) => {
+        logger.error("telegram.user_control_lookup_failed", { error, userId: accessUserId });
         return null;
       })
     : null;
@@ -1861,19 +2401,28 @@ export async function handleTelegram(update) {
   if (userControl?.banned && !isAdminUser) {
     await sendTelegramText(
       message,
-      `Access denied. Your Telegram user ID ${message.from?.id ?? "unavailable"} is banned from NvidBot.${userControl.banReason ? `\nReason: ${userControl.banReason}` : ""}\n\nUse /paysupport if you believe this is a mistake.`
+      `Access denied. This account is banned from NvidBot.${userControl.banReason ? `\nReason: ${userControl.banReason}` : ""}\n\nUse /paysupport if you believe this is a mistake.`
     );
     return;
   }
 
   // /whoami deliberately remains available so an owner can discover the ID to
   // place in TELEGRAM_ALLOWED_USER_IDS without first opening access to the bot.
-  if (!telegramUserIsAllowed(message) && command?.name !== "whoami") {
+  if (!telegramUserIdIsAllowed(accessUserId) && command?.name !== "whoami") {
     await sendTelegramText(
       message,
-      `Access denied. Your Telegram user ID is ${message.from?.id ?? "unavailable"}. Send /whoami for full ID details.`
+      `Access denied. Telegram user ${accessUserId} is not in the configured access list.`
     );
     return;
+  }
+
+  if (command) {
+    if (groupMessage(message) && command.name.startsWith("nvid")) {
+      const groupResult = await handleNvidGroupCommand(command, message, context);
+      if (groupResult.handled) return;
+      text = groupResult.prompt || text;
+      command = null;
+    }
   }
 
   if (command) {
@@ -1885,28 +2434,26 @@ export async function handleTelegram(update) {
     return;
   }
 
+  if (groupMessage(message) && context.groupConfiguration?.enabled === false) {
+    await sendTelegramText(message, "Nvid AI replies are disabled in this group. A current group administrator can use /nvid_enable.");
+    return;
+  }
+
   if (!(await modeEnabled("chat"))) {
     await sendTelegramText(message, "AI Chat Mode is currently disabled by the bot administrator. Commands remain available.");
     return;
   }
 
   const livePlatformStore = getPlatformStore();
-  if (livePlatformStore?.getUserRole && message.from?.id) {
-    const principal = await platformPrincipal(String(message.from.id), livePlatformStore);
+  if (livePlatformStore?.getUserRole && accessUserId) {
+    const principal = await platformPrincipal(String(accessUserId), livePlatformStore);
     if (["banned_user", "restricted_user"].includes(principal?.role) && !isAdminUser) {
       await livePlatformStore.writeSecurityEvent?.({
         eventType: "telegram_ai_authorization_denied",
         severity: "high",
-        userId: String(message.from.id),
-        metadata: { role: principal.role }
+        userId: String(accessUserId),
+        metadata: { role: principal.role, runtimeMode: context.effectiveRuntimeMode }
       });
-      await store.decideGuardJoinRequest({
-        chatId: joinRequest.chat.id,
-        userId: joinRequest.from.id,
-        actorUserId: telegramAdminUserId(),
-        decision: "rejected",
-        reason: "Configured policy rejected a platform-banned user"
-      }).catch(() => undefined);
       await sendTelegramText(message, "This platform account is not permitted to use AI chat.");
       return;
     }
@@ -1936,20 +2483,21 @@ export async function handleTelegram(update) {
     : Promise.resolve();
 
   telegramChatsInFlight.add(chatKey);
-  const reservationId = `telegram:${message.chat.id}:${message.message_id ?? update.update_id ?? "unknown"}`;
+  const reservationPrefix = context.telegramTransportMode === "bot_api" ? "telegram" : context.telegramTransportMode;
+  const reservationId = `${reservationPrefix}:${message.business_connection_id || message.guest_query_id || message.chat.id}:${message.message_id ?? update.update_id ?? "unknown"}`;
   let creditReserved = false;
-  const unlimitedCredits = aiEntitlement({ userId: message.from?.id, userControl }).unlimited;
+  const unlimitedCredits = aiEntitlement({ userId: accessUserId, userControl }).unlimited;
   if (telegramStarsRequired() && !unlimitedCredits) {
     try {
       const ledger = requireStarLedger();
       const promptCost = aiChatStarCost();
-      const reservation = await ledger.reservePrompt(String(message.from?.id), { reservationId, cost: promptCost });
+      const reservation = await ledger.reservePrompt(String(accessUserId), { reservationId, cost: promptCost });
       if (!reservation?.reserved) {
         telegramChatsInFlight.delete(chatKey);
         await releaseDurableLease();
         if (["reserved", "completed", "restored"].includes(reservation?.state)) return;
-        await sendTelegramText(
-          message,
+        await deliverTelegramAiAnswer(
+          context, message,
           `You need ${promptCost} AI message credit${promptCost === 1 ? "" : "s"} for this prompt. Your balance is ${balanceValue(reservation)}.\n\nUse /topup <amount> to buy credits with Telegram Stars. Example: /topup 10`
         );
         return;
@@ -1959,7 +2507,7 @@ export async function handleTelegram(update) {
       telegramChatsInFlight.delete(chatKey);
       await releaseDurableLease();
       logger.error("telegram.credit_reservation_failed", { error, reservationId });
-      await sendTelegramText(message, "The credit ledger is temporarily unavailable, so you were not charged. Please try again later.");
+      await deliverTelegramAiAnswer(context, message, "The credit ledger is temporarily unavailable, so you were not charged. Please try again later.");
       return;
     }
   }
@@ -1967,23 +2515,26 @@ export async function handleTelegram(update) {
   const isPrivateChat = message.chat.type === "private";
   const model = preferredTelegramModel(message, userControl);
   const settings = await currentModeSettings();
-  const activeAssistantMode = selectedAssistantMode(userControl, settings);
+  let activeAssistantMode = selectedAssistantMode(userControl, settings);
+  const groupMode = context.groupConfiguration?.defaultMode;
+  if (groupMode && ASSISTANT_MODE_DEFINITIONS[groupMode] && settings[groupMode] !== false) activeAssistantMode = groupMode;
   const draftId = telegramDraftId(update, message);
   let streamedText = "";
   let lastDraftAt = 0;
   let lastDraftText = "";
-  let draftAvailable = isPrivateChat;
+  let draftAvailable = isPrivateChat && context.telegramTransportMode !== "guest";
   let draftQueue = Promise.resolve();
 
   const sendTyping = () => telegramApi("sendChatAction", {
     chat_id: message.chat.id,
     action: "typing",
+    ...messageBusinessPayload(message),
     ...messageThreadPayload(message)
   }).catch(() => undefined);
 
-  await sendTyping();
-  const typingTimer = setInterval(() => void sendTyping(), 4000);
-  typingTimer.unref?.();
+  if (context.telegramTransportMode !== "guest") await sendTyping();
+  const typingTimer = context.telegramTransportMode === "guest" ? null : setInterval(() => void sendTyping(), 4000);
+  typingTimer?.unref?.();
 
   const queueDraft = (force = false) => {
     if (!draftAvailable || !streamedText) return draftQueue;
@@ -1999,6 +2550,7 @@ export async function handleTelegram(update) {
           chat_id: message.chat.id,
           draft_id: draftId,
           text: draftText,
+          ...messageBusinessPayload(message),
           ...messageThreadPayload(message)
         });
       } catch {
@@ -2022,8 +2574,10 @@ export async function handleTelegram(update) {
       maxTokens: responseTokenLimit(userControl?.responseLength),
       systemPrompt: assistantSystemPrompt({ mode: activeAssistantMode, persona: assistantPreferences(userControl) }),
       persistence: {
-        userId: String(message.from?.id),
-        channel: "telegram",
+        userId: String(accessUserId),
+        channel: context.telegramTransportMode === "telegram_secretary"
+          ? "telegram_business"
+          : context.telegramTransportMode === "guest" ? "telegram_guest" : "telegram",
         telegramChatId: String(message.chat.id),
         telegramThreadId: message.message_thread_id === undefined ? null : String(message.message_thread_id),
         requestId: reservationId,
@@ -2042,7 +2596,7 @@ export async function handleTelegram(update) {
     if (creditReserved && requireStarLedger().transitionPrompt) {
       await requireStarLedger().transitionPrompt(reservationId, "delivery_attempted");
     }
-    await sendTelegramText(message, answer || streamedText || "I could not generate a response.");
+    await deliverTelegramAiAnswer(context, message, answer || streamedText || "I could not generate a response.");
     if (creditReserved && requireStarLedger().transitionPrompt) {
       await requireStarLedger().transitionPrompt(reservationId, "delivered");
     }
@@ -2065,9 +2619,9 @@ export async function handleTelegram(update) {
       }
     }
     logger.error("telegram.ai_generation_failed", { error: generationError, reservationId });
-    await sendTelegramText(message, "I could not complete that response. Please try again in a moment.");
+    await deliverTelegramAiAnswer(context, message, "I could not complete that response. Please try again in a moment.").catch(() => undefined);
   } finally {
-    clearInterval(typingTimer);
+    if (typingTimer) clearInterval(typingTimer);
     telegramChatsInFlight.delete(chatKey);
     await releaseDurableLease();
   }
@@ -2107,7 +2661,164 @@ export function telegramPublicStatus() {
     link: telegramStatus.link || null,
     webhookReady: telegramStatus.webhookReady === true,
     starsRequired: telegramStatus.starsRequired === true,
-    starLedgerReady: telegramStatus.starLedgerReady === true
+    starLedgerReady: telegramStatus.starLedgerReady === true,
+    canJoinGroups: telegramStatus.canJoinGroups === true,
+    canReadAllGroupMessages: telegramStatus.canReadAllGroupMessages === true,
+    supportsInlineQueries: telegramStatus.supportsInlineQueries === true,
+    supportsGuestQueries: telegramStatus.supportsGuestQueries === true,
+    canConnectToBusiness: telegramStatus.canConnectToBusiness === true,
+    hasMainWebApp: telegramStatus.hasMainWebApp === true,
+    hasTopicsEnabled: telegramStatus.hasTopicsEnabled === true,
+    canManageBots: telegramStatus.canManageBots === true,
+    supportsJoinRequestQueries: telegramStatus.supportsJoinRequestQueries === true,
+    lastVerifiedAt: telegramStatus.lastVerifiedAt || null
+  };
+}
+
+function telegramCapabilityCard({
+  id, name, description, status, nvidEnabled, requiredPermissions = [],
+  connectionStatus = status, setupInstructions = null, lastVerifiedAt = null, details = {}
+}) {
+  return {
+    id,
+    name,
+    description,
+    telegramStatus: status,
+    nvidEnabled: nvidEnabled === true,
+    requiredPermissions,
+    connectionStatus,
+    setupInstructions,
+    lastVerifiedAt,
+    details
+  };
+}
+
+export async function telegramCapabilities({ refresh = false } = {}) {
+  if (refresh && telegramStatus.enabled) {
+    const me = await telegramApi("getMe");
+    telegramStatus = Object.freeze({
+      ...telegramStatus,
+      id: me?.id ?? telegramStatus.id ?? null,
+      username: me?.username || telegramStatus.username || null,
+      displayName: me?.first_name || telegramStatus.displayName || null,
+      canJoinGroups: me?.can_join_groups === true,
+      canReadAllGroupMessages: me?.can_read_all_group_messages === true,
+      supportsInlineQueries: me?.supports_inline_queries === true,
+      supportsGuestQueries: me?.supports_guest_queries === true,
+      canConnectToBusiness: me?.can_connect_to_business === true,
+      hasMainWebApp: me?.has_main_web_app === true,
+      hasTopicsEnabled: me?.has_topics_enabled === true,
+      canManageBots: me?.can_manage_bots === true,
+      supportsJoinRequestQueries: me?.supports_join_request_queries === true,
+      lastVerifiedAt: new Date().toISOString()
+    });
+  }
+
+  const safeStatus = telegramPublicStatus();
+  const modes = await currentModeSettings();
+  const store = getPlatformStore();
+  let groups = [];
+  let businessConnections = [];
+  let verifications = [];
+  if (store) {
+    [groups, businessConnections, verifications] = await Promise.all([
+      store.listTelegramGroups?.({ limit: 250 }).catch(() => []) ?? [],
+      store.listBusinessConnections?.({ limit: 250 }).catch(() => []) ?? [],
+      store.listCapabilityVerifications?.().catch(() => []) ?? []
+    ]);
+  }
+  const lastVerification = new Map(verifications.map((item) => [item.capabilityKey, item]));
+  const activeGroups = groups.filter((group) => group.active);
+  const administratorGroups = activeGroups.filter((group) => group.botIsAdministrator);
+  const connectedBusiness = businessConnections.filter((connection) => connection.enabled);
+  const verifiedAt = safeStatus.lastVerifiedAt;
+  const setup = (command) => `Open @BotFather, choose this bot, run ${command}, then return here and select Verify again.`;
+  const booleanCapability = (supported, enabled = true) => supported
+    ? (enabled ? "active" : "disabled")
+    : "setup_required";
+
+  return {
+    verifiedAt,
+    bot: {
+      username: safeStatus.username,
+      displayName: safeStatus.displayName,
+      configured: safeStatus.configured,
+      webhookReady: safeStatus.webhookReady
+    },
+    capabilities: [
+      telegramCapabilityCard({
+        id: "group_access", name: "Group access", description: "Install Nvid AI in groups and supergroups.",
+        status: safeStatus.canJoinGroups ? "active" : "setup_required", nvidEnabled: safeStatus.canJoinGroups,
+        requiredPermissions: ["BotFather group access"],
+        setupInstructions: safeStatus.canJoinGroups ? null : setup("/setjoingroups"), lastVerifiedAt: verifiedAt,
+        details: { knownGroups: groups.length, activeGroups: activeGroups.length }
+      }),
+      telegramCapabilityCard({
+        id: "group_privacy", name: "Group Privacy", description: safeStatus.canReadAllGroupMessages
+          ? "Telegram delivers all permitted group messages; Nvid AI still enforces invocation-only replies."
+          : "Telegram Privacy Mode is enabled, so the bot receives addressed commands, mentions, replies, and service updates.",
+        status: safeStatus.lastVerifiedAt ? "active" : "configured_unverified",
+        nvidEnabled: true, requiredPermissions: ["BotFather privacy setting"],
+        connectionStatus: safeStatus.lastVerifiedAt ? "active" : "configured_unverified",
+        setupInstructions: safeStatus.lastVerifiedAt ? null : setup("/setprivacy"), lastVerifiedAt: verifiedAt,
+        details: { privacyModeEnabled: !safeStatus.canReadAllGroupMessages, invocationOnlyEnforcedByNvid: true }
+      }),
+      telegramCapabilityCard({
+        id: "inline", name: "Inline Mode", description: "Use @bot_username query in supported chats.",
+        status: booleanCapability(safeStatus.supportsInlineQueries, modes.inline !== false), nvidEnabled: modes.inline !== false,
+        requiredPermissions: ["BotFather Inline Mode"], setupInstructions: safeStatus.supportsInlineQueries ? null : setup("/setinline"), lastVerifiedAt: verifiedAt
+      }),
+      telegramCapabilityCard({
+        id: "guest", name: "Guest Mode", description: "Answer explicit Telegram guest queries when Telegram delivers them.",
+        status: booleanCapability(safeStatus.supportsGuestQueries, modes.guest_chat !== false), nvidEnabled: modes.guest_chat !== false,
+        requiredPermissions: ["BotFather Guest Mode"], setupInstructions: safeStatus.supportsGuestQueries ? null : setup("/setguestmode"), lastVerifiedAt: verifiedAt
+      }),
+      telegramCapabilityCard({
+        id: "telegram_secretary", name: "Telegram Secretary Mode", description: "Operate through connected Telegram Business accounts. This is separate from Group Secretary.",
+        status: !safeStatus.canConnectToBusiness ? "setup_required" : connectedBusiness.length ? "connected" : "not_connected",
+        nvidEnabled: modes.secretary !== false, requiredPermissions: ["Telegram Business connection", "Reply permission"],
+        connectionStatus: connectedBusiness.length ? "connected" : "not_connected",
+        setupInstructions: safeStatus.canConnectToBusiness ? "Connect Nvid AI from Telegram Business chatbot settings." : setup("/business"),
+        lastVerifiedAt: connectedBusiness[0]?.lastVerifiedAt || verifiedAt,
+        details: { connectedAccounts: connectedBusiness.length, groupSecretaryConfiguredSeparately: true }
+      }),
+      telegramCapabilityCard({
+        id: "bot_management", name: "Bot Management", description: "Manage explicitly connected bot profiles with encrypted credentials.",
+        status: safeStatus.canManageBots ? "active" : (lastVerification.get("bot_management") ? "configured_unverified" : "setup_required"),
+        nvidEnabled: modes.bot_management !== false, requiredPermissions: ["BotFather or Telegram managed-bot capability"],
+        setupInstructions: safeStatus.canManageBots ? null : "Enable bot management for this bot in BotFather where available, then verify again.", lastVerifiedAt: lastVerification.get("bot_management")?.verifiedAt || verifiedAt,
+        details: { managedBots: null }
+      }),
+      telegramCapabilityCard({
+        id: "bot_to_bot", name: "Bot-to-Bot Mode", description: "Controlled interaction with allowlists, duplicate detection and chain limits.",
+        status: modes.bot_to_bot === false ? "disabled" : "configured_unverified", nvidEnabled: modes.bot_to_bot !== false,
+        requiredPermissions: ["Per-group enablement", "Bot allowlist"], lastVerifiedAt: lastVerification.get("bot_to_bot")?.verifiedAt || null
+      }),
+      telegramCapabilityCard({
+        id: "guard", name: "Guard Mode", description: "Review Telegram group join requests when Nvid AI has the required group rights.",
+        status: safeStatus.supportsJoinRequestQueries ? (administratorGroups.length ? "active" : "permission_required") : "configured_unverified",
+        nvidEnabled: modes.guard !== false, requiredPermissions: ["Group administrator", "Invite users"],
+        connectionStatus: administratorGroups.length ? "active" : "permission_required", lastVerifiedAt: verifiedAt,
+        details: { administratorGroups: administratorGroups.length }
+      }),
+      telegramCapabilityCard({
+        id: "threads", name: "Thread and Topic Mode", description: "Keep AI and Secretary context isolated by Telegram topic.",
+        status: safeStatus.hasTopicsEnabled || groups.some((group) => group.chatType === "supergroup") ? "active" : "configured_unverified",
+        nvidEnabled: modes.threaded !== false, requiredPermissions: ["Forum topics where used"], lastVerifiedAt: verifiedAt,
+        details: { threadIsolation: true }
+      }),
+      telegramCapabilityCard({
+        id: "mini_app", name: "Mini App", description: "Authenticated Telegram-native user and administration interface.",
+        status: safeStatus.hasMainWebApp ? "active" : "configured_unverified", nvidEnabled: true,
+        requiredPermissions: ["BotFather Main App or Menu Button"],
+        setupInstructions: safeStatus.hasMainWebApp ? null : setup("/newapp"), lastVerifiedAt: verifiedAt
+      }),
+      telegramCapabilityCard({
+        id: "payments", name: "Telegram Stars", description: "One-credit billing and Telegram Stars top-ups.",
+        status: safeStatus.starLedgerReady ? "active" : "unavailable", nvidEnabled: safeStatus.starsRequired,
+        requiredPermissions: ["Telegram Stars payments"], lastVerifiedAt: verifiedAt
+      })
+    ]
   };
 }
 
@@ -2350,11 +3061,22 @@ export async function configureTelegramBot() {
         web_app: { url: miniAppUrl() }
       }
     });
-    await telegramApi("setMyCommands", { commands: TELEGRAM_COMMANDS });
+    await telegramApi("setMyCommands", {
+      commands: TELEGRAM_COMMANDS,
+      scope: { type: "all_private_chats" }
+    });
+    await telegramApi("setMyCommands", {
+      commands: TELEGRAM_GROUP_COMMANDS,
+      scope: { type: "all_group_chats" }
+    });
+    await telegramApi("setMyCommands", {
+      commands: TELEGRAM_GROUP_ADMIN_COMMANDS,
+      scope: { type: "all_chat_administrators" }
+    });
     await telegramApi("setWebhook", {
       url: webhookUrl,
       secret_token: secret,
-      allowed_updates: ["message", "pre_checkout_query", "callback_query", "inline_query", "chat_join_request", "my_chat_member", "chat_member"],
+      allowed_updates: TELEGRAM_ALLOWED_UPDATES,
       max_connections: 10
     });
     const webhook = await telegramApi("getWebhookInfo");
@@ -2363,6 +3085,7 @@ export async function configureTelegramBot() {
     telegramStatus = Object.freeze({
       enabled: true,
       configured: webhookMatches,
+      id: me?.id ?? null,
       username: me?.username || null,
       displayName: me?.first_name || null,
       link: me?.username ? `https://t.me/${me.username}` : null,
@@ -2370,7 +3093,17 @@ export async function configureTelegramBot() {
       starsRequired,
       starLedgerReady,
       pendingUpdates: Number(webhook?.pending_update_count || 0),
-      lastWebhookError: webhook?.last_error_message || null
+      lastWebhookError: webhook?.last_error_message || null,
+      canJoinGroups: me?.can_join_groups === true,
+      canReadAllGroupMessages: me?.can_read_all_group_messages === true,
+      supportsInlineQueries: me?.supports_inline_queries === true,
+      supportsGuestQueries: me?.supports_guest_queries === true,
+      canConnectToBusiness: me?.can_connect_to_business === true,
+      hasMainWebApp: me?.has_main_web_app === true,
+      hasTopicsEnabled: me?.has_topics_enabled === true,
+      canManageBots: me?.can_manage_bots === true,
+      supportsJoinRequestQueries: me?.supports_join_request_queries === true,
+      lastVerifiedAt: new Date().toISOString()
     });
     return telegramPublicStatus();
   } catch (error) {

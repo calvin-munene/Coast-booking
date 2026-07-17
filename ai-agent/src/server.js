@@ -28,6 +28,7 @@ import {
   setTelegramUserAiSettings,
   setTelegramUserPreferredModel,
   telegramBillingHistory,
+  telegramCapabilities,
   telegramDashboardState,
   telegramPublicStatus,
   telegramGroupPermissionState,
@@ -879,6 +880,14 @@ export function createAppServer() {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/api/telegram/capabilities") {
+      if (!consumeRequestBudget(req, "telegram-capabilities", { limit: 30, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
+      const auth = await authorizeUserRequest(req);
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const refresh = url.searchParams.get("refresh") === "true";
+      return json(res, 200, await telegramCapabilities({ refresh }));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/admin/groups") {
       const auth = await authorizeAdminRequest(req, { permission: "groups.view" });
       if (!auth.allowed) return json(res, auth.status, { error: auth.error });
@@ -919,6 +928,17 @@ export function createAppServer() {
       if (typeof data.requestId !== "string" || !data.changes || typeof data.changes !== "object") {
         return json(res, 400, { error: "requestId and changes are required" });
       }
+      if (data.changes.activationPolicy === "always_on") {
+        if (live.state.actor?.status !== "creator" || data.changes.alwaysOnConfirmed !== true) {
+          await recordSecurityEvent(req, {
+            eventType: "telegram_group_always_on_denied",
+            severity: "medium",
+            userId: auth.session.userId,
+            metadata: { chatId: groupSettingsMatch[1], reason: "creator_confirmation_required" }
+          });
+          return json(res, 403, { error: "Only the current Telegram group creator can explicitly confirm Always On" });
+        }
+      }
       const changed = await getPlatformStore().updateGroupSettings({
         actorUserId: auth.session.userId,
         chatId: groupSettingsMatch[1],
@@ -926,6 +946,14 @@ export function createAppServer() {
         changes: data.changes
       });
       return json(res, 200, changed);
+    }
+
+    if (url.pathname === "/api/secretary/connections" && req.method === "GET") {
+      const auth = await authorizeUserRequest(req);
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, {
+        connections: await getPlatformStore().listBusinessConnections({ ownerUserId: auth.session.userId, limit: parseLimit(url) })
+      });
     }
 
     const groupModerationMatch = url.pathname.match(/^\/api\/groups\/(-?\d+)\/moderation$/);

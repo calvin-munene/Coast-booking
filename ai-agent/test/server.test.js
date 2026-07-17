@@ -833,6 +833,80 @@ test("group Mini App APIs require current Telegram administrator status", async 
   }
 });
 
+test("Telegram capability API is authenticated and returns safe runtime state", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  setPlatformStoreForTests(platformStoreDouble({
+    async listTelegramGroups() { return [{ chatId: "-1001", active: true, botIsAdministrator: true, chatType: "supergroup" }]; },
+    async listBusinessConnections() { return []; },
+    async listCapabilityVerifications() { return []; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    assert.equal((await requestGet(port, "/api/telegram/capabilities")).status, 401);
+    const session = await launchWebSession(port, 123);
+    const response = await requestGet(port, "/api/telegram/capabilities", { authorization: `Bearer ${session}` });
+    assert.equal(response.status, 200, response.text);
+    const data = JSON.parse(response.text);
+    assert.ok(data.capabilities.some((entry) => entry.id === "group_access"));
+    assert.ok(data.capabilities.some((entry) => entry.id === "telegram_secretary"));
+    assert.ok(data.capabilities.some((entry) => entry.id === "payments"));
+    assert.equal(response.text.includes("test-token"), false);
+    assert.equal(response.text.includes("TELEGRAM_BOT_TOKEN"), false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("Always On group activation requires live creator confirmation", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  let actorStatus = "administrator";
+  const updates = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async syncGroupMember() {},
+    async updateGroupSettings(input) { updates.push(input); return { duplicate: false, settings: input.changes }; }
+  }));
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    if (method === "getMe") return new Response(JSON.stringify({ ok: true, result: { id: 999, is_bot: true } }), { status: 200, headers: { "content-type": "application/json" } });
+    if (method === "getChatMember") {
+      const result = String(payload.user_id) === "123"
+        ? { status: actorStatus, can_manage_chat: true, user: { id: 123 } }
+        : { status: "administrator", can_manage_chat: true, user: { id: 999 } };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true, result: true }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    const headers = { authorization: `Bearer ${session}`, origin: process.env.PUBLIC_URL };
+    const denied = await requestJsonMethod(port, "/api/groups/-10077/settings", "PATCH", {
+      requestId: crypto.randomUUID(),
+      changes: { activationPolicy: "always_on", alwaysOnConfirmed: true }
+    }, headers);
+    assert.equal(denied.status, 403, denied.text);
+    assert.equal(updates.length, 0);
+
+    actorStatus = "creator";
+    const allowed = await requestJsonMethod(port, "/api/groups/-10077/settings", "PATCH", {
+      requestId: crypto.randomUUID(),
+      changes: { activationPolicy: "always_on", alwaysOnConfirmed: true }
+    }, headers);
+    assert.equal(allowed.status, 200, allowed.text);
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].changes.activationPolicy, "always_on");
+  } finally {
+    await close(server);
+  }
+});
+
 test("durable conversation lease blocks a duplicate generation across simulated instances", async () => {
   enableTelegramPayments();
   process.env.NVIDIA_API_KEY = "nvapi-test";

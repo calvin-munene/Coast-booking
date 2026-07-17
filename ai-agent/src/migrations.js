@@ -554,6 +554,130 @@ export const PLATFORM_MIGRATIONS = Object.freeze([
         ('managed_bots', FALSE, 'Encrypted managed bot profiles and connectivity operations')
       ON CONFLICT (feature_key) DO NOTHING;
     `
+  }),
+  Object.freeze({
+    version: "2026071702_telegram_contexts",
+    sql: `
+      ALTER TABLE telegram_groups
+        ADD COLUMN IF NOT EXISTS bot_is_administrator BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+      UPDATE telegram_groups
+      SET bot_is_administrator = bot_status IN ('creator', 'administrator'),
+          last_seen_at = GREATEST(last_seen_at, last_event_at)
+      WHERE bot_is_administrator IS DISTINCT FROM (bot_status IN ('creator', 'administrator'))
+         OR last_seen_at < last_event_at;
+
+      ALTER TABLE telegram_group_settings
+        ADD COLUMN IF NOT EXISTS activation_policy TEXT NOT NULL DEFAULT 'mention_only',
+        ADD COLUMN IF NOT EXISTS default_mode TEXT NOT NULL DEFAULT 'chat',
+        ADD COLUMN IF NOT EXISTS response_visibility TEXT NOT NULL DEFAULT 'reply',
+        ADD COLUMN IF NOT EXISTS secretary_observation_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS message_storage_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS retention_days INTEGER NOT NULL DEFAULT 7,
+        ADD COLUMN IF NOT EXISTS bot_to_bot_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS bot_to_bot_allowlist JSONB NOT NULL DEFAULT '[]'::jsonb,
+        ADD COLUMN IF NOT EXISTS always_on_confirmed_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS thread_isolation_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS delegation_policy JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+      ALTER TABLE telegram_group_settings
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_activation_policy_check,
+        ADD CONSTRAINT telegram_group_settings_activation_policy_check
+          CHECK (activation_policy IN ('mention_only', 'command_only', 'mention_command_or_reply', 'administrators_only', 'always_on')),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_response_visibility_check,
+        ADD CONSTRAINT telegram_group_settings_response_visibility_check
+          CHECK (response_visibility IN ('reply', 'public', 'silent')),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_retention_days_check,
+        ADD CONSTRAINT telegram_group_settings_retention_days_check
+          CHECK (retention_days BETWEEN 1 AND 90),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_bot_to_bot_allowlist_check,
+        ADD CONSTRAINT telegram_group_settings_bot_to_bot_allowlist_check
+          CHECK (jsonb_typeof(bot_to_bot_allowlist) = 'array'),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_delegation_policy_check,
+        ADD CONSTRAINT telegram_group_settings_delegation_policy_check
+          CHECK (jsonb_typeof(delegation_policy) = 'object'),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_always_on_confirmation_check,
+        ADD CONSTRAINT telegram_group_settings_always_on_confirmation_check
+          CHECK (activation_policy <> 'always_on' OR always_on_confirmed_at IS NOT NULL);
+
+      CREATE TABLE IF NOT EXISTS telegram_group_bot_permissions (
+        chat_id BIGINT PRIMARY KEY REFERENCES telegram_groups(chat_id) ON DELETE CASCADE,
+        member_status TEXT NOT NULL DEFAULT 'unknown'
+          CHECK (member_status IN ('creator', 'administrator', 'member', 'restricted', 'left', 'kicked', 'unknown')),
+        permission_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(permission_snapshot) = 'object'),
+        verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS telegram_business_connections (
+        connection_id TEXT PRIMARY KEY CHECK (length(connection_id) BETWEEN 1 AND 256),
+        owner_user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        user_chat_id BIGINT,
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        can_reply BOOLEAN NOT NULL DEFAULT FALSE,
+        rights JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(rights) = 'object'),
+        allowed_chat_configuration JSONB NOT NULL DEFAULT '{}'::jsonb
+          CHECK (jsonb_typeof(allowed_chat_configuration) = 'object'),
+        connected_at TIMESTAMPTZ NOT NULL,
+        last_verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS telegram_business_connections_owner_idx
+        ON telegram_business_connections(owner_user_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS telegram_observed_messages (
+        observation_id UUID PRIMARY KEY,
+        update_type TEXT NOT NULL CHECK (length(update_type) BETWEEN 1 AND 64),
+        transport_mode TEXT NOT NULL CHECK (transport_mode IN ('group_secretary', 'telegram_secretary')),
+        chat_id BIGINT NOT NULL,
+        thread_id BIGINT,
+        message_id BIGINT NOT NULL,
+        sender_user_id BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        business_connection_id TEXT REFERENCES telegram_business_connections(connection_id) ON DELETE CASCADE,
+        content TEXT CHECK (content IS NULL OR length(content) <= 20000),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'edited', 'deleted', 'expired')),
+        observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS telegram_observed_messages_identity_idx
+        ON telegram_observed_messages(transport_mode, chat_id, COALESCE(thread_id, 0), message_id);
+      CREATE INDEX IF NOT EXISTS telegram_observed_messages_context_idx
+        ON telegram_observed_messages(chat_id, thread_id, observed_at DESC)
+        WHERE status IN ('active', 'edited');
+      CREATE INDEX IF NOT EXISTS telegram_observed_messages_expiry_idx
+        ON telegram_observed_messages(expires_at) WHERE status <> 'expired';
+
+      CREATE TABLE IF NOT EXISTS telegram_capability_verifications (
+        capability_key TEXT PRIMARY KEY CHECK (length(capability_key) BETWEEN 1 AND 64),
+        status TEXT NOT NULL CHECK (status IN (
+          'active', 'disabled', 'setup_required', 'permission_required', 'connected',
+          'not_connected', 'configured_unverified', 'unavailable'
+        )),
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+        verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS telegram_bot_interactions (
+        correlation_id UUID PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        thread_id BIGINT,
+        sender_bot_id BIGINT NOT NULL,
+        message_id BIGINT NOT NULL,
+        message_fingerprint TEXT NOT NULL CHECK (message_fingerprint ~ '^[a-f0-9]{64}$'),
+        chain_depth INTEGER NOT NULL DEFAULT 0 CHECK (chain_depth BETWEEN 0 AND 3),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (chat_id, message_id, sender_bot_id)
+      );
+      CREATE INDEX IF NOT EXISTS telegram_bot_interactions_expiry_idx
+        ON telegram_bot_interactions(expires_at);
+
+      INSERT INTO feature_flags (feature_key, enabled, description)
+      VALUES ('telegram_context_routing', TRUE, 'Deterministic Telegram transport and invocation routing')
+      ON CONFLICT (feature_key) DO NOTHING;
+    `
   })
 ]);
 

@@ -82,10 +82,13 @@ function groupRow(row) {
     chatType: row.chat_type,
     active: row.active === true,
     botStatus: row.bot_status,
+    botIsAdministrator: row.bot_is_administrator === true || ["creator", "administrator"].includes(row.bot_status),
     botPermissions: row.bot_permissions || {},
     memberCount: row.member_count === null ? null : Number(row.member_count),
     lastEventAt: row.last_event_at,
-    updatedAt: row.updated_at
+    lastSeenAt: row.last_seen_at || row.last_event_at,
+    updatedAt: row.updated_at,
+    settings: row.settings_snapshot ? groupSettingsRow(row.settings_snapshot) : undefined
   };
 }
 
@@ -97,6 +100,18 @@ function groupSettingsRow(row) {
     moderationEnabled: row.moderation_enabled === true,
     guardEnabled: row.guard_enabled === true,
     secretaryEnabled: row.secretary_enabled === true,
+    secretaryObservationEnabled: row.secretary_observation_enabled === true,
+    messageStorageEnabled: row.message_storage_enabled === true,
+    retentionDays: Number(row.retention_days || 7),
+    activationPolicy: row.activation_policy || "mention_only",
+    defaultMode: row.default_mode || "chat",
+    responseVisibility: row.response_visibility || "reply",
+    botToBotEnabled: row.bot_to_bot_enabled === true,
+    botToBotAllowlist: row.bot_to_bot_allowlist || [],
+    alwaysOnConfirmed: Boolean(row.always_on_confirmed_at),
+    alwaysOnConfirmedAt: row.always_on_confirmed_at || null,
+    threadIsolationEnabled: row.thread_isolation_enabled !== false,
+    delegationPolicy: row.delegation_policy || {},
     welcomeEnabled: row.welcome_enabled === true,
     welcomeMessage: row.welcome_message || null,
     goodbyeEnabled: row.goodbye_enabled === true,
@@ -114,6 +129,22 @@ function groupSettingsRow(row) {
     blockedDomains: row.blocked_domains || [],
     guardPolicy: row.guard_policy || {},
     secretaryPolicy: row.secretary_policy || {},
+    updatedAt: row.updated_at
+  };
+}
+
+function businessConnectionRow(row) {
+  if (!row) return null;
+  return {
+    connectionId: row.connection_id,
+    ownerUserId: String(row.owner_user_id),
+    userChatId: row.user_chat_id === null ? null : String(row.user_chat_id),
+    enabled: row.enabled === true,
+    canReply: row.can_reply === true,
+    rights: row.rights || {},
+    allowedChatConfiguration: row.allowed_chat_configuration || {},
+    connectedAt: row.connected_at,
+    lastVerifiedAt: row.last_verified_at,
     updatedAt: row.updated_at
   };
 }
@@ -307,6 +338,8 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     const title = bounded(chat?.title || chat?.username || `Telegram ${id}`, "title", 255);
     const username = chat?.username ? bounded(chat.username, "username", 64) : null;
     const status = ["creator", "administrator", "member", "restricted", "left", "kicked"].includes(botMember?.status) ? botMember.status : "unknown";
+    const active = !["left", "kicked"].includes(status);
+    const botIsAdministrator = ["creator", "administrator"].includes(status);
     const permissions = botMember && typeof botMember === "object" ? Object.fromEntries(
       Object.entries(botMember).filter(([key, value]) => key.startsWith("can_") && typeof value === "boolean")
     ) : {};
@@ -314,18 +347,30 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     if (count !== null && (!Number.isSafeInteger(count) || count < 0)) throw new TypeError("memberCount is invalid");
     return transaction(async (client) => {
       const result = await client.query(
-        `INSERT INTO telegram_groups (chat_id, title, username, chat_type, bot_status, bot_permissions, member_count)
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+        `INSERT INTO telegram_groups
+          (chat_id, title, username, chat_type, active, bot_status, bot_is_administrator, bot_permissions, member_count, last_seen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW())
          ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title, username = EXCLUDED.username,
-           chat_type = EXCLUDED.chat_type, active = TRUE,
+           chat_type = EXCLUDED.chat_type,
+           active = CASE WHEN EXCLUDED.bot_status = 'unknown' THEN telegram_groups.active ELSE EXCLUDED.active END,
            bot_status = CASE WHEN EXCLUDED.bot_status = 'unknown' THEN telegram_groups.bot_status ELSE EXCLUDED.bot_status END,
+           bot_is_administrator = CASE WHEN EXCLUDED.bot_status = 'unknown' THEN telegram_groups.bot_is_administrator ELSE EXCLUDED.bot_is_administrator END,
            bot_permissions = CASE WHEN EXCLUDED.bot_status = 'unknown' THEN telegram_groups.bot_permissions ELSE EXCLUDED.bot_permissions END,
            member_count = COALESCE(EXCLUDED.member_count, telegram_groups.member_count),
-           last_event_at = NOW(), updated_at = NOW()
+           last_event_at = NOW(), last_seen_at = NOW(), updated_at = NOW()
          RETURNING *`,
-        [id, title, username, type, status, JSON.stringify(permissions), count]
+        [id, title, username, type, active, status, botIsAdministrator, JSON.stringify(permissions), count]
       );
       await client.query("INSERT INTO telegram_group_settings (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING", [id]);
+      if (botMember) {
+        await client.query(
+          `INSERT INTO telegram_group_bot_permissions (chat_id, member_status, permission_snapshot, verified_at)
+           VALUES ($1, $2, $3::jsonb, NOW())
+           ON CONFLICT (chat_id) DO UPDATE SET member_status = EXCLUDED.member_status,
+             permission_snapshot = EXCLUDED.permission_snapshot, verified_at = NOW()`,
+          [id, status, JSON.stringify(permissions)]
+        );
+      }
       return groupRow(result.rows[0]);
     });
   }
@@ -358,9 +403,10 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     const query = String(search || "").trim().slice(0, 100);
     return transaction(async (client) => {
       const result = await client.query(
-        `SELECT groups.* FROM telegram_groups AS groups
-         WHERE groups.active = TRUE
-           AND ($1::bigint IS NULL OR EXISTS (
+        `SELECT groups.*, to_jsonb(settings) AS settings_snapshot
+         FROM telegram_groups AS groups
+         LEFT JOIN telegram_group_settings AS settings USING (chat_id)
+         WHERE ($1::bigint IS NULL OR EXISTS (
              SELECT 1 FROM telegram_group_members AS members WHERE members.chat_id = groups.chat_id
                AND members.user_id = $1 AND members.telegram_status IN ('creator', 'administrator')
            ))
@@ -377,13 +423,40 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     return transaction(async (client) => {
       const group = await client.query("SELECT * FROM telegram_groups WHERE chat_id = $1", [id]);
       if (!group.rowCount) return null;
-      const [settings, actions, warnings, guard] = await Promise.all([
+      const [settings, permissions, actions, warnings, guard] = await Promise.all([
         client.query("SELECT * FROM telegram_group_settings WHERE chat_id = $1", [id]),
+        client.query("SELECT member_status, permission_snapshot, verified_at FROM telegram_group_bot_permissions WHERE chat_id = $1", [id]),
         client.query("SELECT * FROM group_moderation_actions WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 100", [id]),
         client.query("SELECT warning_id, user_id::text, issued_by::text, reason, active, removed_at, created_at FROM group_warnings WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 100", [id]),
         client.query("SELECT join_request_id, user_id::text, requested_at, status, user_snapshot, decision_reason, decided_at FROM guard_join_requests WHERE chat_id = $1 ORDER BY requested_at DESC LIMIT 100", [id])
       ]);
-      return { group: groupRow(group.rows[0]), settings: groupSettingsRow(settings.rows[0]), actions: actions.rows, warnings: warnings.rows, guardRequests: guard.rows };
+      return {
+        group: groupRow(group.rows[0]),
+        settings: groupSettingsRow(settings.rows[0]),
+        botPermissionSnapshot: permissions.rows[0] ? {
+          status: permissions.rows[0].member_status,
+          permissions: permissions.rows[0].permission_snapshot || {},
+          verifiedAt: permissions.rows[0].verified_at
+        } : null,
+        actions: actions.rows,
+        warnings: warnings.rows,
+        guardRequests: guard.rows
+      };
+    });
+  }
+
+  async function getGroupMember(rawChatId, rawUserId) {
+    const groupId = chatId(rawChatId);
+    const id = userId(rawUserId);
+    return transaction(async (client) => {
+      const result = await client.query(
+        `SELECT user_id::text, telegram_status, permissions, joined_at, last_seen_at, updated_at
+         FROM telegram_group_members WHERE chat_id = $1 AND user_id = $2`,
+        [groupId, id]
+      );
+      if (!result.rowCount) return null;
+      const row = result.rows[0];
+      return { userId: row.user_id, status: row.telegram_status, permissions: row.permissions || {}, joinedAt: row.joined_at, lastSeenAt: row.last_seen_at, updatedAt: row.updated_at };
     });
   }
 
@@ -393,7 +466,11 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     const operationId = requestId(rawRequestId);
     const input = jsonObject(changes, "changes");
     const normalized = {};
-    for (const key of ["enabled", "moderationEnabled", "guardEnabled", "secretaryEnabled", "welcomeEnabled", "goodbyeEnabled", "antiFloodEnabled", "antiLinkEnabled", "antiCapsEnabled", "antiSpamEnabled"]) {
+    for (const key of [
+      "enabled", "moderationEnabled", "guardEnabled", "secretaryEnabled", "secretaryObservationEnabled",
+      "messageStorageEnabled", "botToBotEnabled", "alwaysOnConfirmed", "threadIsolationEnabled",
+      "welcomeEnabled", "goodbyeEnabled", "antiFloodEnabled", "antiLinkEnabled", "antiCapsEnabled", "antiSpamEnabled"
+    ]) {
       if (input[key] !== undefined) normalized[key] = boolean(input[key], key);
     }
     for (const [key, maximum] of [["welcomeMessage", 2000], ["goodbyeMessage", 2000], ["rules", 10000]]) {
@@ -411,8 +488,25 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
       normalized.warningMuteSeconds = Number(input.warningMuteSeconds);
       if (!Number.isSafeInteger(normalized.warningMuteSeconds) || normalized.warningMuteSeconds < 30 || normalized.warningMuteSeconds > 31_536_000) throw new TypeError("warningMuteSeconds is invalid");
     }
-    for (const key of ["blockedWords", "allowedDomains", "blockedDomains"]) if (input[key] !== undefined) normalized[key] = stringArray(input[key], key);
-    for (const key of ["guardPolicy", "secretaryPolicy"]) if (input[key] !== undefined) normalized[key] = jsonObject(input[key], key);
+    if (input.activationPolicy !== undefined) {
+      normalized.activationPolicy = String(input.activationPolicy);
+      if (!["mention_only", "command_only", "mention_command_or_reply", "administrators_only", "always_on"].includes(normalized.activationPolicy)) throw new TypeError("activationPolicy is invalid");
+      if (normalized.activationPolicy === "always_on" && input.alwaysOnConfirmed !== true) throw new TypeError("always_on requires explicit owner confirmation");
+    }
+    if (input.defaultMode !== undefined) {
+      normalized.defaultMode = bounded(input.defaultMode, "defaultMode", 64).toLowerCase();
+      if (!/^[a-z0-9_]+$/.test(normalized.defaultMode)) throw new TypeError("defaultMode is invalid");
+    }
+    if (input.responseVisibility !== undefined) {
+      normalized.responseVisibility = String(input.responseVisibility);
+      if (!["reply", "public", "silent"].includes(normalized.responseVisibility)) throw new TypeError("responseVisibility is invalid");
+    }
+    if (input.retentionDays !== undefined) {
+      normalized.retentionDays = Number(input.retentionDays);
+      if (!Number.isSafeInteger(normalized.retentionDays) || normalized.retentionDays < 1 || normalized.retentionDays > 90) throw new TypeError("retentionDays is invalid");
+    }
+    for (const key of ["blockedWords", "allowedDomains", "blockedDomains", "botToBotAllowlist"]) if (input[key] !== undefined) normalized[key] = stringArray(input[key], key);
+    for (const key of ["guardPolicy", "secretaryPolicy", "delegationPolicy"]) if (input[key] !== undefined) normalized[key] = jsonObject(input[key], key);
     if (!Object.keys(normalized).length) throw new TypeError("At least one group setting is required");
     return transaction(async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [operationId]);
@@ -440,7 +534,16 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
           anti_spam_enabled = COALESCE($20, anti_spam_enabled),
           blocked_words = COALESCE($21::jsonb, blocked_words), allowed_domains = COALESCE($22::jsonb, allowed_domains),
           blocked_domains = COALESCE($23::jsonb, blocked_domains), guard_policy = COALESCE($24::jsonb, guard_policy),
-          secretary_policy = COALESCE($25::jsonb, secretary_policy), updated_by = $26, updated_at = NOW()
+          secretary_policy = COALESCE($25::jsonb, secretary_policy),
+          activation_policy = COALESCE($26, activation_policy), default_mode = COALESCE($27, default_mode),
+          response_visibility = COALESCE($28, response_visibility),
+          secretary_observation_enabled = COALESCE($29, secretary_observation_enabled),
+          message_storage_enabled = COALESCE($30, message_storage_enabled), retention_days = COALESCE($31, retention_days),
+          bot_to_bot_enabled = COALESCE($32, bot_to_bot_enabled),
+          bot_to_bot_allowlist = COALESCE($33::jsonb, bot_to_bot_allowlist),
+          always_on_confirmed_at = CASE WHEN $34::boolean THEN CASE WHEN $35::boolean THEN NOW() ELSE NULL END ELSE always_on_confirmed_at END,
+          thread_isolation_enabled = COALESCE($36, thread_isolation_enabled),
+          delegation_policy = COALESCE($37::jsonb, delegation_policy), updated_by = $38, updated_at = NOW()
          WHERE chat_id = $1 RETURNING *`,
         [id, normalized.enabled, normalized.moderationEnabled, normalized.guardEnabled, normalized.secretaryEnabled,
           normalized.welcomeEnabled, Object.hasOwn(normalized, "welcomeMessage"), normalized.welcomeMessage,
@@ -451,7 +554,13 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
           normalized.allowedDomains ? JSON.stringify(normalized.allowedDomains) : null,
           normalized.blockedDomains ? JSON.stringify(normalized.blockedDomains) : null,
           normalized.guardPolicy ? JSON.stringify(normalized.guardPolicy) : null,
-          normalized.secretaryPolicy ? JSON.stringify(normalized.secretaryPolicy) : null, actor]
+          normalized.secretaryPolicy ? JSON.stringify(normalized.secretaryPolicy) : null,
+          normalized.activationPolicy, normalized.defaultMode, normalized.responseVisibility,
+          normalized.secretaryObservationEnabled, normalized.messageStorageEnabled, normalized.retentionDays,
+          normalized.botToBotEnabled, normalized.botToBotAllowlist ? JSON.stringify(normalized.botToBotAllowlist) : null,
+          Object.hasOwn(normalized, "alwaysOnConfirmed"), normalized.alwaysOnConfirmed,
+          normalized.threadIsolationEnabled, normalized.delegationPolicy ? JSON.stringify(normalized.delegationPolicy) : null,
+          actor]
       );
       if (!result.rowCount) {
         const error = new Error("Telegram group was not found");
@@ -991,6 +1100,171 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     });
   }
 
+  async function upsertBusinessConnection(connection) {
+    const connectionId = bounded(connection?.id || connection?.connectionId, "connectionId", 256);
+    const owner = userId(connection?.user?.id || connection?.ownerUserId, "ownerUserId");
+    const userChat = connection?.user_chat_id === undefined && connection?.userChatId === undefined
+      ? null
+      : chatId(connection?.user_chat_id ?? connection?.userChatId);
+    const rights = jsonObject(connection?.rights, "rights");
+    const enabled = connection?.is_enabled === true || connection?.enabled === true;
+    const connectedAt = new Date(Number(connection?.date || 0) * 1000);
+    if (!Number.isFinite(connectedAt.getTime()) || connectedAt.getTime() <= 0) throw new TypeError("connection date is invalid");
+    const allowed = jsonObject(connection?.allowedChatConfiguration, "allowedChatConfiguration");
+    return transaction(async (client) => {
+      await ensureUserWithClient(client, owner);
+      const result = await client.query(
+        `INSERT INTO telegram_business_connections
+          (connection_id, owner_user_id, user_chat_id, enabled, can_reply, rights,
+           allowed_chat_configuration, connected_at, last_verified_at)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, NOW())
+         ON CONFLICT (connection_id) DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id,
+           user_chat_id = EXCLUDED.user_chat_id, enabled = EXCLUDED.enabled, can_reply = EXCLUDED.can_reply,
+           rights = EXCLUDED.rights, allowed_chat_configuration = EXCLUDED.allowed_chat_configuration,
+           connected_at = EXCLUDED.connected_at, last_verified_at = NOW(), updated_at = NOW()
+         RETURNING *`,
+        [connectionId, owner, userChat, enabled, rights.can_reply === true, JSON.stringify(rights), JSON.stringify(allowed), connectedAt]
+      );
+      return businessConnectionRow(result.rows[0]);
+    });
+  }
+
+  async function getBusinessConnection(rawConnectionId) {
+    const connectionId = bounded(rawConnectionId, "connectionId", 256);
+    return transaction(async (client) => {
+      const result = await client.query("SELECT * FROM telegram_business_connections WHERE connection_id = $1", [connectionId]);
+      return businessConnectionRow(result.rows[0]);
+    });
+  }
+
+  async function listBusinessConnections({ ownerUserId = null, limit: rawLimit = 50 } = {}) {
+    const owner = ownerUserId === null ? null : userId(ownerUserId, "ownerUserId");
+    return transaction(async (client) => {
+      const result = await client.query(
+        `SELECT * FROM telegram_business_connections
+         WHERE ($1::bigint IS NULL OR owner_user_id = $1)
+         ORDER BY updated_at DESC LIMIT $2`,
+        [owner, limit(rawLimit)]
+      );
+      return result.rows.map(businessConnectionRow);
+    });
+  }
+
+  async function observeTelegramMessage({ updateType, transportMode, chatId: rawChatId, threadId = null, messageId, senderUserId = null, businessConnectionId = null, content = null, status = "active", retentionDays = 7 }) {
+    const groupId = chatId(rawChatId);
+    const thread = threadId === null || threadId === undefined ? null : chatId(threadId);
+    const message = chatId(messageId);
+    const sender = senderUserId === null || senderUserId === undefined ? null : userId(senderUserId, "senderUserId");
+    const type = bounded(updateType, "updateType", 64);
+    if (!["group_secretary", "telegram_secretary"].includes(transportMode)) throw new TypeError("transportMode is invalid");
+    if (!["active", "edited", "deleted"].includes(status)) throw new TypeError("status is invalid");
+    const days = Number(retentionDays);
+    if (!Number.isSafeInteger(days) || days < 1 || days > 90) throw new TypeError("retentionDays is invalid");
+    const connectionId = businessConnectionId ? bounded(businessConnectionId, "businessConnectionId", 256) : null;
+    const body = content === null || content === undefined ? null : String(content).slice(0, 20_000);
+    return transaction(async (client) => {
+      if (sender) await ensureUserWithClient(client, sender);
+      const result = await client.query(
+        `INSERT INTO telegram_observed_messages
+          (observation_id, update_type, transport_mode, chat_id, thread_id, message_id,
+           sender_user_id, business_connection_id, content, status, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + ($11::text || ' days')::interval)
+         ON CONFLICT (transport_mode, chat_id, (COALESCE(thread_id, 0)), message_id)
+         DO UPDATE SET update_type = EXCLUDED.update_type, sender_user_id = EXCLUDED.sender_user_id,
+           business_connection_id = EXCLUDED.business_connection_id, content = EXCLUDED.content,
+           status = EXCLUDED.status, expires_at = EXCLUDED.expires_at, updated_at = NOW()
+         RETURNING observation_id, status, observed_at, expires_at`,
+        [crypto.randomUUID(), type, transportMode, groupId, thread, message, sender, connectionId, body, status, String(days)]
+      );
+      return result.rows[0];
+    });
+  }
+
+  async function listObservedMessages({ chatId: rawChatId, threadId = null, transportMode = "group_secretary", limit: rawLimit = 100 } = {}) {
+    const groupId = chatId(rawChatId);
+    const thread = threadId === null || threadId === undefined ? null : chatId(threadId);
+    if (!["group_secretary", "telegram_secretary"].includes(transportMode)) throw new TypeError("transportMode is invalid");
+    return transaction(async (client) => {
+      const result = await client.query(
+        `SELECT observation_id, update_type, transport_mode, chat_id::text, thread_id::text,
+                message_id::text, sender_user_id::text, content, status, observed_at, expires_at
+         FROM telegram_observed_messages
+         WHERE chat_id = $1 AND COALESCE(thread_id, 0) = COALESCE($2::bigint, 0)
+           AND transport_mode = $3 AND status IN ('active', 'edited') AND expires_at > NOW()
+         ORDER BY observed_at DESC LIMIT $4`,
+        [groupId, thread, transportMode, limit(rawLimit, 100, 500)]
+      );
+      return result.rows.reverse();
+    });
+  }
+
+  async function markBusinessMessagesDeleted({ connectionId: rawConnectionId, chatId: rawChatId, messageIds }) {
+    const connectionId = bounded(rawConnectionId, "connectionId", 256);
+    const groupId = chatId(rawChatId);
+    if (!Array.isArray(messageIds) || !messageIds.length || messageIds.length > 100) throw new TypeError("messageIds is invalid");
+    const ids = messageIds.map((value) => chatId(value));
+    return transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE telegram_observed_messages SET status = 'deleted', content = NULL, updated_at = NOW()
+         WHERE business_connection_id = $1 AND chat_id = $2 AND message_id = ANY($3::bigint[])
+         RETURNING observation_id`,
+        [connectionId, groupId, ids]
+      );
+      return { deleted: result.rowCount };
+    });
+  }
+
+  async function saveCapabilityVerification({ capabilityKey, status, metadata = {} }) {
+    const key = bounded(capabilityKey, "capabilityKey", 64).toLowerCase();
+    const state = String(status || "");
+    if (!["active", "disabled", "setup_required", "permission_required", "connected", "not_connected", "configured_unverified", "unavailable"].includes(state)) throw new TypeError("capability status is invalid");
+    const safeMetadata = jsonObject(metadata, "metadata");
+    return transaction(async (client) => {
+      const result = await client.query(
+        `INSERT INTO telegram_capability_verifications (capability_key, status, metadata, verified_at)
+         VALUES ($1, $2, $3::jsonb, NOW())
+         ON CONFLICT (capability_key) DO UPDATE SET status = EXCLUDED.status,
+           metadata = EXCLUDED.metadata, verified_at = NOW()
+         RETURNING capability_key, status, metadata, verified_at`,
+        [key, state, JSON.stringify(safeMetadata)]
+      );
+      return result.rows[0];
+    });
+  }
+
+  async function listCapabilityVerifications() {
+    return transaction(async (client) => {
+      const result = await client.query("SELECT capability_key, status, metadata, verified_at FROM telegram_capability_verifications ORDER BY capability_key");
+      return result.rows.map((row) => ({
+        capabilityKey: row.capability_key,
+        status: row.status,
+        metadata: row.metadata || {},
+        verifiedAt: row.verified_at
+      }));
+    });
+  }
+
+  async function recordBotInteraction({ chatId: rawChatId, threadId = null, senderBotId, messageId, content, chainDepth = 0 }) {
+    const groupId = chatId(rawChatId);
+    const thread = threadId === null || threadId === undefined ? null : chatId(threadId);
+    const sender = userId(senderBotId, "senderBotId");
+    const message = chatId(messageId);
+    const depth = Number(chainDepth);
+    if (!Number.isSafeInteger(depth) || depth < 0 || depth > 3) return { accepted: false, reason: "chain_depth" };
+    const fingerprint = crypto.createHash("sha256").update(String(content || "")).digest("hex");
+    return transaction(async (client) => {
+      const result = await client.query(
+        `INSERT INTO telegram_bot_interactions
+          (correlation_id, chat_id, thread_id, sender_bot_id, message_id, message_fingerprint, chain_depth, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 minutes')
+         ON CONFLICT (chat_id, message_id, sender_bot_id) DO NOTHING
+         RETURNING correlation_id`,
+        [crypto.randomUUID(), groupId, thread, sender, message, fingerprint, depth]
+      );
+      return { accepted: result.rowCount > 0, correlationId: result.rows[0]?.correlation_id || null, reason: result.rowCount ? null : "duplicate" };
+    });
+  }
+
   return {
     syncUserProfile,
     listManagedUsers,
@@ -998,6 +1272,7 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     manageUser,
     upsertTelegramGroup,
     syncGroupMember,
+    getGroupMember,
     listTelegramGroups,
     getTelegramGroup,
     updateGroupSettings,
@@ -1025,6 +1300,15 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     listManagedBotProfiles,
     getManagedBotProfile,
     updateManagedBotHealth,
-    deleteManagedBotProfile
+    deleteManagedBotProfile,
+    upsertBusinessConnection,
+    getBusinessConnection,
+    listBusinessConnections,
+    observeTelegramMessage,
+    listObservedMessages,
+    markBusinessMessagesDeleted,
+    saveCapabilityVerification,
+    listCapabilityVerifications,
+    recordBotInteraction
   };
 }

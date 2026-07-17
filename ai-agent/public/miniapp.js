@@ -12,9 +12,7 @@ const state = {
   activeConversationId: sessionStorage.getItem("nvidbotActiveConversation") || ""
 };
 
-const unavailableRoutes = {
-  "/threads": ["Threads", "Thread context is isolated by group, forum topic, and user. Add the bot to a forum group to activate topic controls.", "Forum topics and group access"],
-};
+const unavailableRoutes = {};
 
 function node(tag, attributes = {}, children = []) {
   const element = document.createElement(tag);
@@ -129,6 +127,49 @@ function modeCard([key, mode]) {
     node("h3", { text: mode.label }),
     node("p", { text: `${mode.description} ${mode.billable ? `${cost} credit${cost === 1 ? "" : "s"} per successful prompt.` : "No AI credit charge."}` }),
     node("div", { className: "card-footer" }, [badge(mode.enabled ? "ONLINE" : "DISABLED", mode.enabled ? "" : "off"), node("code", { text: key })])
+  ]);
+}
+
+function displayStatus(value) {
+  return String(value || "unknown").replaceAll("_", " ").toUpperCase();
+}
+
+function verifiedTime(value) {
+  if (!value) return "Not verified yet";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Not verified yet" : date.toLocaleString();
+}
+
+function capabilityDestination(id) {
+  if (["group_access", "group_privacy", "guard", "threads", "bot_to_bot"].includes(id)) return "/groups";
+  if (id === "telegram_secretary") return "/secretary";
+  if (id === "bot_management") return "/bots";
+  if (id === "payments") return "/payments";
+  return "/help";
+}
+
+function telegramCapabilityCard(capability) {
+  const attention = ["setup_required", "permission_required", "unavailable"].includes(capability.telegramStatus);
+  const configured = ["active", "connected"].includes(capability.telegramStatus);
+  const permissions = capability.requiredPermissions?.length
+    ? capability.requiredPermissions.join(" · ")
+    : "No additional permission";
+  return node("article", { className: `capability-card ${attention ? "attention" : configured ? "active" : ""}`.trim() }, [
+    node("div", { className: "capability-head" }, [
+      node("div", {}, [node("h3", { text: capability.name }), node("p", { text: capability.description })]),
+      badge(displayStatus(capability.telegramStatus), attention ? "danger" : configured ? "" : "neutral")
+    ]),
+    node("dl", { className: "capability-meta" }, [
+      node("div", {}, [node("dt", { text: "Telegram setup" }), node("dd", { text: displayStatus(capability.telegramStatus) })]),
+      node("div", {}, [node("dt", { text: "Nvid AI feature" }), node("dd", { text: capability.nvidEnabled ? "ENABLED" : "DISABLED" })]),
+      node("div", {}, [node("dt", { text: "Required" }), node("dd", { text: permissions })]),
+      node("div", {}, [node("dt", { text: "Last verified" }), node("dd", { text: verifiedTime(capability.lastVerifiedAt) })])
+    ]),
+    capability.setupInstructions ? node("p", { className: "setup-copy", text: capability.setupInstructions }) : null,
+    node("div", { className: "button-row" }, [
+      routeLink("Configure", capabilityDestination(capability.id), "button primary"),
+      routeLink("Read more", "/help", "button")
+    ])
   ]);
 }
 
@@ -479,13 +520,29 @@ async function renderGroups({ admin = false, purpose = "manage" } = {}) {
   const data = await api(admin ? "/api/admin/groups?limit=100" : "/api/groups?limit=100");
   const groups = data.groups || [];
   const items = groups.map((group) => {
-    const status = group.botStatus === "administrator" || group.botStatus === "creator" ? "ADMIN" : "LIMITED";
-    return node("article", { className: "list-item" }, [
-      node("div", {}, [
-        node("h3", { text: group.title }),
-        node("p", { text: `${group.chatType} · ${group.chatId}${group.username ? ` · @${group.username}` : ""}` })
+    const settings = group.settings || {};
+    const installed = group.active === true;
+    const permissionState = group.botIsAdministrator ? "HEALTHY" : installed ? "LIMITED" : "REMOVED";
+    return node("article", { className: "group-card" }, [
+      node("div", { className: "group-card-head" }, [
+        node("div", {}, [
+          node("h3", { text: group.title }),
+          node("p", { text: `${group.chatType} · ${group.chatId}${group.username ? ` · @${group.username}` : ""}` })
+        ]),
+        badge(installed ? "ACTIVE" : "REMOVED", installed ? "" : "danger")
       ]),
-      node("div", { className: "button-row" }, [badge(status, status === "ADMIN" ? "" : "neutral"), routeLink(purpose === "guard" ? "Guard" : "Manage", `/group/${group.chatId}`, "button")])
+      node("div", { className: "group-facts" }, [
+        node("span", { text: `Permissions: ${permissionState}` }),
+        node("span", { text: `Activation: ${displayStatus(settings.activationPolicy || "mention_only")}` }),
+        node("span", { text: `Assistant: ${displayStatus(settings.defaultMode || "chat")}` }),
+        node("span", { text: `Secretary: ${settings.secretaryEnabled ? "ON" : "OFF"}` }),
+        node("span", { text: `Guard: ${settings.guardEnabled ? "ON" : "OFF"}` }),
+        node("span", { text: `Moderation: ${settings.moderationEnabled ? "ON" : "OFF"}` })
+      ]),
+      node("div", { className: "card-footer" }, [
+        node("small", { text: `Last activity ${verifiedTime(group.lastSeenAt || group.lastEventAt)}` }),
+        routeLink(purpose === "guard" ? "Open Guard" : "Manage group", `/group/${group.chatId}`, "button")
+      ])
     ]);
   });
   app.replaceChildren(
@@ -509,17 +566,37 @@ async function renderGroup(chatId) {
   const data = await api(`/api/groups/${chatId}`);
   const group = data.group;
   const settings = data.settings;
+  const activationPolicy = node("select");
+  for (const [value, label] of [
+    ["mention_only", "Mention or /nvid (recommended)"],
+    ["command_only", "/nvid command only"],
+    ["mention_command_or_reply", "Mention, /nvid, or reply"],
+    ["administrators_only", "Administrators only"],
+    ["always_on", "Always on (creator confirmation required)"]
+  ]) activationPolicy.append(node("option", { value, text: label }));
+  activationPolicy.value = settings.activationPolicy || "mention_only";
+  const assistantMode = node("select");
+  for (const mode of state.dashboard.assistantModes || []) {
+    if (mode.enabled) assistantMode.append(node("option", { value: mode.id, text: mode.label }));
+  }
+  assistantMode.value = settings.defaultMode || "chat";
   const moderation = booleanSetting("Moderation", settings.moderationEnabled);
   const guard = booleanSetting("Guard queue", settings.guardEnabled);
-  const secretary = booleanSetting("Secretary", settings.secretaryEnabled);
+  const secretary = booleanSetting("Group Secretary", settings.secretaryEnabled);
+  const secretaryObservation = booleanSetting("Observe authorized group messages", settings.secretaryObservationEnabled);
+  const messageStorage = booleanSetting("Store authorized messages for summaries", settings.messageStorageEnabled);
+  const threadIsolation = booleanSetting("Isolate every topic and thread", settings.threadIsolationEnabled !== false);
   const welcome = booleanSetting("Welcome messages", settings.welcomeEnabled);
   const goodbye = booleanSetting("Goodbye messages", settings.goodbyeEnabled);
+  const retentionDays = node("input", { type: "number", min: "1", max: "90", value: String(settings.retentionDays || 7) });
   const rules = node("textarea", { maxlength: "10000", placeholder: "Group rules" });
   rules.value = settings.rules || "";
   const welcomeMessage = node("textarea", { maxlength: "2000", placeholder: "Welcome {name} to the group." });
   welcomeMessage.value = settings.welcomeMessage || "";
   const save = node("button", { className: "button primary", type: "button", text: "Save group controls" });
   save.addEventListener("click", async () => {
+    const enablingAlwaysOn = activationPolicy.value === "always_on" && settings.activationPolicy !== "always_on";
+    if (enablingAlwaysOn && !window.confirm("Always On allows Nvid AI to respond without an explicit mention. Telegram requires the current group creator to confirm this policy. Continue?")) return;
     save.disabled = true;
     try {
       await api(`/api/groups/${chatId}/settings`, {
@@ -530,6 +607,13 @@ async function renderGroup(chatId) {
             moderationEnabled: moderation.input.checked,
             guardEnabled: guard.input.checked,
             secretaryEnabled: secretary.input.checked,
+            secretaryObservationEnabled: secretaryObservation.input.checked,
+            messageStorageEnabled: messageStorage.input.checked,
+            retentionDays: Number(retentionDays.value),
+            threadIsolationEnabled: threadIsolation.input.checked,
+            activationPolicy: activationPolicy.value,
+            alwaysOnConfirmed: activationPolicy.value === "always_on",
+            defaultMode: assistantMode.value,
             welcomeEnabled: welcome.input.checked,
             goodbyeEnabled: goodbye.input.checked,
             welcomeMessage: welcomeMessage.value.trim() || null,
@@ -593,15 +677,58 @@ async function renderGroup(chatId) {
 
   app.replaceChildren(
     pageHead(group.title, "Live Telegram permissions are verified again for every moderation or Guard action."),
-    node("section", { className: "stats" }, [stat("Bot status", group.botStatus), stat("Members", group.memberCount ?? "—"), stat("Guard queue", String(data.guardRequests?.filter((item) => ["queued", "verification_pending"].includes(item.status)).length || 0))]),
-    node("section", { className: "card" }, [node("h3", { text: "Group configuration" }), moderation.element, guard.element, secretary.element, welcome.element, goodbye.element, node("div", { className: "field" }, [node("label", { text: "Welcome message" }), welcomeMessage]), node("div", { className: "field" }, [node("label", { text: "Rules" }), rules]), save]),
+    node("section", { className: "stats" }, [stat("Bot status", data.livePermissions?.bot?.status || group.botStatus), stat("Activation", displayStatus(settings.activationPolicy)), stat("Guard queue", String(data.guardRequests?.filter((item) => ["queued", "verification_pending"].includes(item.status)).length || 0))]),
+    node("section", { className: "card" }, [
+      node("h3", { text: "Overview and activation" }),
+      node("p", { text: "Normal group conversation is ignored unless this activation policy explicitly invokes Nvid AI." }),
+      node("div", { className: "field" }, [node("label", { text: "Activation policy" }), activationPolicy]),
+      node("div", { className: "field" }, [node("label", { text: "Group assistant" }), assistantMode]),
+      moderation.element, guard.element, secretary.element, secretaryObservation.element, messageStorage.element,
+      node("div", { className: "field" }, [node("label", { text: "Secretary retention (days)" }), retentionDays]),
+      threadIsolation.element, welcome.element, goodbye.element,
+      node("div", { className: "field" }, [node("label", { text: "Welcome message" }), welcomeMessage]),
+      node("div", { className: "field" }, [node("label", { text: "Rules" }), rules]), save
+    ]),
+    node("section", { className: "section" }, [sectionTitle("Verified permissions"), node("div", { className: "card" }, [
+      node("p", { text: `Your live Telegram role: ${data.livePermissions?.actor?.status || "unknown"}` }),
+      node("p", { text: `Nvid AI live role: ${data.livePermissions?.bot?.status || "unknown"}` }),
+      node("p", { text: `Snapshot verified: ${verifiedTime(data.botPermissionSnapshot?.verifiedAt)}` })
+    ])]),
     node("section", { className: "section" }, [sectionTitle("Moderation console"), node("div", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "Action" }), action]), node("div", { className: "field" }, [node("label", { text: "Target" }), target]), node("div", { className: "field" }, [node("label", { text: "Duration" }), duration]), node("div", { className: "field" }, [node("label", { text: "Reason" }), reason]), execute])]),
-    node("section", { className: "section" }, [sectionTitle("Guard queue"), guardPanel])
+    node("section", { className: "section" }, [sectionTitle("Guard queue"), guardPanel]),
+    node("section", { className: "section" }, [sectionTitle("Recent logs"), data.actions?.length ? node("div", { className: "list" }, data.actions.slice(0, 12).map((entry) => historyItem(entry.action, `${entry.result} · ${entry.reason || "No reason supplied"}`, new Date(entry.created_at).toLocaleString(), entry.result === "failed"))) : node("p", { className: "notice", text: "No group actions logged yet." })])
+  );
+}
+
+async function renderThreads() {
+  const data = await api("/api/groups?limit=100");
+  const groups = (data.groups || []).filter((group) => group.active);
+  const rows = groups.map((group) => historyItem(
+    group.title,
+    `${group.chatType} · assistant ${group.settings?.defaultMode || "chat"} · every message_thread_id has isolated context`,
+    group.settings?.threadIsolationEnabled === false ? "DISABLED" : "ISOLATED",
+    group.settings?.threadIsolationEnabled === false
+  ));
+  app.replaceChildren(
+    pageHead("Threads & Topics", "Nvid AI separates AI history and Secretary observations by group, Telegram topic, and user."),
+    node("section", { className: "hero-card compact-hero" }, [
+      node("p", { className: "eyebrow", text: "NO CROSS-TOPIC LEAKAGE" }),
+      node("h2", { text: "Each topic is its own workspace." }),
+      node("p", { text: "Use /nvid_reset inside a topic to reset only that topic and user context. Replies remain in the originating topic." })
+    ]),
+    rows.length ? node("section", { className: "section list" }, rows) : node("section", { className: "empty-state compact" }, [
+      node("h2", { text: "No active groups yet" }),
+      node("p", { text: "Add Nvid AI to a Telegram forum group and send /nvid_status to register and verify topic support." })
+    ])
   );
 }
 
 async function renderSecretary() {
-  const [data, jobData] = await Promise.all([api("/api/secretary/reminders?limit=100"), api("/api/secretary/jobs")]);
+  const [data, jobData, connectionData] = await Promise.all([
+    api("/api/secretary/reminders?limit=100"),
+    api("/api/secretary/jobs"),
+    api("/api/secretary/connections?limit=50")
+  ]);
   const title = node("input", { maxlength: "200", placeholder: "Reminder title" });
   const message = node("textarea", { maxlength: "2000", placeholder: "What should Nvid AI remind you about?" });
   const due = node("input", { type: "datetime-local" });
@@ -637,7 +764,27 @@ async function renderSecretary() {
     node("div", {}, [node("h3", { text: "Daily task digest" }), node("p", { text: `${job.schedule} ${job.timezone} · next ${new Date(job.next_run_at).toLocaleString()}` })]),
     node("button", { className: "button danger", type: "button", text: "Pause", onclick: async () => { await api(`/api/secretary/jobs/${job.job_id}`, { method: "DELETE" }); await renderSecretary(); } })
   ]));
-  app.replaceChildren(pageHead("Secretary", "Private and authorized-group reminders are delivered by a durable Telegram worker."), node("section", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "Title" }), title]), node("div", { className: "field" }, [node("label", { text: "Message" }), message]), node("div", { className: "field" }, [node("label", { text: "Due time" }), due]), create]), node("section", { className: "section" }, [sectionTitle("Daily automation"), node("div", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "UTC delivery time" }), digestTime]), scheduleDigest]), jobs.length ? node("div", { className: "list" }, jobs) : null]), node("section", { className: "section" }, [sectionTitle("Scheduled reminders"), reminders.length ? node("div", { className: "list" }, reminders) : node("p", { className: "notice", text: "No reminders scheduled." })]));
+  const connections = connectionData.connections || [];
+  const connectionCards = connections.map((connection) => node("article", { className: "list-item" }, [
+    node("div", {}, [
+      node("h3", { text: "Telegram Business connection" }),
+      node("p", { text: `${connection.enabled ? "Connected" : "Disconnected"} · Reply permission ${connection.canReply ? "granted" : "missing"} · verified ${verifiedTime(connection.lastVerifiedAt)}` })
+    ]),
+    badge(connection.enabled && connection.canReply ? "ACTIVE" : "ACTION", connection.enabled && connection.canReply ? "" : "danger")
+  ]));
+  app.replaceChildren(
+    pageHead("Secretary", "Telegram Business Secretary and Group Secretary are distinct, permission-bound operating contexts."),
+    node("section", { className: "section" }, [sectionTitle("Telegram Secretary connections"), connections.length
+      ? node("div", { className: "list" }, connectionCards)
+      : node("div", { className: "notice", text: "No Telegram Business account is connected. Selecting a Secretary assistant does not activate Telegram Secretary Mode." })]),
+    node("section", { className: "section" }, [sectionTitle("Group Secretary"), node("div", { className: "card" }, [
+      node("p", { text: "Group Secretary observation, storage, retention, and public-response policy are configured separately for each group." }),
+      routeLink("Configure managed groups", "/groups", "button")
+    ])]),
+    node("section", { className: "card" }, [node("h3", { text: "Personal reminder" }), node("div", { className: "field" }, [node("label", { text: "Title" }), title]), node("div", { className: "field" }, [node("label", { text: "Message" }), message]), node("div", { className: "field" }, [node("label", { text: "Due time" }), due]), create]),
+    node("section", { className: "section" }, [sectionTitle("Daily automation"), node("div", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "UTC delivery time" }), digestTime]), scheduleDigest]), jobs.length ? node("div", { className: "list" }, jobs) : null]),
+    node("section", { className: "section" }, [sectionTitle("Scheduled reminders"), reminders.length ? node("div", { className: "list" }, reminders) : node("p", { className: "notice", text: "No reminders scheduled." })])
+  );
 }
 
 async function renderBots() {
@@ -809,7 +956,11 @@ async function renderAdmin(path) {
 
 async function renderSettings() {
   const modes = Object.entries(state.dashboard.modes || {});
-  const current = (await api("/api/user/settings")).settings;
+  const [settingsData, telegramData] = await Promise.all([
+    api("/api/user/settings"),
+    api("/api/telegram/capabilities")
+  ]);
+  const current = settingsData.settings;
   const language = node("input", { value: current.preferredLanguage || "auto", maxlength: "32" });
   const responseLength = node("select");
   for (const value of ["concise", "balanced", "detailed"]) responseLength.append(node("option", { value, text: value }));
@@ -841,8 +992,24 @@ async function renderSettings() {
       save.disabled = false;
     }
   });
+  const verify = node("button", { className: "button", type: "button", text: "Verify Telegram again" });
+  verify.addEventListener("click", async () => {
+    verify.disabled = true;
+    try {
+      const refreshed = await api("/api/telegram/capabilities?refresh=true");
+      showToast(`Telegram capabilities verified at ${verifiedTime(refreshed.verifiedAt)}`);
+      await renderSettings();
+    } catch (error) { showToast(error.message); } finally { verify.disabled = false; }
+  });
   app.replaceChildren(
-    pageHead("Settings", "Telegram-aware personalization, modes, and account access."),
+    pageHead("Mode & Account Settings", "Real Telegram capability state, Nvid AI enablement, permissions, and assistant preferences."),
+    node("section", { className: "hero-card compact-hero" }, [
+      node("p", { className: "eyebrow", text: "BOTFATHER + RUNTIME STATUS" }),
+      node("h2", { text: telegramData.bot?.username ? `@${telegramData.bot.username}` : "Telegram setup needs attention" }),
+      node("p", { text: "BotFather-controlled features are verified here, not represented as pretend switches." }),
+      node("div", { className: "button-row" }, [verify, badge(telegramData.bot?.webhookReady ? "WEBHOOK READY" : "WEBHOOK SETUP", telegramData.bot?.webhookReady ? "" : "danger")])
+    ]),
+    node("section", { className: "section" }, [sectionTitle("Telegram operating modes"), node("div", { className: "capability-grid" }, (telegramData.capabilities || []).map(telegramCapabilityCard))]),
     node("section", { className: "card" }, [
       node("h3", { text: "Personal AI settings" }),
       node("div", { className: "field" }, [node("label", { text: "Preferred language" }), language]),
@@ -852,7 +1019,7 @@ async function renderSettings() {
       node("div", { className: "field" }, [node("label", { text: "Custom instructions" }), instructions]),
       node("div", { className: "button-row" }, [save, node("button", { className: "button", type: "button", text: "Legacy /persona", onclick: openBot })])
     ]),
-    node("section", { className: "section" }, [sectionTitle("Mode availability"), node("div", { className: "grid" }, modes.map(modeCard))]),
+    node("section", { className: "section" }, [sectionTitle("AI assistant availability"), node("div", { className: "grid" }, modes.map(modeCard))]),
     ...(state.dashboard.platformAdmin ? [node("section", { className: "section" }, [sectionTitle("Administrator"), node("div", { className: "button-row" }, [routeLink("Admin console", "/admin", "button primary"), routeLink("AI pricing", "/admin/pricing", "button")])])] : [])
   );
 }
@@ -886,6 +1053,7 @@ async function render(path = currentPath()) {
     else if (path === "/guard") await renderGroups({ purpose: "guard" });
     else if (/^\/group\/-?\d+$/.test(path)) await renderGroup(path.split("/").at(-1));
     else if (path === "/secretary") await renderSecretary();
+    else if (path === "/threads") await renderThreads();
     else if (path === "/bots") await renderBots();
     else if (path === "/usage" || path === "/payments") await renderBilling(path === "/payments" ? "payments" : "usage");
     else if (path === "/settings") await renderSettings();

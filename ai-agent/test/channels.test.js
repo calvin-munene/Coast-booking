@@ -95,6 +95,30 @@ function starLedgerDouble(overrides = {}) {
   };
 }
 
+function groupStoreDouble(overrides = {}) {
+  return {
+    async upsertTelegramGroup({ chat }) {
+      return { id: String(chat.id), chatType: chat.type, active: true, botIsAdministrator: true };
+    },
+    async getTelegramGroup(chatId) {
+      return {
+        group: { id: String(chatId), chatType: "supergroup", active: true, botIsAdministrator: true },
+        settings: {
+          enabled: true,
+          activationPolicy: "mention_only",
+          defaultMode: "chat",
+          secretaryEnabled: false,
+          botToBotEnabled: false,
+          threadIsolationEnabled: true
+        },
+        permissions: null
+      };
+    },
+    async syncUserProfile() {},
+    ...overrides
+  };
+}
+
 function enableStarTestEnvironment() {
   process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
   process.env.TELEGRAM_STARS_REQUIRED = "true";
@@ -185,6 +209,8 @@ test("configures Telegram commands and a protected Render webhook", async () => 
     "setMyDescription",
     "setChatMenuButton",
     "setMyCommands",
+    "setMyCommands",
+    "setMyCommands",
     "setWebhook",
     "getWebhookInfo"
   ]);
@@ -197,10 +223,22 @@ test("configures Telegram commands and a protected Render webhook", async () => 
   assert.deepEqual(calls[4].payload.commands.map(({ command }) => command), [
     "start", "help", "dashboard", "modes", "mode", "use", "persona", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "ban", "unban", "kick", "mute", "unmute", "warn", "unwarn", "warnings", "purge", "pin", "unpin", "lock", "unlock", "rules", "setrules", "slowmode", "approve", "reject", "modlog", "admins", "report", "starbalance", "whoami"
   ]);
-  assert.deepEqual(calls[5].payload, {
+  assert.equal(calls[4].payload.scope.type, "all_private_chats");
+  assert.deepEqual(calls[5].payload.commands.map(({ command }) => command), [
+    "nvid", "nvid_help", "nvid_status", "nvid_mode", "nvid_summary", "nvid_reset", "nvid_report"
+  ]);
+  assert.equal(calls[5].payload.scope.type, "all_group_chats");
+  assert.equal(calls[6].payload.scope.type, "all_chat_administrators");
+  assert.ok(calls[6].payload.commands.some(({ command }) => command === "nvid_secretary"));
+  assert.deepEqual(calls[7].payload, {
     url: "https://nvidbot.onrender.com/webhooks/telegram",
     secret_token: "valid_secret-123",
-    allowed_updates: ["message", "pre_checkout_query", "callback_query", "inline_query", "chat_join_request", "my_chat_member", "chat_member"],
+    allowed_updates: [
+      "message", "edited_message", "channel_post", "edited_channel_post", "business_connection",
+      "business_message", "edited_business_message", "deleted_business_messages", "guest_message",
+      "pre_checkout_query", "callback_query", "inline_query", "chat_join_request", "my_chat_member",
+      "chat_member", "managed_bot", "subscription"
+    ],
     max_connections: 10
   });
   assert.equal(status.configured, true);
@@ -371,6 +409,7 @@ test("uses typing and a final reply without drafts in a group", async () => {
   process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
   process.env.NVIDIA_API_KEY = "nvapi-test";
   delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+  setPlatformStoreForTests(groupStoreDouble());
   const telegramMethods = [];
   global.fetch = async (url) => {
     if (new URL(url).hostname === "api.telegram.org") {
@@ -383,7 +422,7 @@ test("uses typing and a final reply without drafts in a group", async () => {
     });
   };
 
-  await handleTelegram(telegramUpdate({ text: "Question", chatId: -900, type: "supergroup", messageId: 22, updateId: 32 }));
+  await handleTelegram(telegramUpdate({ text: "/nvid Question", chatId: -900, type: "supergroup", messageId: 22, updateId: 32 }));
 
   assert.deepEqual(telegramMethods, ["sendChatAction", "sendMessage"]);
 });
@@ -392,6 +431,7 @@ test("isolates Telegram AI history by group user and forum thread", async () => 
   process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
   process.env.NVIDIA_API_KEY = "nvapi-test";
   delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+  setPlatformStoreForTests(groupStoreDouble());
   const nvidiaRequests = [];
   global.fetch = async (url, options) => {
     if (new URL(url).hostname === "api.telegram.org") return telegramSuccess();
@@ -404,7 +444,7 @@ test("isolates Telegram AI history by group user and forum thread", async () => 
   };
 
   await handleTelegram(telegramUpdate({
-    text: "user-one-secret-alpha",
+    text: "/nvid user-one-secret-alpha",
     userId: 101,
     chatId: -9101,
     type: "supergroup",
@@ -413,7 +453,7 @@ test("isolates Telegram AI history by group user and forum thread", async () => 
     updateId: 1
   }));
   await handleTelegram(telegramUpdate({
-    text: "user-two-question",
+    text: "/nvid user-two-question",
     userId: 202,
     chatId: -9101,
     type: "supergroup",
@@ -422,7 +462,7 @@ test("isolates Telegram AI history by group user and forum thread", async () => 
     updateId: 2
   }));
   await handleTelegram(telegramUpdate({
-    text: "user-one-other-thread",
+    text: "/nvid user-one-other-thread",
     userId: 101,
     chatId: -9101,
     type: "supergroup",
@@ -436,6 +476,224 @@ test("isolates Telegram AI history by group user and forum thread", async () => 
   assert.doesNotMatch(nvidiaRequests[2], /user-one-secret-alpha/);
   assert.match(nvidiaRequests[1], /user-two-question/);
   assert.match(nvidiaRequests[2], /user-one-other-thread/);
+});
+
+test("ordinary group messages are observed safely but never billed or answered", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  let reservations = 0;
+  let externalCalls = 0;
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async reservePrompt() { reservations += 1; return { reserved: true }; }
+  }));
+  setPlatformStoreForTests(groupStoreDouble());
+  global.fetch = async () => { externalCalls += 1; return telegramSuccess(); };
+
+  await handleTelegram(telegramUpdate({ text: "ordinary group conversation", chatId: -9102, type: "supergroup" }));
+
+  assert.equal(reservations, 0);
+  assert.equal(externalCalls, 0);
+});
+
+test("my_chat_member updates persist add, promotion, demotion, and removal states", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  const states = [];
+  setPlatformStoreForTests(groupStoreDouble({
+    async upsertTelegramGroup({ chat, botMember }) { states.push({ chatId: String(chat.id), status: botMember?.status }); }
+  }));
+  for (const [index, status] of ["member", "administrator", "restricted", "left"].entries()) {
+    await handleTelegram({
+      update_id: 100 + index,
+      my_chat_member: {
+        chat: { id: -9200, type: "supergroup", title: "Lifecycle" },
+        from: { id: 7 },
+        old_chat_member: { status: index ? states.at(-1)?.status || "member" : "left", user: { id: 999, is_bot: true } },
+        new_chat_member: { status, user: { id: 999, is_bot: true }, can_manage_chat: status === "administrator" }
+      }
+    });
+  }
+  assert.deepEqual(states.map(({ status }) => status), ["member", "administrator", "restricted", "left"]);
+});
+
+test("Group Secretary stores authorized messages by thread without public replies", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  const observations = [];
+  let apiCalls = 0;
+  setPlatformStoreForTests(groupStoreDouble({
+    async getTelegramGroup(chatId) {
+      return {
+        group: { id: String(chatId), active: true, botIsAdministrator: true },
+        settings: {
+          enabled: true,
+          activationPolicy: "mention_only",
+          defaultMode: "secretary",
+          secretaryEnabled: true,
+          secretaryObservationEnabled: true,
+          messageStorageEnabled: true,
+          retentionDays: 14,
+          threadIsolationEnabled: true
+        }
+      };
+    },
+    async observeTelegramMessage(value) { observations.push(value); }
+  }));
+  global.fetch = async () => { apiCalls += 1; return telegramSuccess(); };
+
+  await handleTelegram(telegramUpdate({ text: "decision in topic eleven", chatId: -9300, type: "supergroup", threadId: 11, messageId: 1 }));
+  await handleTelegram(telegramUpdate({ text: "decision in topic twenty two", chatId: -9300, type: "supergroup", threadId: 22, messageId: 2 }));
+
+  assert.deepEqual(observations.map(({ transportMode, threadId }) => [transportMode, threadId]), [["group_secretary", 11], ["group_secretary", 22]]);
+  assert.equal(apiCalls, 0);
+});
+
+test("group configuration commands use live Telegram authority instead of stale local roles", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  const changes = [];
+  let liveActorStatus = "creator";
+  let botCanManage = true;
+  setPlatformStoreForTests(groupStoreDouble({
+    async getGroupMember() { return { status: "administrator" }; },
+    async updateGroupSettings(change) { changes.push(change); return { settings: change.changes }; }
+  }));
+  const sent = [];
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    if (method === "getMe") return telegramSuccess({ id: 999, is_bot: true, username: "NvidBotAI" });
+    if (method === "getChatMember") {
+      return telegramSuccess(String(payload.user_id) === "123"
+        ? { status: liveActorStatus, can_manage_chat: liveActorStatus !== "member", user: { id: 123 } }
+        : { status: "administrator", can_manage_chat: botCanManage, user: { id: 999, is_bot: true } });
+    }
+    if (method === "sendMessage") sent.push(payload.text);
+    return telegramSuccess();
+  };
+
+  await handleTelegram(telegramUpdate({ text: "/nvid_secretary on", chatId: -9400, type: "supergroup" }));
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].changes.messageStorageEnabled, true);
+  assert.match(sent.at(-1), /Group Secretary is now active/);
+
+  liveActorStatus = "member";
+  await handleTelegram(telegramUpdate({ text: "/nvid_guard on", chatId: -9400, type: "supergroup", messageId: 8 }));
+  assert.equal(changes.length, 1);
+  assert.match(sent.at(-1), /current Telegram group administrator rights/);
+
+  liveActorStatus = "administrator";
+  botCanManage = false;
+  await handleTelegram(telegramUpdate({ text: "/nvid_guard on", chatId: -9400, type: "supergroup", messageId: 9 }));
+  assert.equal(changes.length, 1);
+  assert.match(sent.at(-1), /must be a group administrator/);
+});
+
+test("Telegram Business messages use telegram_secretary delivery context", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  setPlatformStoreForTests(groupStoreDouble({
+    async getBusinessConnection() {
+      return { ownerUserId: "123", enabled: true, canReply: true, allowedChatConfiguration: {} };
+    }
+  }));
+  const telegramCalls = [];
+  let nvidiaCalls = 0;
+  global.fetch = async (url, options) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === "api.telegram.org") {
+      telegramCalls.push({ method: parsed.pathname.split("/").at(-1), payload: JSON.parse(options.body) });
+      return telegramSuccess();
+    }
+    nvidiaCalls += 1;
+    return new Response('data: {"choices":[{"delta":{"content":"Business reply"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+
+  await handleTelegram({
+    update_id: 501,
+    business_message: {
+      message_id: 17,
+      business_connection_id: "business-connection-1",
+      from: { id: 456, first_name: "Customer" },
+      chat: { id: 456, type: "private" },
+      text: "Can you help?"
+    }
+  });
+
+  assert.equal(nvidiaCalls, 1);
+  assert.equal(telegramCalls.find(({ method }) => method === "sendMessage").payload.business_connection_id, "business-connection-1");
+});
+
+test("guest responses use answerGuestQuery and never send typing actions", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  const telegramCalls = [];
+  global.fetch = async (url, options) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === "api.telegram.org") {
+      telegramCalls.push({ method: parsed.pathname.split("/").at(-1), payload: JSON.parse(options.body) });
+      return telegramSuccess();
+    }
+    return new Response('data: {"choices":[{"delta":{"content":"Guest reply"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+
+  await handleTelegram({ update_id: 601, guest_message: { message_id: 1, guest_query_id: "guest-1", from: { id: 321 }, chat: { id: 321, type: "private" }, text: "Guest question" } });
+
+  assert.deepEqual(telegramCalls.map(({ method }) => method), ["answerGuestQuery"]);
+  assert.equal(telegramCalls[0].payload.guest_query_id, "guest-1");
+});
+
+test("inline AI returns an NVIDIA answer and completes one idempotent credit", async () => {
+  enableStarTestEnvironment();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  const transitions = [];
+  const completed = [];
+  setTelegramStarLedgerForTests(starLedgerDouble({
+    async getModeSettings(defaultModes) { return { ...defaultModes, inline: true }; },
+    async getUserControl(userId) { return { userId: String(userId), banned: false, unlimitedCredits: false, selectedMode: "research" }; },
+    async reservePrompt(userId, { reservationId, cost }) { return { reserved: true, userId, reservationId, cost, state: "reserved", balance: "4" }; },
+    async reserveProviderCapacity() { return { reserved: true }; },
+    async transitionPrompt(id, state) { transitions.push([id, state]); },
+    async completePrompt(id) { completed.push(id); }
+  }));
+  const telegramCalls = [];
+  global.fetch = async (url, options) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === "api.telegram.org") {
+      telegramCalls.push({ method: parsed.pathname.split("/").at(-1), payload: JSON.parse(options.body) });
+      return telegramSuccess();
+    }
+    return new Response('data: {"choices":[{"delta":{"content":"Inline NVIDIA answer"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+
+  await handleTelegram({ update_id: 650, inline_query: { id: "inline-query-1", from: { id: 123 }, query: "compare two architectures" } });
+
+  assert.deepEqual(telegramCalls.map(({ method }) => method), ["answerInlineQuery"]);
+  assert.match(telegramCalls[0].payload.results[0].input_message_content.message_text, /Inline NVIDIA answer/);
+  assert.deepEqual(completed, ["inline:123:inline-query-1"]);
+  assert.deepEqual(transitions.map(([, state]) => state), ["generation_started", "response_produced", "delivery_attempted", "delivered"]);
+});
+
+test("bot-to-bot duplicate updates are processed once with an allowlist", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  let accepted = true;
+  let nvidiaCalls = 0;
+  setPlatformStoreForTests(groupStoreDouble({
+    async getTelegramGroup(chatId) {
+      return {
+        group: { id: String(chatId), active: true, botIsAdministrator: true },
+        settings: { enabled: true, activationPolicy: "mention_only", defaultMode: "chat", botToBotEnabled: true, botToBotAllowlist: ["777"] }
+      };
+    },
+    async recordBotInteraction() { const result = accepted; accepted = false; return { accepted: result }; }
+  }));
+  global.fetch = async (url) => {
+    if (new URL(url).hostname === "api.telegram.org") return telegramSuccess();
+    nvidiaCalls += 1;
+    return new Response('data: {"choices":[{"delta":{"content":"Bot reply"}}]}\n\ndata: [DONE]\n\n', { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  const update = { update_id: 701, message: { message_id: 5, from: { id: 777, is_bot: true, username: "AllowedBot" }, chat: { id: -9500, type: "supergroup" }, text: "/nvid coordinated task" } };
+  await handleTelegram(update);
+  await handleTelegram(update);
+  assert.equal(nvidiaCalls, 1);
 });
 
 test("Guard callbacks verify mode, requester authority, and current bot permissions", async () => {

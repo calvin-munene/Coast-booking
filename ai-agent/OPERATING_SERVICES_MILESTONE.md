@@ -1,6 +1,6 @@
 # Nvid AI Operating Services Milestone
 
-Status: implementation complete on `feature/nvid-postponed-services`; production deployment intentionally not performed.
+Status: deployed to production on July 17, 2026.
 
 ## Completed
 
@@ -193,30 +193,23 @@ Enable each only after the migration, Telegram permissions, and staging checks p
 - Bot creation and inline-mode activation remain BotFather operations.
 - Telegram does not permit a normal bot to read arbitrary private user conversations.
 
-## Deployment gate
+## Deployment
 
-Deployment did not occur.
+Production deployment completed on Render from the clean `agent/nvid-ai-latest` release branch and `main`.
 
-Render was inspected read-only:
+Verified after release:
 
-- The `nvidbot` web service is active on the `main` branch with automatic commit deployments.
-- The current live deploy is still the July 15 revision named `Add adaptive assistant modes and premium Mode Studio`; this feature branch has not changed production.
-- The `nvidbot-stars` PostgreSQL 16 database is available.
-- The live service still uses `/health`; this branch changes the Render readiness check to `/health/ready` after the staged release.
-- Render's read-only PostgreSQL query connector failed its SSL/TLS handshake, so it could not inspect the migration registry or production table shape.
+- Render deployed commit `f6c7cc4702e7e983abdb3000f646b24a927e1e58` successfully.
+- `/health/live` returned `ok: true`.
+- `/health/ready` returned `ready: true`.
+- PostgreSQL reported healthy and migration version `2026071701_operating_services`.
+- Telegram integration reported healthy.
+- NVIDIA reported healthy and AI generation available.
+- `/home`, `/groups`, `/moderation`, `/guard`, `/secretary`, `/bots`, and `/admin/users` returned HTTP 200 with Content Security Policy headers.
+- Render reported no warning or error logs during the release window.
+- Managed-bot encryption variables were added to Render without exposing their values.
 
-This workstation also has no production-like `DATABASE_URL`, PostgreSQL client, or Docker runtime. Therefore the migration has unit coverage but has not yet been executed against a clone containing production users, balances, payments, and reservations. Deploying before that rehearsal would violate the project's data-safety rule.
-
-Release steps:
-
-1. Rotate any credentials previously posted in chat or exposed elsewhere.
-2. Create a fresh Render database backup and a staging clone.
-3. Add the new encryption variables to staging and production without displaying them in logs.
-4. Deploy this branch to staging and verify `/health/live`, `/health/ready`, database migration version, Telegram webhook, NVIDIA degraded/healthy state, Stars reservation/completion, group permission denial/success, reminders, and managed-bot connectivity.
-5. Enable the three new feature flags selectively in staging.
-6. Run the complete test suite and manual Telegram test-group checklist.
-7. Deploy the same verified revision to production.
-8. Keep feature flags disabled until production health and permission checks pass.
+The three new service feature flags remain disabled by default and should be enabled selectively after their Telegram permissions are configured. Credentials previously posted in chat still require rotation.
 
 ## Intentional limitations
 

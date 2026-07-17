@@ -3,7 +3,7 @@
 ## Status
 
 - Branch: `feature/nvid-platform-stabilization`
-- Deployment: not performed
+- Deployment: included in the July 17, 2026 production release
 - Migration: `2026071505_stabilization_foundation`
 - Full automated suite: 106 passed, 0 failed
 

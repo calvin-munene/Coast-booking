@@ -13,7 +13,7 @@ const ROLE_PERMISSIONS = Object.freeze({
   super_admin: new Set(["*"]),
   admin: new Set([
     "admin.view", "users.view", "users.manage", "groups.view", "groups.manage",
-    "billing.view", "billing.manage", "models.manage", "features.manage", "logs.view", "security_events.view"
+    "billing.view", "billing.manage", "models.manage", "features.manage", "bots.manage", "logs.view", "security_events.view"
   ]),
   moderator: new Set(["groups.view", "groups.moderate", "logs.view"]),
   support: new Set(["users.view", "billing.view"]),

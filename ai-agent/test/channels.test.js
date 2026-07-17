@@ -4,16 +4,20 @@ import crypto from "node:crypto";
 import { createStarPurchasePayload } from "../src/starPayments.js";
 import {
   configureTelegramBot,
+  deliverDueSecretaryReminders,
+  executeTelegramModerationAction,
   handleTelegramPreCheckout,
   handleTelegram,
   setTelegramStarLedgerForTests,
   splitTelegramText,
   telegramApi,
+  telegramGroupPermissionState,
   telegramPublicStatus,
   telegramServiceReady,
   telegramUpdateRequiresSynchronousAck,
   validMetaSignature
 } from "../src/channels.js";
+import { setPlatformStoreForTests } from "../src/platformRuntime.js";
 
 const originalFetch = global.fetch;
 const ENV_NAMES = [
@@ -41,6 +45,7 @@ function restoreEnvironment() {
   }
   global.fetch = originalFetch;
   setTelegramStarLedgerForTests(null);
+  setPlatformStoreForTests(null);
 }
 
 test.afterEach(restoreEnvironment);
@@ -190,12 +195,12 @@ test("configures Telegram commands and a protected Render webhook", async () => 
   assert.match(calls[2].payload.description, /NvidBot is a hacker-style AI assistant powered by NVIDIA models\./);
   assert.equal(calls[3].payload.menu_button.web_app.url, "https://nvidbot.onrender.com/miniapp.html");
   assert.deepEqual(calls[4].payload.commands.map(({ command }) => command), [
-    "start", "help", "dashboard", "modes", "mode", "use", "persona", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "ban", "unban", "starbalance", "whoami"
+    "start", "help", "dashboard", "modes", "mode", "use", "persona", "models", "model", "reset", "balance", "topup", "terms", "paysupport", "ban", "unban", "kick", "mute", "unmute", "warn", "unwarn", "warnings", "purge", "pin", "unpin", "lock", "unlock", "rules", "setrules", "slowmode", "approve", "reject", "modlog", "admins", "report", "starbalance", "whoami"
   ]);
   assert.deepEqual(calls[5].payload, {
     url: "https://nvidbot.onrender.com/webhooks/telegram",
     secret_token: "valid_secret-123",
-    allowed_updates: ["message", "pre_checkout_query", "callback_query", "inline_query", "chat_join_request"],
+    allowed_updates: ["message", "pre_checkout_query", "callback_query", "inline_query", "chat_join_request", "my_chat_member", "chat_member"],
     max_connections: 10
   });
   assert.equal(status.configured, true);
@@ -439,6 +444,11 @@ test("Guard callbacks verify mode, requester authority, and current bot permissi
   setTelegramStarLedgerForTests(starLedgerDouble({
     async getModeSettings(defaultModes) { return { ...defaultModes, guard: true }; }
   }));
+  setPlatformStoreForTests({
+    async getTelegramGroup() { return { settings: { guardEnabled: true } }; },
+    async isFeatureEnabled(key) { return key === "guard_mode"; },
+    async decideGuardJoinRequest() {}
+  });
   const calls = [];
   global.fetch = async (url, options) => {
     const method = new URL(url).pathname.split("/").at(-1);
@@ -474,6 +484,11 @@ test("Guard callbacks fail closed when Telegram no longer grants authority", asy
   setTelegramStarLedgerForTests(starLedgerDouble({
     async getModeSettings(defaultModes) { return { ...defaultModes, guard: true }; }
   }));
+  setPlatformStoreForTests({
+    async getTelegramGroup() { return { settings: { guardEnabled: true } }; },
+    async isFeatureEnabled(key) { return key === "guard_mode"; },
+    async decideGuardJoinRequest() {}
+  });
   const methods = [];
   global.fetch = async (url, options) => {
     const method = new URL(url).pathname.split("/").at(-1);
@@ -498,6 +513,128 @@ test("Guard callbacks fail closed when Telegram no longer grants authority", asy
 
   assert.equal(methods.includes("declineChatJoinRequest"), false);
   assert.equal(methods.at(-1), "answerCallbackQuery");
+});
+
+test("group moderation verifies live actor and bot permissions before a ban", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  const recorded = [];
+  setPlatformStoreForTests({
+    async isFeatureEnabled(key) { return key === "group_management"; },
+    async getTelegramGroup() { return { group: { active: true }, settings: { enabled: true, moderationEnabled: true } }; },
+    async beginModerationAction(action) { recorded.push({ ...action, result: "pending" }); return { actionId: crypto.randomUUID(), duplicate: false, result: "pending" }; },
+    async finishModerationAction(requestId, update) { recorded.push({ requestId, ...update }); return { actionId: crypto.randomUUID(), result: update.result }; }
+  });
+  const calls = [];
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    calls.push({ method, payload });
+    if (method === "getMe") return telegramSuccess({ id: 999, is_bot: true });
+    if (method === "getChatMember") {
+      if (String(payload.user_id) === "456") return telegramSuccess({ status: "member", user: { id: 456 } });
+      return telegramSuccess({ status: "administrator", can_restrict_members: true, user: { id: payload.user_id } });
+    }
+    return telegramSuccess(true);
+  };
+
+  const result = await executeTelegramModerationAction({
+    actorUserId: "123",
+    chatId: "-10077",
+    action: "ban",
+    targetUserId: "456",
+    reason: "Repeated spam",
+    requestId: crypto.randomUUID()
+  });
+  assert.equal(result.ok, true);
+  assert.ok(calls.some(({ method }) => method === "banChatMember"));
+  assert.equal(recorded.at(-1).result, "success");
+  assert.equal(recorded[0].targetUserId, "456");
+});
+
+test("group moderation fails closed when a stored administrator is no longer a Telegram admin", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  setPlatformStoreForTests({
+    async isFeatureEnabled() { return true; },
+    async getTelegramGroup() { return { group: { active: true }, settings: { enabled: true, moderationEnabled: true } }; },
+    async beginModerationAction() { throw new Error("should not record an unattempted action"); },
+    async finishModerationAction() { throw new Error("should not finish an unattempted action"); }
+  });
+  const methods = [];
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    methods.push(method);
+    if (method === "getMe") return telegramSuccess({ id: 999, is_bot: true });
+    if (method === "getChatMember") return telegramSuccess(String(payload.user_id) === "123"
+      ? { status: "member", user: { id: 123 } }
+      : String(payload.user_id) === "999"
+        ? { status: "administrator", can_restrict_members: true, user: { id: 999 } }
+        : { status: "member", user: { id: 456 } });
+    return telegramSuccess(true);
+  };
+  const state = await telegramGroupPermissionState({ chatId: "-10077", actorUserId: "123", action: "ban", targetUserId: "456" });
+  assert.equal(state.actorAllowed, false);
+  await assert.rejects(
+    executeTelegramModerationAction({ actorUserId: "123", chatId: "-10077", action: "ban", targetUserId: "456" }),
+    /need Telegram's can_restrict_members/
+  );
+  assert.equal(methods.includes("banChatMember"), false);
+});
+
+test("duplicate moderation request IDs do not execute a Telegram action twice", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  const states = new Map();
+  setPlatformStoreForTests({
+    async isFeatureEnabled() { return true; },
+    async getTelegramGroup() { return { group: { active: true }, settings: { enabled: true, moderationEnabled: true } }; },
+    async beginModerationAction({ requestId }) {
+      if (states.has(requestId)) return { duplicate: true, actionId: "saved", result: states.get(requestId) };
+      states.set(requestId, "pending");
+      return { duplicate: false, actionId: "saved", result: "pending" };
+    },
+    async finishModerationAction(requestId, { result }) { states.set(requestId, result); return { actionId: "saved", result }; }
+  });
+  let bans = 0;
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    if (method === "getMe") return telegramSuccess({ id: 999, is_bot: true });
+    if (method === "getChatMember") return telegramSuccess(String(payload.user_id) === "456"
+      ? { status: "member", user: { id: 456 } }
+      : { status: "administrator", can_restrict_members: true, user: { id: payload.user_id } });
+    if (method === "banChatMember") bans += 1;
+    return telegramSuccess(true);
+  };
+  const id = crypto.randomUUID();
+  await executeTelegramModerationAction({ actorUserId: "123", chatId: "-10077", action: "ban", targetUserId: "456", requestId: id });
+  const duplicate = await executeTelegramModerationAction({ actorUserId: "123", chatId: "-10077", action: "ban", targetUserId: "456", requestId: id });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(bans, 1);
+});
+
+test("Secretary reminder delivery is leased, persistent, and marks successful Telegram delivery", async () => {
+  process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
+  const completed = [];
+  setPlatformStoreForTests({
+    async isFeatureEnabled(key) { return key === "secretary_automation"; },
+    async acquireLease({ key, ownerId }) { return { acquired: true, key, ownerId }; },
+    async releaseLease() {},
+    async claimDueSecretaryReminders() {
+      return [{ reminder_id: crypto.randomUUID(), owner_user_id: "123", chat_id: "123", thread_id: null, title: "Ship release", message: "Run the production checklist" }];
+    },
+    async completeSecretaryReminder(id, result) { completed.push({ id, result }); },
+    async claimDueSecretaryJobs() { return []; }
+  });
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ method: new URL(url).pathname.split("/").at(-1), payload: JSON.parse(options.body) });
+    return telegramSuccess(true);
+  };
+  const result = await deliverDueSecretaryReminders();
+  assert.equal(result.delivered, 1);
+  assert.equal(calls[0].method, "sendMessage");
+  assert.match(calls[0].payload.text, /production checklist/);
+  assert.equal(completed[0].result.delivered, true);
 });
 
 test("admin AI chat does not consume Stars credits", async () => {

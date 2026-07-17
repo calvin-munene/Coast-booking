@@ -97,7 +97,14 @@ export function consumeTelegramWebAppInitData(initData, { now = Date.now() } = {
   if (consumedLaunches.has(fingerprint)) return { ok: false, code: "replayed" };
   consumedLaunches.set(fingerprint, authDate + maxAge + FUTURE_CLOCK_SKEW_SECONDS);
 
-  return { ok: true, userId, user, authDate };
+  return {
+    ok: true,
+    userId,
+    user,
+    authDate,
+    fingerprint,
+    expiresAt: (authDate + maxAge + FUTURE_CLOCK_SKEW_SECONDS) * 1000
+  };
 }
 
 export function issueTelegramWebAppSession({ userId, user }, { now = Date.now() } = {}) {

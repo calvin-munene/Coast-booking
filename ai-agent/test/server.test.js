@@ -2,13 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import crypto from "node:crypto";
-import { createAppServer } from "../src/server.js";
+import { createAppServer, resolveClientIp } from "../src/server.js";
 import { setTelegramStarLedgerForTests } from "../src/channels.js";
 import { createStarPurchasePayload } from "../src/starPayments.js";
 import { resetTelegramWebAuthForTests } from "../src/telegramWebAuth.js";
 import { setPlatformStoreForTests } from "../src/platformRuntime.js";
 import { resetNvidiaModelCatalogForTests } from "../src/agent.js";
 import { aiChatStarCost, resetPricingForTests } from "../src/pricing.js";
+import { recordNvidiaRequest, resetProviderHealthForTests } from "../src/providerHealth.js";
 
 const originalFetch = global.fetch;
 const ENV_NAMES = [
@@ -22,7 +23,10 @@ const ENV_NAMES = [
   "NVIDIA_API_KEY",
   "NVIDIA_GLOBAL_REQUESTS_PER_HOUR",
   "NVIDIA_MAX_CONCURRENT_REQUESTS",
-  "PUBLIC_URL"
+  "PUBLIC_URL",
+  "META_APP_SECRET",
+  "TRUST_PROXY",
+  "RENDER"
 ];
 const originalEnvironment = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
 
@@ -36,6 +40,7 @@ function restoreEnvironment() {
   setPlatformStoreForTests(null);
   resetNvidiaModelCatalogForTests();
   resetPricingForTests();
+  resetProviderHealthForTests();
   resetTelegramWebAuthForTests();
 }
 
@@ -108,6 +113,32 @@ function requestJson(port, path, value, headers = {}) {
       headers: {
         "content-type": "application/json",
         "content-length": Buffer.byteLength(requestBody),
+        ...headers
+      }
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.once("end", () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        text: Buffer.concat(chunks).toString("utf8")
+      }));
+    });
+    request.once("error", reject);
+    request.end(requestBody);
+  });
+}
+
+function requestJsonMethod(port, path, method, value = null, headers = {}) {
+  const requestBody = value === null ? "" : JSON.stringify(value);
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: "127.0.0.1",
+      port,
+      path,
+      method,
+      headers: {
+        ...(value === null ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(requestBody) }),
         ...headers
       }
     }, (response) => {
@@ -692,6 +723,451 @@ test("pricing changes require billing authority and immediately update the succe
     assert.equal(response.status, 200, response.text);
     assert.equal(changes[0].actorUserId, "6643462826");
     assert.equal(aiChatStarCost(), 2);
+  } finally {
+    await close(server);
+  }
+});
+
+test("user administration rechecks privilege and reserves role and credit changes for the Super Admin", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "4", payments: "0", prompts: "0" }; }
+  }));
+  const changes = [];
+  const users = [{
+    userId: "123",
+    role: "standard_user",
+    firstName: "Ada",
+    lastName: null,
+    username: "ada",
+    banned: false,
+    unlimitedCredits: false,
+    balance: "4"
+  }];
+  setPlatformStoreForTests(platformStoreDouble({
+    async listManagedUsers() { return users; },
+    async getManagedUser() { return users[0]; },
+    async manageUser(change) { changes.push(change); return { duplicate: false, user: { ...users[0], role: change.role || users[0].role } }; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 6643462826);
+    const headers = { authorization: `Bearer ${session}`, origin: process.env.PUBLIC_URL };
+    const listed = await requestGet(port, "/api/admin/users?search=ada", headers);
+    assert.equal(listed.status, 200, listed.text);
+    const changed = await requestJsonMethod(port, "/api/admin/users/123", "PATCH", {
+      requestId: crypto.randomUUID(),
+      role: "premium_user",
+      creditDelta: 5,
+      unlimitedCredits: true,
+      note: "Verified subscription"
+    }, headers);
+    assert.equal(changed.status, 200, changed.text);
+    assert.equal(changes[0].actorUserId, "6643462826");
+    assert.equal(changes[0].creditDelta, 5);
+  } finally {
+    await close(server);
+  }
+
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "4", payments: "0", prompts: "0" }; }
+  }));
+  let called = false;
+  setPlatformStoreForTests(platformStoreDouble({
+    async getUserRole(id) { return String(id) === "777" ? "admin" : "standard_user"; },
+    async getManagedUser() { return users[0]; },
+    async manageUser() { called = true; }
+  }));
+  const second = createAppServer();
+  const secondPort = await listen(second);
+  try {
+    const adminSession = await launchWebSession(secondPort, 777);
+    const denied = await requestJsonMethod(secondPort, "/api/admin/users/123", "PATCH", {
+      requestId: crypto.randomUUID(),
+      creditDelta: 1
+    }, { authorization: `Bearer ${adminSession}`, origin: process.env.PUBLIC_URL });
+    assert.equal(denied.status, 403, denied.text);
+    assert.equal(called, false);
+  } finally {
+    await close(second);
+  }
+});
+
+test("group Mini App APIs require current Telegram administrator status", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const group = { chatId: "-10077", title: "Nvid Test Group", chatType: "supergroup", active: true, botStatus: "administrator", botPermissions: {} };
+  setPlatformStoreForTests(platformStoreDouble({
+    async listTelegramGroups() { return [group]; },
+    async getTelegramGroup() { return { group, settings: { enabled: true, moderationEnabled: true, guardEnabled: false }, actions: [], warnings: [], guardRequests: [] }; },
+    async syncGroupMember() {}
+  }));
+  let actorIsAdmin = true;
+  global.fetch = async (url, options) => {
+    const method = new URL(url).pathname.split("/").at(-1);
+    const payload = JSON.parse(options.body);
+    if (method === "getMe") return new Response(JSON.stringify({ ok: true, result: { id: 999, is_bot: true } }), { status: 200, headers: { "content-type": "application/json" } });
+    if (method === "getChatMember") {
+      const result = String(payload.user_id) === "123"
+        ? { status: actorIsAdmin ? "administrator" : "member", can_manage_chat: actorIsAdmin, user: { id: 123 } }
+        : { status: "administrator", can_manage_chat: true, user: { id: 999 } };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true, result: true }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    const headers = { authorization: `Bearer ${session}` };
+    assert.equal((await requestGet(port, "/api/groups", headers)).status, 200);
+    assert.equal((await requestGet(port, "/api/groups/-10077", headers)).status, 200);
+    actorIsAdmin = false;
+    const denied = await requestGet(port, "/api/groups/-10077", headers);
+    assert.equal(denied.status, 403, denied.text);
+  } finally {
+    await close(server);
+  }
+});
+
+test("durable conversation lease blocks a duplicate generation across simulated instances", async () => {
+  enableTelegramPayments();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const leases = new Map();
+  setPlatformStoreForTests(platformStoreDouble({
+    async acquireLease({ key, ownerId }) {
+      if (leases.has(key)) return { acquired: false };
+      leases.set(key, ownerId);
+      return { acquired: true, key, ownerId };
+    },
+    async releaseLease({ key, ownerId }) {
+      if (leases.get(key) !== ownerId) return false;
+      leases.delete(key);
+      return true;
+    }
+  }));
+  const provider = deferred();
+  global.fetch = async () => provider.promise;
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    const conversationId = crypto.randomUUID();
+    const first = requestJson(port, "/api/chat", {
+      requestId: crypto.randomUUID(),
+      conversationId,
+      message: "first"
+    }, { authorization: `Bearer ${session}` });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const duplicate = await requestJson(port, "/api/chat", {
+      requestId: crypto.randomUUID(),
+      conversationId,
+      message: "duplicate"
+    }, { authorization: `Bearer ${session}` });
+    assert.equal(duplicate.status, 409, duplicate.text);
+    provider.resolve(new Response(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "content-type": "text/event-stream" } }
+    ));
+    assert.equal((await first).status, 200);
+    assert.equal(leases.size, 0);
+  } finally {
+    await close(server);
+  }
+});
+
+test("browser response completion failure becomes recoverable and is never restored", async () => {
+  enableTelegramPayments();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  const transitions = [];
+  const restored = [];
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async transitionPrompt(_reservationId, state) { transitions.push(state); return { changed: true, state }; },
+    async completePrompt() { throw new Error("database temporarily unavailable"); },
+    async restorePrompt(reservationId) { restored.push(reservationId); }
+  }));
+  global.fetch = async () => new Response(
+    'data: {"choices":[{"delta":{"content":"produced answer"}}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    const response = await requestJson(port, "/api/chat", {
+      requestId: crypto.randomUUID(),
+      message: "produce then recover"
+    }, { authorization: `Bearer ${session}` });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /event: done/);
+    assert.deepEqual(transitions, ["generation_started", "response_produced", "delivery_attempted", "delivered", "completion_pending"]);
+    assert.deepEqual(restored, []);
+  } finally {
+    console.error = originalConsoleError;
+    await close(server);
+  }
+});
+
+test("Mini App replay claims remain effective across simulated instances", async () => {
+  enableTelegramPayments();
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const fingerprints = new Set();
+  setPlatformStoreForTests(platformStoreDouble({
+    async claimReplay({ fingerprint }) {
+      if (fingerprints.has(fingerprint)) return false;
+      fingerprints.add(fingerprint);
+      return true;
+    }
+  }));
+  const launch = signedInitData({ userId: 321 });
+  let server = createAppServer();
+  let port = await listen(server);
+  try {
+    assert.equal((await requestJson(port, "/api/miniapp/state", { initData: launch })).status, 200);
+  } finally {
+    await close(server);
+  }
+  resetTelegramWebAuthForTests();
+  server = createAppServer();
+  port = await listen(server);
+  try {
+    assert.equal((await requestJson(port, "/api/miniapp/state", { initData: launch })).status, 401);
+  } finally {
+    await close(server);
+  }
+});
+
+test("billable chat rechecks a platform restriction after session issuance", async () => {
+  enableTelegramPayments();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "0", payments: "0", prompts: "0" }; }
+  }));
+  let role = "standard_user";
+  const securityEvents = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async getUserRole() { return role; },
+    async writeSecurityEvent(event) { securityEvents.push(event); return { written: true }; }
+  }));
+  let providerCalls = 0;
+  global.fetch = async () => {
+    providerCalls += 1;
+    return new Response('data: {"choices":[{"delta":{"content":"answer"}}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  };
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    role = "restricted_user";
+    const denied = await requestJson(port, "/api/chat", {
+      requestId: crypto.randomUUID(),
+      message: "must not run"
+    }, { authorization: `Bearer ${session}` });
+    assert.equal(denied.status, 403, denied.text);
+    assert.equal(providerCalls, 0);
+    assert.ok(securityEvents.some((event) => event.eventType === "current_user_authorization_denied"));
+  } finally {
+    await close(server);
+  }
+});
+
+test("billable chat and direct APIs recheck a Telegram ban after session issuance", async () => {
+  enableTelegramPayments();
+  let banned = false;
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getUserControl(userId) {
+      return { userId: String(userId), banned, unlimitedCredits: false, selectedMode: "chat" };
+    }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    banned = true;
+    const headers = { authorization: `Bearer ${session}` };
+    assert.equal((await requestGet(port, "/api/modes", headers)).status, 403);
+    assert.equal((await requestJson(port, "/api/chat", {
+      requestId: crypto.randomUUID(),
+      message: "blocked"
+    }, headers)).status, 403);
+  } finally {
+    await close(server);
+  }
+});
+
+test("configured administrator remains authorized with a current valid session", async () => {
+  enableTelegramPayments();
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async getStats() { return { accounts: "1", credits: "0", payments: "0", prompts: "0" }; }
+  }));
+  setPlatformStoreForTests(platformStoreDouble({ async getUserRole() { return "admin"; } }));
+  global.fetch = async () => new Response(
+    'data: {"choices":[{"delta":{"content":"admin answer"}}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } }
+  );
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 6643462826);
+    const response = await requestJson(port, "/api/chat", {
+      requestId: crypto.randomUUID(),
+      message: "admin request"
+    }, { authorization: `Bearer ${session}` });
+    assert.equal(response.status, 200, response.text);
+    assert.match(response.text, /event: done/);
+  } finally {
+    await close(server);
+  }
+});
+
+test("trusted proxy resolution ignores forged leftmost forwarding entries", () => {
+  const request = {
+    headers: { "x-forwarded-for": "203.0.113.9, 198.51.100.12" },
+    socket: { remoteAddress: "10.0.0.4" }
+  };
+  assert.equal(resolveClientIp(request, {}), "10.0.0.4");
+  assert.equal(resolveClientIp(request, { RENDER: "true" }), "198.51.100.12");
+  assert.equal(resolveClientIp({ headers: { "x-forwarded-for": "forged" }, socket: { remoteAddress: "127.0.0.1" } }, { TRUST_PROXY: "render" }), "127.0.0.1");
+});
+
+test("readiness keeps core interfaces available while NVIDIA is degraded", async () => {
+  process.env.TELEGRAM_STARS_REQUIRED = "false";
+  setPlatformStoreForTests(platformStoreDouble({
+    async health() { return { ok: true, latencyMs: 1, migrationVersion: "test" }; }
+  }));
+  recordNvidiaRequest({ ok: false, statusCode: 503, latencyMs: 10 });
+  recordNvidiaRequest({ ok: false, statusCode: 503, latencyMs: 10 });
+  recordNvidiaRequest({ ok: false, statusCode: 503, latencyMs: 10 });
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const response = await requestGet(port, "/health/ready");
+    const health = JSON.parse(response.text);
+    assert.equal(response.status, 200);
+    assert.equal(health.ready, true);
+    assert.equal(health.status, "degraded");
+    assert.equal(health.aiGenerationAvailable, false);
+    assert.equal(health.services.nvidia.requiredForReadiness, false);
+  } finally {
+    await close(server);
+  }
+});
+
+test("WhatsApp AI is denied safely when its production feature flag is disabled", async () => {
+  process.env.META_APP_SECRET = "meta-test-secret";
+  const securityEvents = [];
+  setPlatformStoreForTests(platformStoreDouble({
+    async isFeatureEnabled() { return false; },
+    async writeSecurityEvent(event) { securityEvents.push(event); return { written: true }; }
+  }));
+  let providerCalls = 0;
+  global.fetch = async () => { providerCalls += 1; return new Response("unexpected", { status: 500 }); };
+  const payload = JSON.stringify({
+    entry: [{ changes: [{ value: { messages: [{ from: "15551234567", text: { body: "hello" } }] } }] }]
+  });
+  const signature = `sha256=${crypto.createHmac("sha256", process.env.META_APP_SECRET).update(payload).digest("hex")}`;
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const response = await requestRaw(port, "/webhooks/whatsapp", payload, { "x-hub-signature-256": signature });
+    assert.equal(response.status, 200);
+    assert.match(response.text, /disabled/);
+    assert.equal(providerCalls, 0);
+    assert.ok(securityEvents.some((event) => event.eventType === "whatsapp_ai_denied"));
+  } finally {
+    await close(server);
+  }
+});
+
+test("conversation APIs create, list, rename, open, and soft-delete owned history", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const conversations = new Map();
+  setPlatformStoreForTests(platformStoreDouble({
+    async getOrCreateConversation(input) {
+      const conversation = {
+        id: input.conversationId,
+        userId: String(input.userId),
+        channel: input.channel,
+        title: input.title,
+        updatedAt: new Date().toISOString()
+      };
+      conversations.set(conversation.id, conversation);
+      return conversation;
+    },
+    async listConversations(userId) { return [...conversations.values()].filter((item) => item.userId === String(userId)); },
+    async getConversation(userId, id) {
+      const conversation = conversations.get(id);
+      return conversation?.userId === String(userId) ? { conversation, messages: [] } : null;
+    },
+    async renameConversation(userId, id, title) {
+      const conversation = conversations.get(id);
+      if (conversation?.userId !== String(userId)) return null;
+      conversation.title = title;
+      return conversation;
+    },
+    async deleteConversation(userId, id) {
+      const conversation = conversations.get(id);
+      return conversation?.userId === String(userId) ? conversations.delete(id) : false;
+    }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const session = await launchWebSession(port, 123);
+    const headers = { authorization: `Bearer ${session}`, origin: process.env.PUBLIC_URL };
+    const created = await requestJson(port, "/api/conversations", { title: "Persistent project" }, headers);
+    assert.equal(created.status, 201, created.text);
+    const id = JSON.parse(created.text).conversation.id;
+    assert.equal((await requestGet(port, "/api/conversations", headers)).status, 200);
+    assert.equal((await requestGet(port, `/api/conversations/${id}`, headers)).status, 200);
+    const renamed = await requestJsonMethod(port, `/api/conversations/${id}`, "PATCH", { title: "Renamed project" }, headers);
+    assert.equal(renamed.status, 200, renamed.text);
+    assert.match(renamed.text, /Renamed project/);
+    assert.equal((await requestJsonMethod(port, `/api/conversations/${id}`, "DELETE", null, headers)).status, 200);
+  } finally {
+    await close(server);
+  }
+});
+
+test("assistant mutation APIs enforce repository ownership", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const assistantId = "55555555-5555-4555-8555-555555555555";
+  setPlatformStoreForTests(platformStoreDouble({
+    async listAssistants() { return []; },
+    async createAssistant(userId, data) { return { id: assistantId, ownerUserId: String(userId), name: data.name }; },
+    async updateAssistant(userId, id, data) {
+      return String(userId) === "123" && id === assistantId ? { id, ownerUserId: "123", name: data.name } : null;
+    },
+    async deleteAssistant(userId, id) { return String(userId) === "123" && id === assistantId; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const ownerSession = await launchWebSession(port, 123);
+    resetTelegramWebAuthForTests();
+    const otherSession = await launchWebSession(port, 456);
+    const ownerHeaders = { authorization: `Bearer ${ownerSession}`, origin: process.env.PUBLIC_URL };
+    const created = await requestJson(port, "/api/assistants", { name: "Owner assistant" }, ownerHeaders);
+    assert.equal(created.status, 201, created.text);
+    const denied = await requestJsonMethod(port, `/api/assistants/${assistantId}`, "PATCH", { name: "Stolen" }, {
+      authorization: `Bearer ${otherSession}`,
+      origin: process.env.PUBLIC_URL
+    });
+    assert.equal(denied.status, 404);
   } finally {
     await close(server);
   }

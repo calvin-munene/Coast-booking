@@ -8,18 +8,12 @@ const state = {
   session: sessionStorage.getItem("nvidbotTelegramSession") || "",
   dashboard: null,
   botLink: "/",
-  chatAbort: null
+  chatAbort: null,
+  activeConversationId: sessionStorage.getItem("nvidbotActiveConversation") || ""
 };
 
 const unavailableRoutes = {
-  "/groups": ["Groups", "Add Nvid AI to a group and promote it with the permissions you want it to use. Managed groups will appear after Telegram sends the bot group events.", "Group administrator permissions"],
-  "/moderation": ["Moderation", "Moderation controls require Nvid AI to be an administrator in the target group. No action is shown as available until Telegram confirms the permissions.", "Delete and restrict permissions"],
-  "/bots": ["Bot Manager", "Managed bot credentials remain disabled until encrypted credential storage is configured by the platform administrator.", "Encryption key and role access"],
-  "/guard": ["Guard", "Guard join-request controls work only in groups where Guard Mode is enabled and the bot can invite users.", "can_invite_users permission"],
-  "/secretary": ["Secretary", "Secretary features only process messages Telegram delivers to Nvid AI. The bot cannot read arbitrary private conversations.", "Bot-visible message history"],
   "/threads": ["Threads", "Thread context is isolated by group, forum topic, and user. Add the bot to a forum group to activate topic controls.", "Forum topics and group access"],
-  "/admin/users": ["User Management", "User search and role-management APIs are not enabled in this deployment yet. Existing /ban and /unban controls remain available in Telegram.", "Platform user-management rollout"],
-  "/admin/groups": ["Group Administration", "Group administration appears only after a group grants the bot live Telegram administrator permissions.", "Test group setup"]
 };
 
 function node(tag, attributes = {}, children = []) {
@@ -164,7 +158,8 @@ function renderHome() {
       quickAction("NVIDIA Models", "Choose from administrator-approved models.", "/models"),
       quickAction("Mode Studio", "Tune Nvid AI for coding, research, documents, translation, or executive work.", "/assistants"),
       quickAction("Payments", "Review your Telegram Stars payment ledger.", "/payments"),
-      quickAction("Managed Groups", "Configure after live group permissions are detected.", "/groups", "SETUP"),
+      quickAction("Managed Groups", "Live moderation, Guard, rules, and permission status.", "/groups"),
+      quickAction("Secretary", "Durable reminders delivered inside authorized Telegram chats.", "/secretary"),
       ...(dashboard.platformAdmin ? [quickAction("Admin Console", "Platform health, models, features, billing, and logs.", "/admin")] : [])
     ])])
   ];
@@ -177,7 +172,21 @@ async function renderChat() {
   const message = node("textarea", { placeholder: "Ask Nvid AI anything…", maxlength: "8000" });
   const model = node("select");
   for (const item of data.models) model.append(node("option", { value: item.id, text: `${item.label} · ${item.tag}` }));
-  model.value = data.defaultModel;
+  model.value = state.dashboard.preferredModel || data.defaultModel;
+  if (state.activeConversationId) {
+    try {
+      const saved = await api(`/api/conversations/${state.activeConversationId}`);
+      output.textContent = saved.messages
+        .filter((item) => item.status === "completed")
+        .map((item) => `${item.role === "user" ? "YOU" : "NVID AI"}\n${item.content}`)
+        .join("\n\n");
+    } catch (error) {
+      if (error.status === 404) {
+        state.activeConversationId = "";
+        sessionStorage.removeItem("nvidbotActiveConversation");
+      } else throw error;
+    }
+  }
   const assistantMode = node("select");
   for (const item of modeData.modes.filter((item) => item.enabled)) {
     assistantMode.append(node("option", { value: item.id, text: item.label }));
@@ -214,7 +223,12 @@ async function renderChat() {
         method: "POST",
         signal: state.chatAbort.signal,
         headers: { "content-type": "application/json", authorization: `Bearer ${state.session}` },
-        body: JSON.stringify({ requestId: requestId(), message: prompt, model: model.value })
+        body: JSON.stringify({
+          requestId: requestId(),
+          message: prompt,
+          model: model.value,
+          conversationId: state.activeConversationId || undefined
+        })
       });
       if (!response.ok) {
         const detail = await response.json().catch(() => ({}));
@@ -238,6 +252,10 @@ async function renderChat() {
             model.value = payload.model;
             if (payload.mode) assistantMode.value = payload.mode;
           }
+          if (event === "done" && payload.conversationId) {
+            state.activeConversationId = payload.conversationId;
+            sessionStorage.setItem("nvidbotActiveConversation", payload.conversationId);
+          }
           if (event === "error") throw new Error(payload.error || "AI generation failed");
         }
         if (done) break;
@@ -254,6 +272,14 @@ async function renderChat() {
   }
   send.addEventListener("click", generate);
   stop.addEventListener("click", () => state.chatAbort?.abort());
+  const newConversation = node("button", { className: "button", type: "button", text: "New conversation" });
+  newConversation.addEventListener("click", () => {
+    state.activeConversationId = "";
+    sessionStorage.removeItem("nvidbotActiveConversation");
+    output.textContent += `${output.textContent ? "\n\n" : ""}YOU\n${prompt}\n\nNVID AI\n`;
+    message.value = "";
+    showToast("New conversation ready");
+  });
   app.replaceChildren(
     pageHead("AI Chat", "Stream a response from an approved NVIDIA model. A successful non-admin request uses the displayed AI credit price."),
     node("section", { className: "chat-console" }, [
@@ -261,13 +287,13 @@ async function renderChat() {
       node("div", { className: "field" }, [node("label", { text: "NVIDIA model" }), model]),
       output,
       node("div", { className: "field" }, [node("label", { text: "Message" }), message]),
-      node("div", { className: "button-row" }, [send, stop])
+      node("div", { className: "button-row" }, [send, stop, newConversation, routeLink("History", "/history", "button")])
     ])
   );
 }
 
 async function renderAssistantModes() {
-  const data = await api("/api/modes");
+  const [data, assistantsData] = await Promise.all([api("/api/modes"), api("/api/assistants")]);
   const cards = data.modes.map((mode) => {
     const active = mode.id === data.selectedMode;
     const action = node("button", {
@@ -299,9 +325,58 @@ async function renderAssistantModes() {
       action
     ]);
   });
+  const name = node("input", { maxlength: "80", placeholder: "Assistant name" });
+  const description = node("input", { maxlength: "500", placeholder: "Short description" });
+  const instructions = node("textarea", { maxlength: "5000", placeholder: "System instructions" });
+  const create = node("button", { className: "button primary", type: "button", text: "Create assistant" });
+  create.addEventListener("click", async () => {
+    if (!name.value.trim()) return showToast("Assistant name is required");
+    create.disabled = true;
+    try {
+      await api("/api/assistants", {
+        method: "POST",
+        body: {
+          name: name.value.trim(),
+          description: description.value.trim(),
+          systemInstructions: instructions.value.trim(),
+          tone: "adaptive",
+          language: state.dashboard.preferredLanguage || "auto",
+          technicalLevel: "adaptive",
+          responseLength: state.dashboard.responseLength || "balanced",
+          memoryEnabled: state.dashboard.memoryEnabled !== false
+        }
+      });
+      await renderAssistantModes();
+    } catch (error) {
+      showToast(error.message);
+      create.disabled = false;
+    }
+  });
+  const customAssistants = assistantsData.assistants.map((assistant) => {
+    const remove = node("button", { className: "button danger", type: "button", text: "Delete" });
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`Delete ${assistant.name}?`)) return;
+      await api(`/api/assistants/${assistant.id}`, { method: "DELETE" });
+      await renderAssistantModes();
+    });
+    return node("article", { className: "list-item" }, [
+      node("div", {}, [node("h3", { text: assistant.name }), node("p", { text: assistant.description || "Custom structured assistant" })]),
+      node("div", {}, [badge(assistant.enabled ? "READY" : "OFF", assistant.enabled ? "" : "off"), remove])
+    ]);
+  });
   app.replaceChildren(
     pageHead("Mode Studio", "Switch the behavior layer used by the NVIDIA assistant. Modes change the system instructions; they do not grant unsupported Telegram access."),
-    node("section", { className: "mode-stack" }, cards)
+    node("section", { className: "mode-stack" }, cards),
+    node("section", { className: "section" }, [
+      sectionTitle("Custom assistants"),
+      customAssistants.length ? node("div", { className: "list" }, customAssistants) : node("p", { text: "No custom assistants yet." }),
+      node("article", { className: "card" }, [
+        node("div", { className: "field" }, [node("label", { text: "Name" }), name]),
+        node("div", { className: "field" }, [node("label", { text: "Description" }), description]),
+        node("div", { className: "field" }, [node("label", { text: "Validated system instructions" }), instructions]),
+        create
+      ])
+    ])
   );
 }
 
@@ -345,9 +420,316 @@ async function renderBilling(kind) {
   );
 }
 
+async function renderConversations() {
+  const data = await api("/api/conversations?limit=100");
+  const search = node("input", { type: "search", placeholder: "Search conversations", maxlength: "160" });
+  const list = node("section", { className: "list" });
+  const draw = (items) => {
+    list.replaceChildren(...items.map((conversation) => {
+      const open = node("button", { className: "button primary", type: "button", text: "Open" });
+      open.addEventListener("click", () => {
+        state.activeConversationId = conversation.id;
+        sessionStorage.setItem("nvidbotActiveConversation", conversation.id);
+        navigate("/chat");
+      });
+      const rename = node("button", { className: "button", type: "button", text: "Rename" });
+      rename.addEventListener("click", async () => {
+        const title = window.prompt("Conversation title", conversation.title)?.trim();
+        if (!title) return;
+        await api(`/api/conversations/${conversation.id}`, { method: "PATCH", body: { title } });
+        await renderConversations();
+      });
+      const remove = node("button", { className: "button danger", type: "button", text: "Delete" });
+      remove.addEventListener("click", async () => {
+        if (!window.confirm("Delete this conversation?")) return;
+        await api(`/api/conversations/${conversation.id}`, { method: "DELETE" });
+        if (state.activeConversationId === conversation.id) {
+          state.activeConversationId = "";
+          sessionStorage.removeItem("nvidbotActiveConversation");
+        }
+        await renderConversations();
+      });
+      return node("article", { className: "list-item" }, [
+        node("div", {}, [
+          node("h3", { text: conversation.title }),
+          node("p", { text: `${conversation.channel.toUpperCase()} · ${new Date(conversation.updatedAt).toLocaleString()}` })
+        ]),
+        node("div", { className: "button-row" }, [open, rename, remove])
+      ]);
+    }));
+    if (!items.length) list.replaceChildren(node("section", { className: "empty-state" }, [
+      node("h2", { text: "No conversations yet" }),
+      node("p", { text: "Start a new AI chat and it will appear here." }),
+      routeLink("Start chat", "/chat", "button primary")
+    ]));
+  };
+  draw(data.conversations);
+  search.addEventListener("input", () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    draw(data.conversations.filter((item) => item.title.toLocaleLowerCase().includes(query)));
+  });
+  app.replaceChildren(
+    pageHead("Conversation History", "Durable AI conversations that survive restarts and deployments."),
+    node("section", { className: "card" }, [search]),
+    list
+  );
+}
+
+async function renderGroups({ admin = false, purpose = "manage" } = {}) {
+  const data = await api(admin ? "/api/admin/groups?limit=100" : "/api/groups?limit=100");
+  const groups = data.groups || [];
+  const items = groups.map((group) => {
+    const status = group.botStatus === "administrator" || group.botStatus === "creator" ? "ADMIN" : "LIMITED";
+    return node("article", { className: "list-item" }, [
+      node("div", {}, [
+        node("h3", { text: group.title }),
+        node("p", { text: `${group.chatType} · ${group.chatId}${group.username ? ` · @${group.username}` : ""}` })
+      ]),
+      node("div", { className: "button-row" }, [badge(status, status === "ADMIN" ? "" : "neutral"), routeLink(purpose === "guard" ? "Guard" : "Manage", `/group/${group.chatId}`, "button")])
+    ]);
+  });
+  app.replaceChildren(
+    pageHead(admin ? "Group Administration" : purpose === "guard" ? "Guard Groups" : "Managed Groups", "Every action verifies the current Telegram administrator and bot permissions before execution."),
+    groups.length ? node("section", { className: "list" }, items) : node("section", { className: "empty-state" }, [
+      badge("SETUP REQUIRED", "neutral"),
+      node("h2", { text: "No managed groups detected" }),
+      node("p", { text: "Add Nvid AI to a Telegram group, promote it with only the permissions you need, then send a message in that group." }),
+      node("button", { className: "button primary", type: "button", text: "Open Telegram bot", onclick: openBot })
+    ])
+  );
+}
+
+function booleanSetting(label, checked) {
+  const input = node("input", { type: "checkbox" });
+  input.checked = checked === true;
+  return { input, element: node("label", { className: "setting-switch" }, [node("span", { text: label }), input]) };
+}
+
+async function renderGroup(chatId) {
+  const data = await api(`/api/groups/${chatId}`);
+  const group = data.group;
+  const settings = data.settings;
+  const moderation = booleanSetting("Moderation", settings.moderationEnabled);
+  const guard = booleanSetting("Guard queue", settings.guardEnabled);
+  const secretary = booleanSetting("Secretary", settings.secretaryEnabled);
+  const welcome = booleanSetting("Welcome messages", settings.welcomeEnabled);
+  const goodbye = booleanSetting("Goodbye messages", settings.goodbyeEnabled);
+  const rules = node("textarea", { maxlength: "10000", placeholder: "Group rules" });
+  rules.value = settings.rules || "";
+  const welcomeMessage = node("textarea", { maxlength: "2000", placeholder: "Welcome {name} to the group." });
+  welcomeMessage.value = settings.welcomeMessage || "";
+  const save = node("button", { className: "button primary", type: "button", text: "Save group controls" });
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      await api(`/api/groups/${chatId}/settings`, {
+        method: "PATCH",
+        body: {
+          requestId: requestId(),
+          changes: {
+            moderationEnabled: moderation.input.checked,
+            guardEnabled: guard.input.checked,
+            secretaryEnabled: secretary.input.checked,
+            welcomeEnabled: welcome.input.checked,
+            goodbyeEnabled: goodbye.input.checked,
+            welcomeMessage: welcomeMessage.value.trim() || null,
+            rules: rules.value.trim() || null
+          }
+        }
+      });
+      showToast("Group controls saved");
+      haptic("medium");
+    } catch (error) { showToast(error.message); } finally { save.disabled = false; }
+  });
+
+  const action = node("select");
+  for (const value of ["ban", "unban", "kick", "mute", "unmute", "warn", "unwarn", "approve", "reject", "lock", "unlock", "slowmode"]) {
+    action.append(node("option", { value, text: value.toUpperCase() }));
+  }
+  const target = node("input", { inputmode: "numeric", placeholder: "Telegram target user ID" });
+  const duration = node("input", { type: "number", min: "0", max: "31536000", placeholder: "Duration seconds (optional)" });
+  const reason = node("textarea", { maxlength: "1000", placeholder: "Reason for the audited action" });
+  const execute = node("button", { className: "button danger", type: "button", text: "Verify and execute" });
+  execute.addEventListener("click", async () => {
+    if (!["lock", "unlock", "slowmode"].includes(action.value) && !/^\d+$/.test(target.value.trim())) return showToast("Enter a valid target user ID");
+    if (!window.confirm(`Execute ${action.value.toUpperCase()} after live Telegram permission verification?`)) return;
+    execute.disabled = true;
+    try {
+      await api(`/api/groups/${chatId}/moderation`, {
+        method: "POST",
+        body: {
+          requestId: requestId(),
+          action: action.value,
+          targetUserId: target.value.trim() || null,
+          durationSeconds: duration.value === "" ? null : Number(duration.value),
+          reason: reason.value.trim() || null
+        }
+      });
+      showToast(`${action.value.toUpperCase()} completed`);
+      await renderGroup(chatId);
+    } catch (error) { showToast(error.message); } finally { execute.disabled = false; }
+  });
+
+  let guardPanel = node("section", { className: "empty-state compact" }, [node("p", { text: "Guard requests appear after the group enables Guard and Telegram sends join requests." })]);
+  try {
+    const queue = await api(`/api/groups/${chatId}/guard?limit=50`);
+    if (queue.requests.length) guardPanel = node("section", { className: "list" }, queue.requests.map((entry) => {
+      const controls = ["queued", "verification_pending"].includes(entry.status) ? ["approve", "reject"].map((decision) => node("button", {
+        className: decision === "approve" ? "button primary" : "button danger",
+        type: "button",
+        text: decision,
+        onclick: async () => {
+          try {
+            await api(`/api/groups/${chatId}/guard`, { method: "POST", body: { requestId: requestId(), action: decision, userId: entry.user_id, reason: "Mini App Guard decision" } });
+            await renderGroup(chatId);
+          } catch (error) { showToast(error.message); }
+        }
+      })) : [badge(entry.status.toUpperCase(), "neutral")];
+      return node("article", { className: "list-item" }, [node("div", {}, [node("h3", { text: entry.user_snapshot?.firstName || `User ${entry.user_id}` }), node("p", { text: `${entry.status} · ${new Date(entry.requested_at).toLocaleString()}` })]), node("div", { className: "button-row" }, controls)]);
+    }));
+  } catch (error) {
+    guardPanel = node("section", { className: "notice", text: `Guard setup: ${error.message}` });
+  }
+
+  app.replaceChildren(
+    pageHead(group.title, "Live Telegram permissions are verified again for every moderation or Guard action."),
+    node("section", { className: "stats" }, [stat("Bot status", group.botStatus), stat("Members", group.memberCount ?? "—"), stat("Guard queue", String(data.guardRequests?.filter((item) => ["queued", "verification_pending"].includes(item.status)).length || 0))]),
+    node("section", { className: "card" }, [node("h3", { text: "Group configuration" }), moderation.element, guard.element, secretary.element, welcome.element, goodbye.element, node("div", { className: "field" }, [node("label", { text: "Welcome message" }), welcomeMessage]), node("div", { className: "field" }, [node("label", { text: "Rules" }), rules]), save]),
+    node("section", { className: "section" }, [sectionTitle("Moderation console"), node("div", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "Action" }), action]), node("div", { className: "field" }, [node("label", { text: "Target" }), target]), node("div", { className: "field" }, [node("label", { text: "Duration" }), duration]), node("div", { className: "field" }, [node("label", { text: "Reason" }), reason]), execute])]),
+    node("section", { className: "section" }, [sectionTitle("Guard queue"), guardPanel])
+  );
+}
+
+async function renderSecretary() {
+  const [data, jobData] = await Promise.all([api("/api/secretary/reminders?limit=100"), api("/api/secretary/jobs")]);
+  const title = node("input", { maxlength: "200", placeholder: "Reminder title" });
+  const message = node("textarea", { maxlength: "2000", placeholder: "What should Nvid AI remind you about?" });
+  const due = node("input", { type: "datetime-local" });
+  const create = node("button", { className: "button primary", type: "button", text: "Schedule reminder" });
+  create.addEventListener("click", async () => {
+    create.disabled = true;
+    try {
+      await api("/api/secretary/reminders", { method: "POST", body: { title: title.value, message: message.value, dueAt: new Date(due.value).toISOString() } });
+      showToast("Reminder scheduled");
+      await renderSecretary();
+    } catch (error) { showToast(error.message); } finally { create.disabled = false; }
+  });
+  const reminders = data.reminders.map((item) => {
+    const cancel = node("button", { className: "button danger", type: "button", text: "Cancel" });
+    cancel.disabled = !["scheduled", "claimed"].includes(item.status);
+    cancel.addEventListener("click", async () => {
+      await api(`/api/secretary/reminders/${item.reminder_id}`, { method: "DELETE" });
+      await renderSecretary();
+    });
+    return node("article", { className: "list-item" }, [node("div", {}, [node("h3", { text: item.title }), node("p", { text: `${new Date(item.due_at).toLocaleString()} · ${item.status}` })]), cancel]);
+  });
+  const digestTime = node("input", { type: "time", value: "08:00" });
+  const scheduleDigest = node("button", { className: "button", type: "button", text: "Schedule daily digest" });
+  scheduleDigest.addEventListener("click", async () => {
+    scheduleDigest.disabled = true;
+    try {
+      await api("/api/secretary/jobs", { method: "POST", body: { jobType: "task_digest", schedule: `daily@${digestTime.value}`, timezone: "UTC" } });
+      showToast("Daily task digest scheduled");
+      await renderSecretary();
+    } catch (error) { showToast(error.message); } finally { scheduleDigest.disabled = false; }
+  });
+  const jobs = jobData.jobs.map((job) => node("article", { className: "list-item" }, [
+    node("div", {}, [node("h3", { text: "Daily task digest" }), node("p", { text: `${job.schedule} ${job.timezone} · next ${new Date(job.next_run_at).toLocaleString()}` })]),
+    node("button", { className: "button danger", type: "button", text: "Pause", onclick: async () => { await api(`/api/secretary/jobs/${job.job_id}`, { method: "DELETE" }); await renderSecretary(); } })
+  ]));
+  app.replaceChildren(pageHead("Secretary", "Private and authorized-group reminders are delivered by a durable Telegram worker."), node("section", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "Title" }), title]), node("div", { className: "field" }, [node("label", { text: "Message" }), message]), node("div", { className: "field" }, [node("label", { text: "Due time" }), due]), create]), node("section", { className: "section" }, [sectionTitle("Daily automation"), node("div", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "UTC delivery time" }), digestTime]), scheduleDigest]), jobs.length ? node("div", { className: "list" }, jobs) : null]), node("section", { className: "section" }, [sectionTitle("Scheduled reminders"), reminders.length ? node("div", { className: "list" }, reminders) : node("p", { className: "notice", text: "No reminders scheduled." })]));
+}
+
+async function renderBots() {
+  const data = await api("/api/bots");
+  const name = node("input", { maxlength: "100", placeholder: "Managed bot name" });
+  const token = node("input", { type: "password", autocomplete: "new-password", placeholder: "Telegram bot token" });
+  const create = node("button", { className: "button primary", type: "button", text: "Encrypt and save" });
+  create.disabled = !data.encryption.configured;
+  create.addEventListener("click", async () => {
+    create.disabled = true;
+    try {
+      await api("/api/bots", { method: "POST", body: { displayName: name.value, token: token.value } });
+      token.value = "";
+      showToast("Managed bot saved securely");
+      await renderBots();
+    } catch (error) { showToast(error.message); } finally { create.disabled = false; }
+  });
+  const bots = data.bots.map((bot) => {
+    const test = node("button", { className: "button", type: "button", text: "Test" });
+    test.disabled = !bot.hasCredential;
+    test.addEventListener("click", async () => {
+      try { await api(`/api/bots/${bot.id}/test`, { method: "POST" }); showToast("Telegram connection verified"); await renderBots(); } catch (error) { showToast(error.message); }
+    });
+    const remove = node("button", { className: "button danger", type: "button", text: "Delete" });
+    remove.addEventListener("click", async () => {
+      if (!window.confirm("Delete this managed bot profile and its encrypted credential?")) return;
+      await api(`/api/bots/${bot.id}`, { method: "DELETE" });
+      await renderBots();
+    });
+    return node("article", { className: "list-item" }, [node("div", {}, [node("h3", { text: bot.displayName }), node("p", { text: `${bot.status}${bot.telegramUsername ? ` · @${bot.telegramUsername}` : ""} · token never displayed` })]), node("div", { className: "button-row" }, [test, remove])]);
+  });
+  app.replaceChildren(...[
+    pageHead("Managed Bots", "Credentials are encrypted with AES-256-GCM and are never returned to the browser."),
+    !data.encryption.configured ? node("section", { className: "notice", text: "BOT_CREDENTIAL_ENCRYPTION_KEY is required before credentials can be saved." }) : null,
+    node("section", { className: "card" }, [node("div", { className: "field" }, [node("label", { text: "Profile name" }), name]), node("div", { className: "field" }, [node("label", { text: "Bot token" }), token]), create]),
+    node("section", { className: "section" }, [sectionTitle("Profiles"), bots.length ? node("div", { className: "list" }, bots) : node("p", { className: "notice", text: "No managed bot profiles." })])
+  ].filter(Boolean));
+}
+
+async function renderAdminUsers() {
+  const data = await api("/api/admin/users?limit=100");
+  const search = node("input", { type: "search", placeholder: "Search by user ID, name, or username" });
+  const list = node("section", { className: "list" });
+  const draw = (users) => list.replaceChildren(...users.map((user) => {
+    const manage = node("button", { className: "button", type: "button", text: "Manage" });
+    manage.addEventListener("click", async () => {
+      const detail = await api(`/api/admin/users/${user.userId}`);
+      const note = window.prompt("Internal note (optional)", "") || undefined;
+      const role = state.dashboard.platformRole === "super_admin" ? window.prompt("Platform role", detail.user.role)?.trim() : undefined;
+      if (state.dashboard.platformRole === "super_admin" && !role) return;
+      try {
+        await api(`/api/admin/users/${user.userId}`, { method: "PATCH", body: { requestId: requestId(), role, note } });
+        showToast("User access updated and audited");
+        await renderAdminUsers();
+      } catch (error) { showToast(error.message); }
+    });
+    const privileged = [];
+    if (state.dashboard.platformRole === "super_admin") {
+      const credits = node("button", { className: "button", type: "button", text: "Credits" });
+      credits.addEventListener("click", async () => {
+        const delta = Number(window.prompt("Credit adjustment (negative or positive whole number)", "0"));
+        if (!Number.isSafeInteger(delta) || delta === 0) return;
+        try { await api(`/api/admin/users/${user.userId}`, { method: "PATCH", body: { requestId: requestId(), creditDelta: delta, note: `Manual credit adjustment: ${delta}` } }); await renderAdminUsers(); } catch (error) { showToast(error.message); }
+      });
+      const unlimited = node("button", { className: "button", type: "button", text: user.unlimitedCredits ? "Meter usage" : "Unlimited" });
+      unlimited.addEventListener("click", async () => {
+        try { await api(`/api/admin/users/${user.userId}`, { method: "PATCH", body: { requestId: requestId(), unlimitedCredits: !user.unlimitedCredits } }); await renderAdminUsers(); } catch (error) { showToast(error.message); }
+      });
+      privileged.push(credits, unlimited);
+    }
+    const ban = node("button", { className: user.banned ? "button" : "button danger", type: "button", text: user.banned ? "Unban" : "Ban" });
+    ban.addEventListener("click", async () => {
+      try {
+        await api(`/api/admin/users/${user.userId}`, { method: "PATCH", body: { requestId: requestId(), banned: !user.banned, banReason: user.banned ? null : "Banned from the Nvid AI admin console" } });
+        await renderAdminUsers();
+      } catch (error) { showToast(error.message); }
+    });
+    return node("article", { className: "list-item" }, [node("div", {}, [node("h3", { text: `${user.firstName || "Telegram user"} ${user.lastName || ""}`.trim() }), node("p", { text: `${user.userId} · ${user.role.replaceAll("_", " ")} · ${user.balance} credits${user.username ? ` · @${user.username}` : ""}` })]), node("div", { className: "button-row" }, [badge(user.banned ? "BANNED" : user.unlimitedCredits ? "UNLIMITED" : "ACTIVE", user.banned ? "danger" : ""), manage, ...privileged, ban])]);
+  }));
+  draw(data.users);
+  search.addEventListener("input", () => {
+    const query = search.value.toLowerCase();
+    draw(data.users.filter((user) => JSON.stringify(user).toLowerCase().includes(query)));
+  });
+  app.replaceChildren(pageHead("User Management", "Roles, bans, unlimited access, credits, and internal notes are enforced server-side and audited."), node("section", { className: "card" }, [search]), list);
+}
+
 async function renderAdmin(path) {
   if (!state.dashboard.platformAdmin) throw Object.assign(new Error("Administrator access is required"), { status: 403 });
   if (path === "/admin/models") return renderModels();
+  if (path === "/admin/users") return renderAdminUsers();
+  if (path === "/admin/groups") return renderGroups({ admin: true });
   if (path === "/admin/payments") {
     const data = await api("/api/admin/payments?limit=100");
     app.replaceChildren(pageHead("Payment Ledger", "Administrator view of Telegram Stars transactions."), node("section", { className: "list" }, data.payments.map((row) => historyItem(`${row.amount} XTR · User ${row.userId}`, new Date(row.creditedAt).toLocaleString(), row.refundedAt ? "REFUNDED" : "CREDITED", Boolean(row.refundedAt)))));
@@ -394,14 +776,15 @@ async function renderAdmin(path) {
     const data = await api("/api/admin/overview");
     app.replaceChildren(
       pageHead("Admin Console", "Authenticated platform control with every mutation audited."),
-      node("section", { className: "stats" }, [stat("Platform users", data.overview.totalUsers), stat("AI requests", data.billing?.completedPrompts || "0"), stat("Stars purchased", data.billing?.totalStarsPurchased || "0")]),
+      node("section", { className: "stats" }, [stat("Platform users", data.overview.totalUsers), stat("Active groups", data.overview.activeGroups || "0"), stat("AI requests", data.billing?.completedPrompts || "0"), stat("Stars purchased", data.billing?.totalStarsPurchased || "0"), stat("Guard queue", data.overview.pendingGuardRequests || "0"), stat("Reminders", data.overview.scheduledReminders || "0")]),
       node("section", { className: "section" }, [sectionTitle("Operations"), node("div", { className: "grid" }, [
         quickAction("Models", "Provider catalog and model availability.", "/admin/models"),
         quickAction("Features", "Durable feature flags and rollouts.", "/admin/features"),
         quickAction("Payments", "Auditable Stars transaction history.", "/admin/payments"),
         quickAction("Logs", "Audit and security event streams.", "/admin/logs"),
         quickAction("System", "Deployment and provider health.", "/admin/system"),
-        quickAction("Users", "Role controls remain gated during rollout.", "/admin/users", "SETUP")
+        quickAction("Users", "Roles, bans, credits, and notes.", "/admin/users"),
+        quickAction("Groups", "Live permissions, Guard, and moderation controls.", "/admin/groups")
       ])])
     );
     return;
@@ -424,18 +807,58 @@ async function renderAdmin(path) {
   }
 }
 
-function renderSettings() {
+async function renderSettings() {
   const modes = Object.entries(state.dashboard.modes || {});
+  const current = (await api("/api/user/settings")).settings;
+  const language = node("input", { value: current.preferredLanguage || "auto", maxlength: "32" });
+  const responseLength = node("select");
+  for (const value of ["concise", "balanced", "detailed"]) responseLength.append(node("option", { value, text: value }));
+  responseLength.value = current.responseLength || "balanced";
+  const creativity = node("input", { type: "number", min: "0", max: "2", step: "0.1", value: String(current.creativity ?? 0.4) });
+  const memoryEnabled = node("input", { type: "checkbox" });
+  memoryEnabled.checked = current.memoryEnabled !== false;
+  const instructions = node("textarea", { maxlength: "2000", placeholder: "Custom instructions for your assistant" });
+  instructions.value = current.customInstructions || current.persona || "";
+  const save = node("button", { className: "button primary", type: "button", text: "Save AI settings" });
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const result = await api("/api/user/settings", {
+        method: "POST",
+        body: {
+          preferredLanguage: language.value.trim() || "auto",
+          responseLength: responseLength.value,
+          creativity: Number(creativity.value),
+          memoryEnabled: memoryEnabled.checked,
+          customInstructions: instructions.value.trim() || null
+        }
+      });
+      Object.assign(state.dashboard, result.settings);
+      showToast("AI settings saved");
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      save.disabled = false;
+    }
+  });
   app.replaceChildren(
     pageHead("Settings", "Telegram-aware personalization, modes, and account access."),
-    node("section", { className: "card" }, [node("h3", { text: "Personal AI instructions" }), node("p", { text: state.dashboard.persona || "No custom persona is set." }), node("div", { className: "button-row" }, [node("button", { className: "button", type: "button", text: "Edit with /persona", onclick: openBot })])]),
+    node("section", { className: "card" }, [
+      node("h3", { text: "Personal AI settings" }),
+      node("div", { className: "field" }, [node("label", { text: "Preferred language" }), language]),
+      node("div", { className: "field" }, [node("label", { text: "Response length" }), responseLength]),
+      node("div", { className: "field" }, [node("label", { text: "Creativity (0-2)" }), creativity]),
+      node("div", { className: "field" }, [node("label", { text: "Memory enabled" }), memoryEnabled]),
+      node("div", { className: "field" }, [node("label", { text: "Custom instructions" }), instructions]),
+      node("div", { className: "button-row" }, [save, node("button", { className: "button", type: "button", text: "Legacy /persona", onclick: openBot })])
+    ]),
     node("section", { className: "section" }, [sectionTitle("Mode availability"), node("div", { className: "grid" }, modes.map(modeCard))]),
     ...(state.dashboard.platformAdmin ? [node("section", { className: "section" }, [sectionTitle("Administrator"), node("div", { className: "button-row" }, [routeLink("Admin console", "/admin", "button primary"), routeLink("AI pricing", "/admin/pricing", "button")])])] : [])
   );
 }
 
 function renderHelp() {
-  const commands = ["/dashboard", "/models", "/model", "/persona", "/reset", "/balance", "/topup", "/terms", "/paysupport", "/whoami"];
+  const commands = ["/dashboard", "/models", "/model", "/persona", "/reset", "/balance", "/topup", "/terms", "/ban", "/mute", "/warn", "/purge", "/rules", "/modlog", "/paysupport", "/whoami"];
   app.replaceChildren(pageHead("Help", "Telegram commands remain available alongside this Mini App."), node("section", { className: "list" }, commands.map((command) => historyItem(command, "Run in your private chat with Nvid AI", "TELEGRAM"))), node("div", { className: "button-row" }, [node("button", { className: "button primary", type: "button", text: "Open Nvid AI bot", onclick: openBot })]));
 }
 
@@ -458,8 +881,14 @@ async function render(path = currentPath()) {
     else if (path === "/chat") await renderChat();
     else if (path === "/models") await renderModels();
     else if (path === "/assistants") await renderAssistantModes();
-    else if (path === "/usage" || path === "/history" || path === "/payments") await renderBilling(path === "/payments" ? "payments" : "usage");
-    else if (path === "/settings") renderSettings();
+    else if (path === "/history") await renderConversations();
+    else if (path === "/groups" || path === "/moderation") await renderGroups();
+    else if (path === "/guard") await renderGroups({ purpose: "guard" });
+    else if (/^\/group\/-?\d+$/.test(path)) await renderGroup(path.split("/").at(-1));
+    else if (path === "/secretary") await renderSecretary();
+    else if (path === "/bots") await renderBots();
+    else if (path === "/usage" || path === "/payments") await renderBilling(path === "/payments" ? "payments" : "usage");
+    else if (path === "/settings") await renderSettings();
     else if (path === "/help") renderHelp();
     else if (path.startsWith("/admin") && !unavailableRoutes[path]) await renderAdmin(path);
     else renderUnavailable(path);
@@ -555,7 +984,7 @@ function setupMatrixCanvas() {
 function startParamPath() {
   const value = tg?.initDataUnsafe?.start_param || new URLSearchParams(location.search).get("startapp") || "";
   const mapped = `/${value.replaceAll("_", "/")}`;
-  return ["/chat", "/models", "/assistants", "/usage", "/payments", "/admin", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system"].includes(mapped) ? mapped : null;
+  return ["/chat", "/models", "/assistants", "/groups", "/guard", "/secretary", "/bots", "/usage", "/payments", "/admin", "/admin/users", "/admin/groups", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system"].includes(mapped) ? mapped : null;
 }
 
 async function start() {

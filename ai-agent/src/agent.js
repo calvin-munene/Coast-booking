@@ -1,10 +1,8 @@
 import { recordNvidiaCatalog, recordNvidiaRequest } from "./providerHealth.js";
+import { getPlatformStore } from "./platformRuntime.js";
 
-const conversations = new Map();
 const conversationLocks = new Map();
 const MAX_TURNS = 12;
-const MAX_CONVERSATIONS = 1000;
-const CONVERSATION_TTL_MS = 6 * 60 * 60 * 1000;
 const REQUEST_DEADLINE_MS = 90 * 1000;
 const RETRYABLE_NVIDIA_STATUS = new Set([429, 500, 502, 503, 504]);
 const MODEL_CATALOG_TTL_MS = 15 * 60 * 1000;
@@ -255,15 +253,6 @@ async function withConversationLock(key, task) {
   }
 }
 
-function historyFor(key) {
-  const entry = conversations.get(key);
-  if (!entry || Date.now() - entry.updatedAt > CONVERSATION_TTL_MS) {
-    conversations.delete(key);
-    return [];
-  }
-  return entry.messages;
-}
-
 function completionHistory(value) {
   if (!Array.isArray(value)) return null;
   return value.slice(-MAX_TURNS * 2).map((message) => {
@@ -276,29 +265,68 @@ function completionHistory(value) {
   });
 }
 
-function saveHistory(key, history, text, answer) {
-  conversations.set(key, {
-    updatedAt: Date.now(),
-    messages: [
-      ...history,
-      { role: "user", content: text },
-      { role: "assistant", content: answer }
-    ].slice(-MAX_TURNS * 2)
-  });
-  if (conversations.size > MAX_CONVERSATIONS) {
-    const oldest = [...conversations.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0]?.[0];
-    if (oldest) conversations.delete(oldest);
+async function beginPersistentTurn(context, persistence) {
+  const store = getPlatformStore();
+  if (!persistence?.userId || !store?.getOrCreateConversation || !store?.beginConversationTurn) {
+    return { history: [], conversation: null, turn: null, store: null };
   }
+  const conversation = await store.getOrCreateConversation({
+    scopeKey: context.conversationId,
+    userId: persistence.userId,
+    channel: persistence.channel || "miniapp",
+    telegramChatId: persistence.telegramChatId ?? null,
+    telegramThreadId: persistence.telegramThreadId ?? null,
+    assistantId: persistence.assistantId ?? null,
+    selectedModel: context.selectedModel,
+    title: persistence.title || "New conversation",
+    conversationId: persistence.conversationId || null
+  });
+  const history = persistence.memoryEnabled === false
+    ? []
+    : await store.conversationContext(conversation.id, { limit: MAX_TURNS * 2 });
+  const turn = await store.beginConversationTurn({
+    conversationId: conversation.id,
+    userId: persistence.userId,
+    text: context.text,
+    model: context.selectedModel,
+    providerRequestId: persistence.requestId || null
+  });
+  return { history, conversation, turn, store };
 }
 
-function completionContext(conversationId, text, model, systemPrompt) {
+async function finishPersistentTurn(persistent, answer, model) {
+  if (!persistent?.turn || !persistent.store?.finishConversationTurn) return;
+  await persistent.store.finishConversationTurn({
+    assistantMessageId: persistent.turn.assistantMessageId,
+    content: answer,
+    model
+  });
+}
+
+async function failPersistentTurn(persistent) {
+  if (!persistent?.turn || !persistent.store?.failConversationTurn) return;
+  await persistent.store.failConversationTurn(persistent.turn.assistantMessageId);
+}
+
+function completionContext(conversationId, text, model, systemPrompt, generation = {}) {
   const selectedModel = selectModel(model);
   const modelDefinition = definitionFor(selectedModel);
   const conversationKey = `${conversationId}:${selectedModel}`;
   const resolvedSystemPrompt = typeof systemPrompt === "string" && systemPrompt.trim()
     ? systemPrompt.trim().slice(0, 5000)
     : null;
-  return { conversationId, selectedModel, modelDefinition, conversationKey, text, systemPrompt: resolvedSystemPrompt };
+  const temperature = Number(generation.temperature);
+  const maxTokens = Number(generation.maxTokens);
+  return {
+    conversationId,
+    selectedModel,
+    modelDefinition,
+    conversationKey,
+    text,
+    systemPrompt: resolvedSystemPrompt,
+    temperature: Number.isFinite(temperature) && temperature >= 0 && temperature <= 2 ? temperature : modelDefinition.temperature,
+    maxTokens: Number.isSafeInteger(maxTokens) && maxTokens >= 128 && maxTokens <= 4096 ? maxTokens : modelDefinition.maxTokens
+  };
 }
 
 function modelUnavailable(error) {
@@ -318,7 +346,10 @@ async function completionResponseWithFallback(context, history, apiKey, stream, 
   } catch (error) {
     const fallbackModel = defaultModel();
     if (!modelUnavailable(error) || fallbackModel === context.selectedModel) throw error;
-    const fallbackContext = completionContext(context.conversationId, context.text, fallbackModel, context.systemPrompt);
+    const fallbackContext = completionContext(context.conversationId, context.text, fallbackModel, context.systemPrompt, {
+      temperature: context.temperature,
+      maxTokens: context.maxTokens
+    });
     const fallbackHistory = history;
     await onModelSelected?.(fallbackContext.selectedModel);
     const response = await requestCompletion(
@@ -345,9 +376,9 @@ function completionOptions(context, history, apiKey, stream) {
         ...history,
         { role: "user", content: context.text }
       ],
-      temperature: context.modelDefinition.temperature,
+      temperature: context.temperature,
       top_p: context.modelDefinition.topP,
-      max_tokens: context.modelDefinition.maxTokens,
+      max_tokens: context.maxTokens,
       stream
     })
   };
@@ -428,45 +459,56 @@ export function selectModel(requestedModel) {
   return selected;
 }
 
-export function resetConversation(conversationId) {
-  const prefix = `${conversationId}:`;
-  for (const key of conversations.keys()) {
-    if (key.startsWith(prefix)) conversations.delete(key);
-  }
+export async function resetConversation(conversationId, { userId } = {}) {
+  const store = getPlatformStore();
+  if (!userId || !store?.deleteConversationByScope) return false;
+  return store.deleteConversationByScope(userId, conversationId);
 }
 
-export async function reply({ conversationId, text, model, signal, systemPrompt, history }) {
+export async function reply({ conversationId, text, model, signal, systemPrompt, history, persistence, temperature, maxTokens }) {
   const apiKey = required("NVIDIA_API_KEY");
-  const context = completionContext(conversationId, text, model, systemPrompt);
+  const context = completionContext(conversationId, text, model, systemPrompt, { temperature, maxTokens });
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   return withConversationLock(context.conversationKey, async () => {
     const suppliedHistory = completionHistory(history);
-    const resolvedHistory = suppliedHistory || historyFor(context.conversationKey);
-    const completed = await completionResponseWithFallback(context, resolvedHistory, apiKey, false, { signal, deadline });
-    const { response } = completed;
-    const data = await response.json();
-    const answer = data.choices?.[0]?.message?.content?.trim();
-    if (!answer) throw new Error("NVIDIA API returned an empty response");
-    if (!suppliedHistory) saveHistory(completed.context.conversationKey, completed.history, text, answer);
-    return answer;
+    const persistent = suppliedHistory ? null : await beginPersistentTurn(context, persistence);
+    try {
+      const resolvedHistory = suppliedHistory || persistent?.history || [];
+      const completed = await completionResponseWithFallback(context, resolvedHistory, apiKey, false, { signal, deadline });
+      const { response } = completed;
+      const data = await response.json();
+      const answer = data.choices?.[0]?.message?.content?.trim();
+      if (!answer) throw new Error("NVIDIA API returned an empty response");
+      await finishPersistentTurn(persistent, answer, completed.context.selectedModel);
+      return answer;
+    } catch (error) {
+      await failPersistentTurn(persistent).catch(() => undefined);
+      throw error;
+    }
   });
 }
 
-export async function streamReply({ conversationId, text, model, signal, onDelta, onModelSelected, systemPrompt, history }) {
+export async function streamReply({ conversationId, text, model, signal, onDelta, onModelSelected, systemPrompt, history, persistence, temperature, maxTokens }) {
   const apiKey = required("NVIDIA_API_KEY");
-  const context = completionContext(conversationId, text, model, systemPrompt);
+  const context = completionContext(conversationId, text, model, systemPrompt, { temperature, maxTokens });
   const deadline = Date.now() + REQUEST_DEADLINE_MS;
   return withConversationLock(context.conversationKey, async () => {
     const suppliedHistory = completionHistory(history);
-    const resolvedHistory = suppliedHistory || historyFor(context.conversationKey);
-    const completed = await completionResponseWithFallback(context, resolvedHistory, apiKey, true, {
-      signal,
-      deadline,
-      onModelSelected
-    });
-    const { response } = completed;
-    const answer = await consumeNvidiaStream(response, onDelta);
-    if (!suppliedHistory) saveHistory(completed.context.conversationKey, completed.history, text, answer);
-    return answer;
+    const persistent = suppliedHistory ? null : await beginPersistentTurn(context, persistence);
+    try {
+      const resolvedHistory = suppliedHistory || persistent?.history || [];
+      const completed = await completionResponseWithFallback(context, resolvedHistory, apiKey, true, {
+        signal,
+        deadline,
+        onModelSelected
+      });
+      const { response } = completed;
+      const answer = await consumeNvidiaStream(response, onDelta);
+      await finishPersistentTurn(persistent, answer, completed.context.selectedModel);
+      return answer;
+    } catch (error) {
+      await failPersistentTurn(persistent).catch(() => undefined);
+      throw error;
+    }
   });
 }

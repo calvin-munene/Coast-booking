@@ -554,3 +554,67 @@ test('lists auditable payment and usage history without exposing invoice payload
   assert.equal(usage[0].cost, 1);
   pool.assertDone();
 });
+
+test('persists NVIDIA model and structured user AI settings', async () => {
+  const controlRow = {
+    user_id: '123', banned: false, unlimited_credits: false, persona: null, selected_mode: 'chat',
+    preferred_model: 'meta/llama-3.1-8b-instruct', preferred_language: 'en',
+    response_length: 'concise', creativity: '0.70', memory_enabled: true,
+    custom_instructions: 'Prefer examples'
+  };
+  const pool = new ScriptedPool([
+    { tag: 'BEGIN' },
+    { tag: 'ensure-account' },
+    { tag: 'set-user-model', result: result([controlRow]) },
+    { tag: 'COMMIT' },
+    { tag: 'BEGIN' },
+    { tag: 'ensure-account' },
+    { tag: 'set-user-ai-settings', result: result([controlRow]) },
+    { tag: 'COMMIT' },
+    { tag: 'get-user-control', result: result([controlRow]) },
+  ]);
+  const ledger = createStarLedger({ pool });
+  assert.equal((await ledger.setUserModel('123', 'meta/llama-3.1-8b-instruct')).preferredModel, 'meta/llama-3.1-8b-instruct');
+  const settings = await ledger.setUserAiSettings('123', {
+    preferredModel: 'meta/llama-3.1-8b-instruct',
+    preferredLanguage: 'en',
+    responseLength: 'concise',
+    creativity: 0.7,
+    memoryEnabled: true,
+    customInstructions: 'Prefer examples'
+  });
+  assert.equal(settings.customInstructions, 'Prefer examples');
+  assert.equal((await ledger.getUserControl('123')).responseLength, 'concise');
+  pool.assertDone();
+});
+
+test('billing completion recovery is durable and idempotent after response production', async () => {
+  const reservationId = 'web:123:550e8400-e29b-41d4-a716-446655440000';
+  const pool = new ScriptedPool([
+    {
+      tag: 'transition-reservation',
+      result: result([{ user_id: '123', cost: 1, status: 'generation_started' }]),
+    },
+    {
+      tag: 'transition-reservation',
+      result: result([{ user_id: '123', cost: 1, status: 'response_produced' }]),
+    },
+    {
+      tag: 'transition-reservation',
+      result: result([{ user_id: '123', cost: 1, status: 'completion_pending' }]),
+    },
+    { tag: 'BEGIN' },
+    { tag: 'recover-completions', result: result([{ reservation_id: reservationId }]) },
+    { tag: 'COMMIT' },
+    { tag: 'BEGIN' },
+    { tag: 'recover-completions', result: result([], 0) },
+    { tag: 'COMMIT' },
+  ]);
+  const ledger = createStarLedger({ pool });
+  assert.equal((await ledger.transitionPrompt(reservationId, 'generation_started')).state, 'generation_started');
+  assert.equal((await ledger.transitionPrompt(reservationId, 'response_produced')).state, 'response_produced');
+  assert.equal((await ledger.transitionPrompt(reservationId, 'completion_pending', { errorCode: 'database_unavailable' })).state, 'completion_pending');
+  assert.deepEqual(await ledger.recoverPendingCompletions(), { completedCount: 1, reservationIds: [reservationId] });
+  assert.deepEqual(await ledger.recoverPendingCompletions(), { completedCount: 0, reservationIds: [] });
+  pool.assertDone();
+});

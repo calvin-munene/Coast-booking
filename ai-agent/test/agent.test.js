@@ -11,6 +11,7 @@ import {
   setRuntimeEnabledModels,
   streamReply
 } from "../src/agent.js";
+import { setPlatformStoreForTests } from "../src/platformRuntime.js";
 
 test("exposes an approved NVIDIA model catalog", () => {
   const previousModel = process.env.NVIDIA_MODEL;
@@ -255,4 +256,56 @@ test("falls back once when NVIDIA reports that the selected model is unavailable
   else process.env.NVIDIA_MODEL = previousModel;
   if (previousModels === undefined) delete process.env.NVIDIA_MODELS;
   else process.env.NVIDIA_MODELS = previousModels;
+});
+
+test("persists conversation turns and keeps durable contexts isolated", async () => {
+  const previousFetch = global.fetch;
+  const previousKey = process.env.NVIDIA_API_KEY;
+  process.env.NVIDIA_API_KEY = "nvapi-test";
+  const ids = {
+    "scope-a": "11111111-1111-4111-8111-111111111111",
+    "scope-b": "22222222-2222-4222-8222-222222222222"
+  };
+  const histories = new Map(Object.values(ids).map((id) => [id, []]));
+  const pending = new Map();
+  setPlatformStoreForTests({
+    async getOrCreateConversation({ scopeKey }) { return { id: ids[scopeKey] }; },
+    async conversationContext(id) { return histories.get(id).map((item) => ({ ...item })); },
+    async beginConversationTurn({ conversationId, text }) {
+      const assistantMessageId = conversationId === ids["scope-a"]
+        ? "33333333-3333-4333-8333-333333333333"
+        : "44444444-4444-4444-8444-444444444444";
+      pending.set(assistantMessageId, { conversationId, text });
+      return { assistantMessageId };
+    },
+    async finishConversationTurn({ assistantMessageId, content }) {
+      const turn = pending.get(assistantMessageId);
+      histories.get(turn.conversationId).push(
+        { role: "user", content: turn.text },
+        { role: "assistant", content }
+      );
+      return true;
+    },
+    async failConversationTurn() { return true; }
+  });
+  const requests = [];
+  global.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body).messages);
+    return new Response(JSON.stringify({ choices: [{ message: { content: `answer-${requests.length}` } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  try {
+    await reply({ conversationId: "scope-a", text: "private-alpha", persistence: { userId: "101", channel: "miniapp" } });
+    await reply({ conversationId: "scope-a", text: "follow-up", persistence: { userId: "101", channel: "miniapp" } });
+    await reply({ conversationId: "scope-b", text: "separate-user", persistence: { userId: "202", channel: "miniapp" } });
+    assert.match(requests[1].map(({ content }) => content).join("\n"), /private-alpha/);
+    assert.doesNotMatch(requests[2].map(({ content }) => content).join("\n"), /private-alpha/);
+  } finally {
+    setPlatformStoreForTests(null);
+    global.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.NVIDIA_API_KEY;
+    else process.env.NVIDIA_API_KEY = previousKey;
+  }
 });

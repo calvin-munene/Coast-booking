@@ -1,90 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeAssistantMode } from './assistantModes.js';
+import { initializePlatformFoundation } from './platformRuntime.js';
 
 const MAX_INT64 = 9_223_372_036_854_775_807n;
 const MAX_STAR_AMOUNT = 10_000;
 const DEFAULT_RESERVATION_TTL_MS = 10 * 60 * 1000;
 
-const SCHEMA_SQL = `
-/* star-ledger:schema */
-CREATE TABLE IF NOT EXISTS telegram_star_accounts (
-  user_id BIGINT PRIMARY KEY,
-  balance BIGINT NOT NULL DEFAULT 0 CHECK (balance >= 0),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS telegram_star_payments (
-  telegram_payment_charge_id TEXT PRIMARY KEY,
-  provider_payment_charge_id TEXT,
-  user_id BIGINT NOT NULL REFERENCES telegram_star_accounts(user_id),
-  amount INTEGER NOT NULL CHECK (amount BETWEEN 1 AND 10000),
-  currency TEXT NOT NULL CHECK (currency = 'XTR'),
-  invoice_payload TEXT,
-  credited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  refunded_at TIMESTAMPTZ,
-  refunded_amount INTEGER CHECK (refunded_amount BETWEEN 1 AND 10000)
-);
-
-ALTER TABLE telegram_star_payments
-  ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ;
-ALTER TABLE telegram_star_payments
-  ADD COLUMN IF NOT EXISTS refunded_amount INTEGER
-    CHECK (refunded_amount BETWEEN 1 AND 10000);
-
-CREATE INDEX IF NOT EXISTS telegram_star_payments_user_id_idx
-  ON telegram_star_payments(user_id, credited_at DESC);
-
-CREATE TABLE IF NOT EXISTS telegram_star_terms_acceptances (
-  user_id BIGINT NOT NULL REFERENCES telegram_star_accounts(user_id),
-  terms_version TEXT NOT NULL,
-  accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (user_id, terms_version)
-);
-
-CREATE TABLE IF NOT EXISTS telegram_star_prompt_reservations (
-  reservation_id TEXT PRIMARY KEY,
-  user_id BIGINT NOT NULL REFERENCES telegram_star_accounts(user_id),
-  cost INTEGER NOT NULL CHECK (cost BETWEEN 1 AND 10000),
-  status TEXT NOT NULL DEFAULT 'reserved'
-    CHECK (status IN ('reserved', 'completed', 'restored')),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  completed_at TIMESTAMPTZ,
-  restored_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS telegram_star_prompt_reservations_stale_idx
-  ON telegram_star_prompt_reservations(created_at)
-  WHERE status = 'reserved';
-
-CREATE TABLE IF NOT EXISTS telegram_bot_modes (
-  mode TEXT PRIMARY KEY,
-  enabled BOOLEAN NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS telegram_user_controls (
-  user_id BIGINT PRIMARY KEY REFERENCES telegram_star_accounts(user_id),
-  banned BOOLEAN NOT NULL DEFAULT FALSE,
-  ban_reason TEXT,
-  unlimited_credits BOOLEAN NOT NULL DEFAULT FALSE,
-  persona TEXT,
-  selected_mode TEXT NOT NULL DEFAULT 'chat',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-ALTER TABLE telegram_user_controls
-  ADD COLUMN IF NOT EXISTS selected_mode TEXT NOT NULL DEFAULT 'chat';
-
-CREATE TABLE IF NOT EXISTS ai_provider_usage_buckets (
-  provider_key TEXT NOT NULL,
-  bucket_start TIMESTAMPTZ NOT NULL,
-  used INTEGER NOT NULL CHECK (used >= 0),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (provider_key, bucket_start)
-);
-`;
+const SCHEMA_SQL = '/* star-ledger:schema */ SELECT 1';
 
 export class StarLedgerValidationError extends TypeError {
   constructor(message) {
@@ -181,6 +103,23 @@ function normalizeDateFromClock(now) {
   return date;
 }
 
+function userControlRow(userId, row = {}) {
+  return {
+    userId: normalizeDbInt(row.user_id ?? userId, 'user_id'),
+    banned: row.banned === true,
+    banReason: row.ban_reason ?? null,
+    unlimitedCredits: row.unlimited_credits === true,
+    persona: row.persona ?? null,
+    selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
+    preferredModel: row.preferred_model ?? null,
+    preferredLanguage: row.preferred_language || 'auto',
+    responseLength: row.response_length || 'balanced',
+    creativity: Number(row.creativity ?? 0.4),
+    memoryEnabled: row.memory_enabled !== false,
+    customInstructions: row.custom_instructions ?? null,
+  };
+}
+
 function assertPositiveInteger(value, fieldName, maximum = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new StarLedgerValidationError(`${fieldName} must be an integer between 1 and ${maximum}`);
@@ -234,7 +173,8 @@ export function createStarLedger({
 
   async function init() {
     if (schemaPromise) return schemaPromise;
-    schemaPromise = resolvePool()
+    schemaPromise = (connectionString && !injectedPool ? initializePlatformFoundation() : Promise.resolve())
+      .then(() => resolvePool())
       .then((resolvedPool) => resolvedPool.query(SCHEMA_SQL))
       .then(() => undefined)
       .catch((error) => {
@@ -690,7 +630,9 @@ export function createStarLedger({
       `/* star-ledger:complete-reservation */
        UPDATE telegram_star_prompt_reservations
        SET status = 'completed', completed_at = NOW(), updated_at = NOW()
-       WHERE reservation_id = $1 AND status = 'reserved'
+       WHERE reservation_id = $1 AND status IN (
+         'reserved', 'generation_started', 'response_produced', 'delivery_attempted', 'delivered', 'completion_pending'
+       )
        RETURNING user_id::text, cost, status`,
       [reservationId],
     );
@@ -724,6 +666,58 @@ export function createStarLedger({
     };
   }
 
+  async function transitionPrompt(rawReservationId, nextState, { errorCode = null } = {}) {
+    const reservationId = normalizeNonEmptyString(rawReservationId, 'reservationId', 128);
+    const transitions = {
+      generation_started: { from: ['reserved'], column: 'generation_started_at' },
+      response_produced: { from: ['generation_started', 'reserved'], column: 'response_produced_at' },
+      delivery_attempted: { from: ['response_produced'], column: 'delivery_attempted_at' },
+      delivered: { from: ['delivery_attempted', 'response_produced'], column: 'delivered_at' },
+      completion_pending: { from: ['response_produced', 'delivery_attempted', 'delivered'], column: 'completion_pending_at' },
+      failed: { from: ['reserved', 'generation_started'], column: 'failed_at' },
+    };
+    const transition = transitions[nextState];
+    if (!transition) throw new StarLedgerValidationError('prompt transition is invalid');
+    const normalizedError = normalizeOptionalString(errorCode, 'errorCode', 128);
+    await init();
+    const resolvedPool = await resolvePool();
+    const result = await resolvedPool.query(
+      `/* star-ledger:transition-reservation */
+       UPDATE telegram_star_prompt_reservations
+       SET status = $2, ${transition.column} = NOW(), last_error_code = $3, updated_at = NOW()
+       WHERE reservation_id = $1 AND status = ANY($4::text[])
+       RETURNING user_id::text, cost, status`,
+      [reservationId, nextState, normalizedError, transition.from],
+    );
+    if (result.rowCount) return { changed: true, reservationId, state: result.rows[0].status };
+    const existing = await resolvedPool.query(
+      `/* star-ledger:get-reservation */
+       SELECT user_id::text, cost, status FROM telegram_star_prompt_reservations WHERE reservation_id = $1`,
+      [reservationId],
+    );
+    return { changed: false, reservationId, state: existing.rows[0]?.status ?? null };
+  }
+
+  async function recoverPendingCompletions({ limit = 100 } = {}) {
+    assertPositiveInteger(limit, 'limit', 1_000);
+    return transaction(async (client) => {
+      const result = await client.query(
+        `/* star-ledger:recover-completions */
+         WITH pending AS (
+           SELECT reservation_id FROM telegram_star_prompt_reservations
+           WHERE status IN ('response_produced', 'delivery_attempted', 'delivered', 'completion_pending')
+           ORDER BY updated_at, reservation_id LIMIT $1 FOR UPDATE SKIP LOCKED
+         )
+         UPDATE telegram_star_prompt_reservations AS reservations
+         SET status = 'completed', completed_at = NOW(), updated_at = NOW(), last_error_code = NULL
+         FROM pending WHERE reservations.reservation_id = pending.reservation_id
+         RETURNING reservations.reservation_id`,
+        [limit],
+      );
+      return { completedCount: result.rowCount, reservationIds: result.rows.map((row) => row.reservation_id) };
+    });
+  }
+
   async function restorePrompt(rawReservationId) {
     const reservationId = normalizeNonEmptyString(rawReservationId, 'reservationId', 128);
     return transaction(async (client) => {
@@ -750,7 +744,7 @@ export function createStarLedger({
 
       const userId = normalizeDbInt(row.user_id, 'reservation user_id');
       const cost = Number(row.cost);
-      if (row.status !== 'reserved') {
+      if (!['reserved', 'generation_started', 'failed'].includes(row.status)) {
         const balanceResult = await client.query(
           `/* star-ledger:get-balance-client */
            SELECT balance::text FROM telegram_star_accounts WHERE user_id = $1`,
@@ -771,7 +765,7 @@ export function createStarLedger({
         `/* star-ledger:restore-reservation */
          UPDATE telegram_star_prompt_reservations
          SET status = 'restored', restored_at = NOW(), updated_at = NOW()
-         WHERE reservation_id = $1 AND status = 'reserved'`,
+         WHERE reservation_id = $1 AND status IN ('reserved', 'generation_started', 'failed')`,
         [reservationId],
       );
       const balanceResult = await client.query(
@@ -805,7 +799,7 @@ export function createStarLedger({
          WITH stale AS (
            SELECT reservation_id
            FROM telegram_star_prompt_reservations
-           WHERE status = 'reserved' AND created_at < $1
+           WHERE status IN ('reserved', 'generation_started', 'failed') AND created_at < $1
            ORDER BY created_at
            LIMIT $2
            FOR UPDATE SKIP LOCKED
@@ -814,7 +808,7 @@ export function createStarLedger({
          SET status = 'restored', restored_at = NOW(), updated_at = NOW()
          FROM stale
          WHERE reservations.reservation_id = stale.reservation_id
-           AND reservations.status = 'reserved'
+           AND reservations.status IN ('reserved', 'generation_started', 'failed')
          RETURNING reservations.user_id::text, reservations.cost`,
         [cutoff, limit],
       );
@@ -909,7 +903,9 @@ export function createStarLedger({
     const resolvedPool = await resolvePool();
     const result = await resolvedPool.query(
       `/* star-ledger:list-usage */
-       SELECT reservation_id, user_id::text, cost, status, created_at, completed_at, restored_at, updated_at
+       SELECT reservation_id, user_id::text, cost, status, created_at, completed_at, restored_at,
+              generation_started_at, response_produced_at, delivery_attempted_at, delivered_at,
+              completion_pending_at, failed_at, updated_at
        FROM telegram_star_prompt_reservations
        WHERE ($1::bigint IS NULL OR user_id = $1::bigint)
        ORDER BY created_at DESC, reservation_id DESC
@@ -924,6 +920,12 @@ export function createStarLedger({
       createdAt: row.created_at,
       completedAt: row.completed_at || null,
       restoredAt: row.restored_at || null,
+      generationStartedAt: row.generation_started_at || null,
+      responseProducedAt: row.response_produced_at || null,
+      deliveryAttemptedAt: row.delivery_attempted_at || null,
+      deliveredAt: row.delivered_at || null,
+      completionPendingAt: row.completion_pending_at || null,
+      failedAt: row.failed_at || null,
       updatedAt: row.updated_at,
     }));
   }
@@ -1011,20 +1013,15 @@ export function createStarLedger({
     const resolvedPool = await resolvePool();
     const result = await resolvedPool.query(
       `/* star-ledger:get-user-control */
-       SELECT banned, ban_reason, unlimited_credits, persona, selected_mode
+       SELECT user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode,
+              preferred_model, preferred_language, response_length, creativity,
+              memory_enabled, custom_instructions
        FROM telegram_user_controls
        WHERE user_id = $1`,
       [userId],
     );
     const row = result.rows[0] || {};
-    return {
-      userId,
-      banned: row.banned === true,
-      banReason: row.ban_reason ?? null,
-      unlimitedCredits: row.unlimited_credits === true,
-      persona: row.persona ?? null,
-      selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
-    };
+    return userControlRow(userId, row);
   }
 
   async function setUserBan(rawUserId, rawBanned, rawReason = null) {
@@ -1039,18 +1036,12 @@ export function createStarLedger({
          VALUES ($1, $2, $3, NOW())
          ON CONFLICT (user_id)
          DO UPDATE SET banned = EXCLUDED.banned, ban_reason = EXCLUDED.ban_reason, updated_at = NOW()
-         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode`,
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode,
+                   preferred_model, preferred_language, response_length, creativity, memory_enabled, custom_instructions`,
         [userId, banned, reason],
       );
       const row = result.rows[0];
-      return {
-        userId: normalizeDbInt(row.user_id, 'user_id'),
-        banned: row.banned === true,
-        banReason: row.ban_reason ?? null,
-        unlimitedCredits: row.unlimited_credits === true,
-        persona: row.persona ?? null,
-        selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
-      };
+      return userControlRow(userId, row);
     });
   }
 
@@ -1065,18 +1056,12 @@ export function createStarLedger({
          VALUES ($1, $2, NOW())
          ON CONFLICT (user_id)
          DO UPDATE SET persona = EXCLUDED.persona, updated_at = NOW()
-         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode`,
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode,
+                   preferred_model, preferred_language, response_length, creativity, memory_enabled, custom_instructions`,
         [userId, persona],
       );
       const row = result.rows[0];
-      return {
-        userId: normalizeDbInt(row.user_id, 'user_id'),
-        banned: row.banned === true,
-        banReason: row.ban_reason ?? null,
-        unlimitedCredits: row.unlimited_credits === true,
-        persona: row.persona ?? null,
-        selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
-      };
+      return userControlRow(userId, row);
     });
   }
 
@@ -1091,18 +1076,64 @@ export function createStarLedger({
          VALUES ($1, $2, NOW())
          ON CONFLICT (user_id)
          DO UPDATE SET selected_mode = EXCLUDED.selected_mode, updated_at = NOW()
-         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode`,
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode,
+                   preferred_model, preferred_language, response_length, creativity, memory_enabled, custom_instructions`,
         [userId, selectedMode],
       );
       const row = result.rows[0];
-      return {
-        userId: normalizeDbInt(row.user_id, 'user_id'),
-        banned: row.banned === true,
-        banReason: row.ban_reason ?? null,
-        unlimitedCredits: row.unlimited_credits === true,
-        persona: row.persona ?? null,
-        selectedMode: normalizeAssistantMode(row.selected_mode || 'chat', { fallback: 'chat' }),
-      };
+      return userControlRow(userId, row);
+    });
+  }
+
+  async function setUserModel(rawUserId, rawModel) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const preferredModel = normalizeOptionalString(rawModel, 'preferredModel', 200);
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const result = await client.query(
+        `/* star-ledger:set-user-model */
+         INSERT INTO telegram_user_controls (user_id, preferred_model, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id)
+         DO UPDATE SET preferred_model = EXCLUDED.preferred_model, updated_at = NOW()
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode,
+                   preferred_model, preferred_language, response_length, creativity, memory_enabled, custom_instructions`,
+        [userId, preferredModel],
+      );
+      return userControlRow(userId, result.rows[0]);
+    });
+  }
+
+  async function setUserAiSettings(rawUserId, settings = {}) {
+    const userId = normalizeTelegramUserId(rawUserId);
+    const preferredModel = normalizeOptionalString(settings.preferredModel, 'preferredModel', 200);
+    const language = normalizeOptionalString(settings.preferredLanguage ?? 'auto', 'preferredLanguage', 32) || 'auto';
+    const responseLength = String(settings.responseLength ?? 'balanced');
+    if (!['concise', 'balanced', 'detailed'].includes(responseLength)) throw new StarLedgerValidationError('responseLength is invalid');
+    const creativity = Number(settings.creativity ?? 0.4);
+    if (!Number.isFinite(creativity) || creativity < 0 || creativity > 2) throw new StarLedgerValidationError('creativity must be between 0 and 2');
+    const memoryEnabled = settings.memoryEnabled === undefined ? true : normalizeBoolean(settings.memoryEnabled, 'memoryEnabled');
+    const customInstructions = normalizeOptionalString(settings.customInstructions, 'customInstructions', 2000);
+    return transaction(async (client) => {
+      await ensureAccount(client, userId);
+      const result = await client.query(
+        `/* star-ledger:set-user-ai-settings */
+         INSERT INTO telegram_user_controls (
+           user_id, preferred_model, preferred_language, response_length, creativity, memory_enabled, custom_instructions, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (user_id) DO UPDATE SET
+           preferred_model = COALESCE(EXCLUDED.preferred_model, telegram_user_controls.preferred_model),
+           preferred_language = EXCLUDED.preferred_language,
+           response_length = EXCLUDED.response_length,
+           creativity = EXCLUDED.creativity,
+           memory_enabled = EXCLUDED.memory_enabled,
+           custom_instructions = EXCLUDED.custom_instructions,
+           updated_at = NOW()
+         RETURNING user_id::text, banned, ban_reason, unlimited_credits, persona, selected_mode,
+                   preferred_model, preferred_language, response_length, creativity, memory_enabled, custom_instructions`,
+        [userId, preferredModel, language, responseLength, creativity, memoryEnabled, customInstructions],
+      );
+      return userControlRow(userId, result.rows[0]);
     });
   }
 
@@ -1128,6 +1159,8 @@ export function createStarLedger({
     hasAcceptedTerms,
     reservePrompt,
     completePrompt,
+    transitionPrompt,
+    recoverPendingCompletions,
     restorePrompt,
     refundStaleReservations,
     reserveProviderCapacity,
@@ -1140,6 +1173,8 @@ export function createStarLedger({
     setUserBan,
     setUserPersona,
     setUserMode,
+    setUserModel,
+    setUserAiSettings,
     close,
   };
 }

@@ -32,3 +32,27 @@ test("migration checksum drift rolls back without applying modified history", as
   assert.ok(fake.queries.some(({ sql }) => sql === "ROLLBACK"));
   assert.equal(fake.queries.at(-1).sql, "RELEASE");
 });
+
+test("stabilization migration is additive and upgrades an existing migration history", async () => {
+  const baseline = migrationPool();
+  await runMigrations(baseline.pool, { migrations: PLATFORM_MIGRATIONS.slice(0, 4) });
+  const existingRows = baseline.queries
+    .filter(({ sql }) => String(sql).includes("INSERT INTO app_schema_migrations"))
+    .map(({ values }) => ({ version: values[0], checksum: values[1] }));
+  const upgrade = migrationPool(existingRows);
+  const result = await runMigrations(upgrade.pool);
+  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services"]);
+  const stabilizationSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071505_stabilization_foundation").sql;
+  assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversations/);
+  assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversation_messages/);
+  assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS durable_leases/);
+  assert.match(stabilizationSql, /ADD COLUMN IF NOT EXISTS response_produced_at/);
+  assert.doesNotMatch(stabilizationSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM telegram_star_accounts/i);
+  const operatingSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071701_operating_services").sql;
+  assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS telegram_groups/);
+  assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS group_moderation_actions/);
+  assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS guard_join_requests/);
+  assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS secretary_reminders/);
+  assert.match(operatingSql, /CREATE TABLE IF NOT EXISTS managed_bot_credentials/);
+  assert.doesNotMatch(operatingSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
+});

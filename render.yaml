@@ -6,7 +6,7 @@ services:
     plan: free
     buildCommand: npm ci
     startCommand: npm start
-    healthCheckPath: /health
+    healthCheckPath: /health/ready
     autoDeployTrigger: commit
     envVars:
       - key: NODE_VERSION
@@ -51,6 +51,12 @@ services:
         sync: false
       - key: PUBLIC_URL
         value: https://nvidbot.onrender.com
+      - key: TRUST_PROXY
+        value: render
+      - key: BOT_CREDENTIAL_ENCRYPTION_KEY
+        sync: false
+      - key: BOT_CREDENTIAL_KEY_VERSION
+        value: v1
       - key: WHATSAPP_ACCESS_TOKEN
         sync: false
       - key: WHATSAPP_PHONE_NUMBER_ID

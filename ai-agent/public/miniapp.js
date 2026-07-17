@@ -181,8 +181,10 @@ function quickAction(label, description, path, status = "OPEN") {
   ]);
 }
 
-function renderHome() {
+async function renderHome() {
   const dashboard = state.dashboard;
+  const allowanceData = await api("/api/usage/allowance?channel=telegram_private").catch(() => ({ allowance: null }));
+  const allowance = allowanceData.allowance;
   const role = dashboard.platformRole?.replaceAll("_", " ") || (dashboard.isAdmin ? "super admin" : "standard user");
   const credits = dashboard.unlimitedCredits ? "Unlimited" : String(dashboard.balance ?? "0");
   const modes = Object.entries(dashboard.modes || {});
@@ -193,12 +195,18 @@ function renderHome() {
       node("p", { text: `Authenticated as Telegram user ${dashboard.userId}. Model controls, billing history, and AI operations stay bound to this verified session.` }),
       node("div", { className: "button-row" }, [routeLink("Start AI chat", "/chat", "button primary"), routeLink("View usage", "/usage", "button")])
     ]),
-    node("section", { className: "stats" }, [stat("Platform role", role), stat("AI credits", credits), stat("Assistant mode", dashboard.selectedMode || "chat")]),
+    node("section", { className: "stats" }, [
+      stat("Plan", allowanceData.plan || dashboard.plan || "standard"),
+      stat("Free requests", allowance ? `${allowance.remaining}/${allowance.freeLimit}` : "2/hour"),
+      stat("AI credits", credits),
+      stat("Assistant mode", dashboard.selectedMode || "chat")
+    ]),
     node("section", { className: "section" }, [sectionTitle("Operational modes", "View all", "/settings"), node("div", { className: "grid" }, modes.slice(0, 6).map(modeCard))]),
     node("section", { className: "section" }, [sectionTitle("Quick actions"), node("div", { className: "grid" }, [
       quickAction("NVIDIA Models", "Choose from administrator-approved models.", "/models"),
       quickAction("Mode Studio", "Tune Nvid AI for coding, research, documents, translation, or executive work.", "/assistants"),
       quickAction("Payments", "Review your Telegram Stars payment ledger.", "/payments"),
+      quickAction("Vouchers", "Redeem secure Nvid AI credit vouchers.", "/vouchers"),
       quickAction("Managed Groups", "Live moderation, Guard, rules, and permission status.", "/groups"),
       quickAction("Secretary", "Durable reminders delivered inside authorized Telegram chats.", "/secretary"),
       ...(dashboard.platformAdmin ? [quickAction("Admin Console", "Platform health, models, features, billing, and logs.", "/admin")] : [])
@@ -256,6 +264,8 @@ async function renderChat() {
     if (!prompt || state.chatAbort) return;
     haptic("medium");
     output.textContent = "";
+    output.classList.add("streaming");
+    output.dataset.status = "Connecting to NVIDIA";
     send.disabled = true;
     stop.disabled = false;
     state.chatAbort = new AbortController();
@@ -288,7 +298,10 @@ async function renderChat() {
           const raw = frame.match(/^data:\s*(.+)$/m)?.[1];
           if (!raw) continue;
           const payload = JSON.parse(raw);
-          if (event === "delta") output.textContent += payload.text || "";
+          if (event === "delta") {
+            output.textContent += payload.text || "";
+            output.dataset.status = "Streaming live";
+          }
           if (event === "meta" && payload.model) {
             model.value = payload.model;
             if (payload.mode) assistantMode.value = payload.mode;
@@ -307,6 +320,8 @@ async function renderChat() {
       if (error.name !== "AbortError") showToast(error.message);
     } finally {
       state.chatAbort = null;
+      output.classList.remove("streaming");
+      delete output.dataset.status;
       send.disabled = false;
       stop.disabled = true;
     }
@@ -317,7 +332,7 @@ async function renderChat() {
   newConversation.addEventListener("click", () => {
     state.activeConversationId = "";
     sessionStorage.removeItem("nvidbotActiveConversation");
-    output.textContent += `${output.textContent ? "\n\n" : ""}YOU\n${prompt}\n\nNVID AI\n`;
+    output.textContent = "";
     message.value = "";
     showToast("New conversation ready");
   });
@@ -461,6 +476,37 @@ async function renderBilling(kind) {
   );
 }
 
+async function renderVouchers() {
+  const allowanceData = await api("/api/usage/allowance?channel=telegram_private");
+  const code = node("input", { maxlength: "100", autocomplete: "off", placeholder: "NVID-XXXX-XXXX-XXXX-XXXX" });
+  const result = node("div", { className: "notice", text: "Voucher codes are applied atomically and can only be redeemed within their campaign rules." });
+  const redeem = node("button", { className: "button primary", type: "button", text: "Redeem voucher" });
+  redeem.addEventListener("click", async () => {
+    redeem.disabled = true;
+    try {
+      const response = await api("/api/vouchers/redeem", { method: "POST", body: { code: code.value.trim() } });
+      result.textContent = `${response.redemption.creditsAdded} credits added. New balance: ${response.redemption.balance}.`;
+      code.value = "";
+      haptic("medium");
+    } catch (error) { result.textContent = error.message; } finally { redeem.disabled = false; }
+  });
+  app.replaceChildren(
+    pageHead("Credits & Vouchers", "Redeem administrator-issued codes without exposing voucher secrets or payment credentials."),
+    node("section", { className: "stats" }, [
+      stat("Credit balance", allowanceData.balance || state.dashboard.balance || "0"),
+      stat("Free remaining", String(allowanceData.allowance?.remaining ?? 2)),
+      stat("Refresh window", `${Math.round((allowanceData.allowance?.windowSeconds || 3600) / 60)} min`)
+    ]),
+    node("section", { className: "card voucher-console" }, [
+      node("p", { className: "eyebrow", text: "SECURE CREDIT REDEMPTION" }),
+      node("h3", { text: "Enter your Nvid AI voucher" }),
+      node("div", { className: "field" }, [node("label", { text: "Voucher code" }), code]),
+      node("div", { className: "button-row" }, [redeem, routeLink("Payment history", "/payments", "button")]),
+      result
+    ])
+  );
+}
+
 async function renderConversations() {
   const data = await api("/api/conversations?limit=100");
   const search = node("input", { type: "search", placeholder: "Search conversations", maxlength: "160" });
@@ -563,7 +609,7 @@ function booleanSetting(label, checked) {
 }
 
 async function renderGroup(chatId) {
-  const data = await api(`/api/groups/${chatId}`);
+  const [data, modelData] = await Promise.all([api(`/api/groups/${chatId}`), api("/api/models")]);
   const group = data.group;
   const settings = data.settings;
   const activationPolicy = node("select");
@@ -580,6 +626,20 @@ async function renderGroup(chatId) {
     if (mode.enabled) assistantMode.append(node("option", { value: mode.id, text: mode.label }));
   }
   assistantMode.value = settings.defaultMode || "chat";
+  const groupModel = node("select");
+  for (const item of modelData.models || []) groupModel.append(node("option", { value: item.id, text: item.label || item.id }));
+  groupModel.value = settings.groupModel || modelData.defaultModel;
+  const groupTone = node("select");
+  for (const value of ["adaptive", "formal", "friendly", "casual", "concise"]) groupTone.append(node("option", { value, text: value }));
+  groupTone.value = settings.groupTone || "adaptive";
+  const groupLanguage = node("input", { maxlength: "32", value: settings.groupLanguage || "auto" });
+  const groupResponseLength = node("select");
+  for (const value of ["concise", "balanced", "detailed"]) groupResponseLength.append(node("option", { value, text: value }));
+  groupResponseLength.value = settings.groupResponseLength || "balanced";
+  const groupCreativity = node("input", { type: "number", min: "0", max: "1", step: "0.1", value: String(settings.groupCreativity ?? 0.4) });
+  const groupInstructions = node("textarea", { maxlength: "4000", placeholder: "Instructions used only in this group" });
+  groupInstructions.value = settings.groupInstructions || "";
+  const allowedTopics = node("input", { maxlength: "1000", placeholder: "Optional comma-separated topics", value: (settings.allowedTopics || []).join(", ") });
   const moderation = booleanSetting("Moderation", settings.moderationEnabled);
   const guard = booleanSetting("Guard queue", settings.guardEnabled);
   const secretary = booleanSetting("Group Secretary", settings.secretaryEnabled);
@@ -588,6 +648,7 @@ async function renderGroup(chatId) {
   const threadIsolation = booleanSetting("Isolate every topic and thread", settings.threadIsolationEnabled !== false);
   const welcome = booleanSetting("Welcome messages", settings.welcomeEnabled);
   const goodbye = booleanSetting("Goodbye messages", settings.goodbyeEnabled);
+  const captcha = booleanSetting("Verify first-time AI users with CAPTCHA", settings.captchaEnabled !== false);
   const retentionDays = node("input", { type: "number", min: "1", max: "90", value: String(settings.retentionDays || 7) });
   const rules = node("textarea", { maxlength: "10000", placeholder: "Group rules" });
   rules.value = settings.rules || "";
@@ -614,6 +675,14 @@ async function renderGroup(chatId) {
             activationPolicy: activationPolicy.value,
             alwaysOnConfirmed: activationPolicy.value === "always_on",
             defaultMode: assistantMode.value,
+            groupModel: groupModel.value,
+            groupTone: groupTone.value,
+            groupLanguage: groupLanguage.value.trim() || "auto",
+            groupResponseLength: groupResponseLength.value,
+            groupCreativity: Number(groupCreativity.value),
+            groupInstructions: groupInstructions.value.trim() || null,
+            allowedTopics: allowedTopics.value.split(",").map((value) => value.trim()).filter(Boolean),
+            captchaEnabled: captcha.input.checked,
             welcomeEnabled: welcome.input.checked,
             goodbyeEnabled: goodbye.input.checked,
             welcomeMessage: welcomeMessage.value.trim() || null,
@@ -683,9 +752,18 @@ async function renderGroup(chatId) {
       node("p", { text: "Normal group conversation is ignored unless this activation policy explicitly invokes Nvid AI." }),
       node("div", { className: "field" }, [node("label", { text: "Activation policy" }), activationPolicy]),
       node("div", { className: "field" }, [node("label", { text: "Group assistant" }), assistantMode]),
+      node("div", { className: "settings-grid" }, [
+        node("div", { className: "field" }, [node("label", { text: "Group NVIDIA model" }), groupModel]),
+        node("div", { className: "field" }, [node("label", { text: "Group tone" }), groupTone]),
+        node("div", { className: "field" }, [node("label", { text: "Group language" }), groupLanguage]),
+        node("div", { className: "field" }, [node("label", { text: "Response length" }), groupResponseLength]),
+        node("div", { className: "field" }, [node("label", { text: "Creativity" }), groupCreativity])
+      ]),
+      node("div", { className: "field" }, [node("label", { text: "Group-only AI instructions" }), groupInstructions]),
+      node("div", { className: "field" }, [node("label", { text: "Allowed topics" }), allowedTopics]),
       moderation.element, guard.element, secretary.element, secretaryObservation.element, messageStorage.element,
       node("div", { className: "field" }, [node("label", { text: "Secretary retention (days)" }), retentionDays]),
-      threadIsolation.element, welcome.element, goodbye.element,
+      threadIsolation.element, captcha.element, welcome.element, goodbye.element,
       node("div", { className: "field" }, [node("label", { text: "Welcome message" }), welcomeMessage]),
       node("div", { className: "field" }, [node("label", { text: "Rules" }), rules]), save
     ]),
@@ -765,13 +843,75 @@ async function renderSecretary() {
     node("button", { className: "button danger", type: "button", text: "Pause", onclick: async () => { await api(`/api/secretary/jobs/${job.job_id}`, { method: "DELETE" }); await renderSecretary(); } })
   ]));
   const connections = connectionData.connections || [];
-  const connectionCards = connections.map((connection) => node("article", { className: "list-item" }, [
+  const contactLists = await Promise.all(connections.map((connection) => api(`/api/secretary/connections/${encodeURIComponent(connection.connectionId)}/contacts?limit=25`).catch(() => ({ contacts: [] }))));
+  const legacyConnectionCards = connections.map((connection) => node("article", { className: "list-item" }, [
     node("div", {}, [
       node("h3", { text: "Telegram Business connection" }),
       node("p", { text: `${connection.enabled ? "Connected" : "Disconnected"} · Reply permission ${connection.canReply ? "granted" : "missing"} · verified ${verifiedTime(connection.lastVerifiedAt)}` })
     ]),
     badge(connection.enabled && connection.canReply ? "ACTIVE" : "ACTION", connection.enabled && connection.canReply ? "" : "danger")
   ]));
+  const connectionCards = connections.map((connection, connectionIndex) => {
+    const style = node("select");
+    for (const value of ["friendly", "formal", "concise", "custom"]) style.append(node("option", { value, text: value }));
+    style.value = connection.businessStyle || "friendly";
+    const language = node("input", { maxlength: "32", value: connection.defaultLanguage || "auto" });
+    const autoReply = node("input", { type: "checkbox" });
+    autoReply.checked = connection.autoReplyEnabled === true;
+    autoReply.disabled = !connection.accessActive || !connection.enabled || !connection.canReply;
+    const endpoint = `/api/secretary/connections/${encodeURIComponent(connection.connectionId)}`;
+    const requestAccess = node("button", { className: "button", type: "button", text: "Request approval" });
+    requestAccess.disabled = connection.accessActive;
+    requestAccess.addEventListener("click", async () => {
+      try { await api(`${endpoint}/request-access`, { method: "POST", body: {} }); showToast("Approval request sent"); await renderSecretary(); } catch (error) { showToast(error.message); }
+    });
+    const pay = node("button", { className: "button primary", type: "button", text: "Activate for 500 Stars" });
+    pay.disabled = connection.accessActive;
+    pay.addEventListener("click", async () => {
+      if (!window.confirm("Send a secure Telegram invoice for exactly 500 Stars? Secretary AI usage will still follow your allowance and credits.")) return;
+      try { await api(`${endpoint}/invoice`, { method: "POST", body: {} }); showToast("500-Star invoice sent to Telegram"); } catch (error) { showToast(error.message); }
+    });
+    const save = node("button", { className: "button", type: "button", text: "Save Secretary profile" });
+    save.addEventListener("click", async () => {
+      try {
+        await api(`${endpoint}/settings`, { method: "POST", body: { businessStyle: style.value, defaultLanguage: language.value.trim() || "auto", autoReplyEnabled: autoReply.checked } });
+        showToast("Adaptive Secretary settings saved");
+        await renderSecretary();
+      } catch (error) { showToast(error.message); }
+    });
+    const contactControls = (contactLists[connectionIndex]?.contacts || []).map((contact) => {
+      const contactLanguage = node("input", { maxlength: "32", value: contact.language_override || "" , placeholder: "auto" });
+      const contactMemory = node("input", { type: "checkbox" });
+      contactMemory.checked = contact.memory_enabled !== false;
+      const update = node("button", { className: "button", type: "button", text: "Save contact" });
+      update.addEventListener("click", async () => {
+        try {
+          await api(`${endpoint}/contacts/${contact.contact_chat_id}`, { method: "PATCH", body: { languageOverride: contactLanguage.value.trim() || null, memoryEnabled: contactMemory.checked } });
+          showToast("Contact language and memory controls saved");
+        } catch (error) { showToast(error.message); }
+      });
+      return node("article", { className: "contact-control" }, [
+        node("code", { text: `Contact ${contact.contact_chat_id}` }),
+        node("div", { className: "field" }, [node("label", { text: "Language override" }), contactLanguage]),
+        node("label", { className: "setting-switch" }, [node("span", { text: "Memory enabled" }), contactMemory]),
+        update
+      ]);
+    });
+    return node("article", { className: "secretary-connection" }, [
+      node("div", { className: "capability-head" }, [
+        node("div", {}, [node("h3", { text: "Telegram Business connection" }), node("p", { text: `${connection.enabled ? "Connected" : "Disconnected"} · Reply right ${connection.canReply ? "granted" : "missing"} · verified ${verifiedTime(connection.lastVerifiedAt)}` })]),
+        badge(displayStatus(connection.accessStatus), connection.accessActive ? "" : "danger")
+      ]),
+      node("div", { className: "settings-grid" }, [
+        node("div", { className: "field" }, [node("label", { text: "Business tone" }), style]),
+        node("div", { className: "field" }, [node("label", { text: "Default language" }), language]),
+        node("div", { className: "field inline-field" }, [node("label", { text: "Automatic replies" }), autoReply])
+      ]),
+      node("div", { className: "button-row" }, [requestAccess, pay, save]),
+      contactControls.length ? node("details", { className: "contact-controls" }, [node("summary", { text: `Contact controls (${contactControls.length})` }), ...contactControls]) : null
+    ]);
+  });
+  void legacyConnectionCards;
   app.replaceChildren(
     pageHead("Secretary", "Telegram Business Secretary and Group Secretary are distinct, permission-bound operating contexts."),
     node("section", { className: "section" }, [sectionTitle("Telegram Secretary connections"), connections.length
@@ -830,17 +970,7 @@ async function renderAdminUsers() {
   const list = node("section", { className: "list" });
   const draw = (users) => list.replaceChildren(...users.map((user) => {
     const manage = node("button", { className: "button", type: "button", text: "Manage" });
-    manage.addEventListener("click", async () => {
-      const detail = await api(`/api/admin/users/${user.userId}`);
-      const note = window.prompt("Internal note (optional)", "") || undefined;
-      const role = state.dashboard.platformRole === "super_admin" ? window.prompt("Platform role", detail.user.role)?.trim() : undefined;
-      if (state.dashboard.platformRole === "super_admin" && !role) return;
-      try {
-        await api(`/api/admin/users/${user.userId}`, { method: "PATCH", body: { requestId: requestId(), role, note } });
-        showToast("User access updated and audited");
-        await renderAdminUsers();
-      } catch (error) { showToast(error.message); }
-    });
+    manage.addEventListener("click", () => navigate(`/admin/user/${user.userId}`));
     const privileged = [];
     if (state.dashboard.platformRole === "super_admin") {
       const credits = node("button", { className: "button", type: "button", text: "Credits" });
@@ -872,11 +1002,93 @@ async function renderAdminUsers() {
   app.replaceChildren(pageHead("User Management", "Roles, bans, unlimited access, credits, and internal notes are enforced server-side and audited."), node("section", { className: "card" }, [search]), list);
 }
 
+async function renderAdminUserDetail(userId) {
+  const data = await api(`/api/admin/users/${userId}`);
+  const detail = data.user;
+  const profile = detail.profile || detail;
+  const mutate = async (changes) => {
+    await api(`/api/admin/users/${userId}`, { method: "PATCH", body: { requestId: requestId(), ...changes } });
+    showToast("User account updated and audited");
+    await renderAdminUserDetail(userId);
+  };
+  const actions = [];
+  if (state.dashboard.platformRole === "super_admin") {
+    const role = node("select");
+    for (const value of ["super_admin", "admin", "moderator", "support", "premium_user", "standard_user", "restricted_user", "banned_user"]) role.append(node("option", { value, text: value.replaceAll("_", " ") }));
+    role.value = profile.role || "standard_user";
+    actions.push(node("div", { className: "field" }, [node("label", { text: "Platform role" }), role]), node("button", { className: "button", type: "button", text: "Save role", onclick: () => mutate({ role: role.value }) }));
+    actions.push(node("button", { className: "button", type: "button", text: profile.unlimited_credits ? "Remove unlimited" : "Grant unlimited", onclick: () => mutate({ unlimitedCredits: !profile.unlimited_credits }) }));
+    actions.push(node("button", { className: "button", type: "button", text: "Adjust credits", onclick: async () => {
+      const creditDelta = Number(window.prompt("Credit adjustment (negative or positive whole number)", "0"));
+      if (Number.isSafeInteger(creditDelta) && creditDelta !== 0) await mutate({ creditDelta, note: `Manual credit adjustment: ${creditDelta}` });
+    } }));
+  }
+  actions.push(node("button", { className: "button danger", type: "button", text: profile.role === "banned_user" || profile.status === "banned" ? "Unban user" : "Ban user", onclick: () => mutate({ banned: !(profile.role === "banned_user" || profile.status === "banned"), banReason: "Administrator dashboard action" }) }));
+  const usageRows = (detail.usage || []).map((row) => historyItem(`${row.channel} · ${row.billing_source}`, `${row.count} request events`, row.status.toUpperCase(), row.status === "failed"));
+  app.replaceChildren(
+    pageHead(profile.username ? `@${profile.username}` : `Telegram user ${userId}`, "Tenant-safe account details, entitlements, billing metadata, and aggregated usage."),
+    node("section", { className: "stats" }, [stat("Role", profile.role || "standard_user"), stat("Plan", profile.plan || "standard"), stat("Credits", profile.balance || "0"), stat("Verified", profile.verified ? "Yes" : "No")]),
+    node("section", { className: "card" }, [node("h3", { text: [profile.first_name, profile.last_name].filter(Boolean).join(" ") || "Telegram account" }), node("p", { text: `First seen ${verifiedTime(profile.created_at)} · Last active ${verifiedTime(profile.last_seen_at)}` }), node("div", { className: "button-row" }, actions)]),
+    node("section", { className: "section" }, [sectionTitle("Usage by channel"), usageRows.length ? node("div", { className: "list" }, usageRows) : node("p", { className: "notice", text: "No AI usage events." })])
+  );
+}
+
+async function renderAdminAnalytics() {
+  const data = await api("/api/admin/analytics");
+  const metrics = data.analytics || {};
+  const cards = Object.entries(metrics).map(([key, value]) => stat(key.replaceAll("_", " "), String(value ?? 0)));
+  app.replaceChildren(
+    pageHead("Platform Analytics", "Aggregated users, groups, Secretary activations, Stars, credits, vouchers, and provider usage—without raw conversations."),
+    node("section", { className: "analytics-grid" }, cards)
+  );
+}
+
+async function renderAdminAccessRequests() {
+  const data = await api("/api/admin/access-requests?limit=100");
+  const rows = (data.requests || []).map((request) => {
+    const decide = async (decision) => {
+      await api(`/api/admin/access-requests/${request.requestId}`, { method: "POST", body: { decision, reason: `${decision} from the Nvid AI admin dashboard` } });
+      await renderAdminAccessRequests();
+    };
+    return node("article", { className: "list-item" }, [
+      node("div", {}, [node("h3", { text: request.username ? `@${request.username}` : `User ${request.ownerUserId}` }), node("p", { text: `${displayStatus(request.status)} · ${verifiedTime(request.createdAt)}` })]),
+      request.status === "pending" ? node("div", { className: "button-row" }, [node("button", { className: "button primary", type: "button", text: "Approve", onclick: () => decide("approve") }), node("button", { className: "button danger", type: "button", text: "Deny", onclick: () => decide("deny") })]) : badge(displayStatus(request.status))
+    ]);
+  });
+  app.replaceChildren(pageHead("Secretary Access", "Approve or deny Telegram Business Secretary connections with a durable audit trail."), rows.length ? node("section", { className: "list" }, rows) : node("section", { className: "empty-state" }, [node("h2", { text: "No access requests" })]));
+}
+
+async function renderAdminVouchers() {
+  const data = await api("/api/admin/vouchers?limit=100");
+  const amount = node("input", { type: "number", min: "1", max: "1000000", value: "10" });
+  const uses = node("input", { type: "number", min: "1", max: "1000000", value: "1" });
+  const result = node("pre", { className: "one-time-secret", text: "The generated code will appear here once." });
+  const create = node("button", { className: "button primary", type: "button", text: "Generate secure voucher" });
+  create.addEventListener("click", async () => {
+    try {
+      const response = await api("/api/admin/vouchers", { method: "POST", body: { requestId: requestId(), creditAmount: Number(amount.value), maximumRedemptions: Number(uses.value), perUserLimit: 1 } });
+      result.textContent = response.voucher.code || "This request was already processed. The one-time code cannot be displayed again.";
+      showToast(response.voucher.duplicate ? "Voucher request was already processed." : "Voucher created. Copy the one-time code now.");
+    } catch (error) { showToast(error.message); }
+  });
+  const rows = (data.vouchers || []).map((voucher) => historyItem(`${voucher.display_prefix}… · ${voucher.credit_amount} credits`, `${voucher.redemptions_used}/${voucher.maximum_redemptions} redemptions`, voucher.active && !voucher.revoked_at ? "ACTIVE" : "REVOKED", !voucher.active));
+  app.replaceChildren(
+    pageHead("Voucher Studio", "Generate cryptographically secure one-use or campaign credit vouchers. Full codes are never stored in plaintext."),
+    node("section", { className: "card" }, [node("div", { className: "settings-grid" }, [node("div", { className: "field" }, [node("label", { text: "Credits" }), amount]), node("div", { className: "field" }, [node("label", { text: "Maximum redemptions" }), uses])]), create, result]),
+    node("section", { className: "section list" }, rows)
+  );
+}
+
 async function renderAdmin(path) {
   if (!state.dashboard.platformAdmin) throw Object.assign(new Error("Administrator access is required"), { status: 403 });
+  const userDetail = path.match(/^\/admin\/user\/(\d+)$/);
+  if (userDetail) return renderAdminUserDetail(userDetail[1]);
   if (path === "/admin/models") return renderModels();
   if (path === "/admin/users") return renderAdminUsers();
   if (path === "/admin/groups") return renderGroups({ admin: true });
+  if (path === "/admin/analytics") return renderAdminAnalytics();
+  if (path === "/admin/access-requests") return renderAdminAccessRequests();
+  if (path === "/admin/vouchers") return renderAdminVouchers();
   if (path === "/admin/payments") {
     const data = await api("/api/admin/payments?limit=100");
     app.replaceChildren(pageHead("Payment Ledger", "Administrator view of Telegram Stars transactions."), node("section", { className: "list" }, data.payments.map((row) => historyItem(`${row.amount} XTR · User ${row.userId}`, new Date(row.creditedAt).toLocaleString(), row.refundedAt ? "REFUNDED" : "CREDITED", Boolean(row.refundedAt)))));
@@ -931,7 +1143,10 @@ async function renderAdmin(path) {
         quickAction("Logs", "Audit and security event streams.", "/admin/logs"),
         quickAction("System", "Deployment and provider health.", "/admin/system"),
         quickAction("Users", "Roles, bans, credits, and notes.", "/admin/users"),
-        quickAction("Groups", "Live permissions, Guard, and moderation controls.", "/admin/groups")
+        quickAction("Groups", "Live permissions, Guard, and moderation controls.", "/admin/groups"),
+        quickAction("Analytics", "Users, channels, Secretary, vouchers, Stars, and failures.", "/admin/analytics"),
+        quickAction("Secretary access", "Approve or deny Telegram Business connections.", "/admin/access-requests"),
+        quickAction("Vouchers", "Generate and monitor secure credit campaigns.", "/admin/vouchers")
       ])])
     );
     return;
@@ -1044,7 +1259,7 @@ async function render(path = currentPath()) {
   app.replaceChildren(node("section", { className: "loading-state" }, [node("span", { className: "loader" }), node("p", { text: "Loading secure workspace…" })]));
   updateNavigation(path);
   try {
-    if (path === "/home") renderHome();
+    if (path === "/home") await renderHome();
     else if (path === "/chat") await renderChat();
     else if (path === "/models") await renderModels();
     else if (path === "/assistants") await renderAssistantModes();
@@ -1056,6 +1271,7 @@ async function render(path = currentPath()) {
     else if (path === "/threads") await renderThreads();
     else if (path === "/bots") await renderBots();
     else if (path === "/usage" || path === "/payments") await renderBilling(path === "/payments" ? "payments" : "usage");
+    else if (path === "/vouchers") await renderVouchers();
     else if (path === "/settings") await renderSettings();
     else if (path === "/help") renderHelp();
     else if (path.startsWith("/admin") && !unavailableRoutes[path]) await renderAdmin(path);
@@ -1152,7 +1368,7 @@ function setupMatrixCanvas() {
 function startParamPath() {
   const value = tg?.initDataUnsafe?.start_param || new URLSearchParams(location.search).get("startapp") || "";
   const mapped = `/${value.replaceAll("_", "/")}`;
-  return ["/chat", "/models", "/assistants", "/groups", "/guard", "/secretary", "/bots", "/usage", "/payments", "/admin", "/admin/users", "/admin/groups", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system"].includes(mapped) ? mapped : null;
+  return ["/chat", "/models", "/assistants", "/groups", "/guard", "/secretary", "/bots", "/usage", "/payments", "/vouchers", "/admin", "/admin/users", "/admin/groups", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system", "/admin/analytics", "/admin/access-requests", "/admin/vouchers"].includes(mapped) ? mapped : null;
 }
 
 async function start() {

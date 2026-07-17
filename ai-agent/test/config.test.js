@@ -53,6 +53,7 @@ test("safe configuration status reports only presence and deployment metadata", 
     telegramWebhookConfigured: false,
     telegramStarsRequired: false,
     telegramStarSigningConfigured: true,
+    telegramOidcConfigured: false,
     databaseConfigured: false,
     whatsappConfigured: false,
     botCredentialEncryptionConfigured: false

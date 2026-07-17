@@ -58,7 +58,12 @@ export function runtimeConfig(env = process.env) {
       starsRequired: booleanValue(env, "TELEGRAM_STARS_REQUIRED", false),
       starSigningConfigured: configured(env, "TELEGRAM_STAR_SIGNING_SECRET"),
       webAppMaxAgeSeconds: integerValue(env, "TELEGRAM_WEBAPP_MAX_AGE_SECONDS", 300, { minimum: 60, maximum: 3600 }),
-      webAppSessionTtlSeconds: integerValue(env, "TELEGRAM_WEBAPP_SESSION_TTL_SECONDS", 3600, { minimum: 300, maximum: 86_400 })
+      webAppSessionTtlSeconds: integerValue(env, "TELEGRAM_WEBAPP_SESSION_TTL_SECONDS", 3600, { minimum: 300, maximum: 86_400 }),
+      oidcClientConfigured: configured(env, "TELEGRAM_OIDC_CLIENT_ID"),
+      oidcSecretConfigured: configured(env, "TELEGRAM_OIDC_CLIENT_SECRET"),
+      oidcRedirectConfigured: configured(env, "TELEGRAM_OIDC_REDIRECT_URI"),
+      webSessionIdleSeconds: integerValue(env, "WEB_SESSION_IDLE_SECONDS", 1800, { minimum: 300, maximum: 86_400 }),
+      webSessionAbsoluteSeconds: integerValue(env, "WEB_SESSION_ABSOLUTE_SECONDS", 43_200, { minimum: 900, maximum: 604_800 })
     }),
     database: Object.freeze({ configured: configured(env, "DATABASE_URL") }),
     whatsapp: Object.freeze({
@@ -97,6 +102,21 @@ export function validateRuntimeConfiguration(env = process.env, { requireNvidia 
     if (stringValue(env, "TELEGRAM_STAR_SIGNING_SECRET").length < 32) problems.push("TELEGRAM_STAR_SIGNING_SECRET must be at least 32 characters");
     if (!config.database.configured) problems.push("DATABASE_URL is required when Telegram Stars are enabled");
   }
+  const oidcConfigured = [config.telegram.oidcClientConfigured, config.telegram.oidcSecretConfigured, config.telegram.oidcRedirectConfigured];
+  if (oidcConfigured.some(Boolean) && !oidcConfigured.every(Boolean)) {
+    problems.push("TELEGRAM_OIDC_CLIENT_ID, TELEGRAM_OIDC_CLIENT_SECRET, and TELEGRAM_OIDC_REDIRECT_URI must be configured together");
+  }
+  if (config.telegram.oidcSecretConfigured && stringValue(env, "TELEGRAM_OIDC_CLIENT_SECRET").length < 16) {
+    problems.push("TELEGRAM_OIDC_CLIENT_SECRET must be at least 16 characters");
+  }
+  if (config.telegram.oidcRedirectConfigured) {
+    try {
+      const redirect = new URL(stringValue(env, "TELEGRAM_OIDC_REDIRECT_URI"));
+      if (redirect.protocol !== "https:" || redirect.username || redirect.password || redirect.hash) problems.push("TELEGRAM_OIDC_REDIRECT_URI must be an HTTPS URL");
+    } catch {
+      problems.push("TELEGRAM_OIDC_REDIRECT_URI must be a valid URL");
+    }
+  }
 
   if (problems.length) throw new ConfigurationError(problems);
   return config;
@@ -112,6 +132,7 @@ export function safeConfigurationStatus(env = process.env) {
     telegramWebhookConfigured: config.telegram.webhookConfigured,
     telegramStarsRequired: config.telegram.starsRequired,
     telegramStarSigningConfigured: config.telegram.starSigningConfigured,
+    telegramOidcConfigured: config.telegram.oidcClientConfigured && config.telegram.oidcSecretConfigured && config.telegram.oidcRedirectConfigured,
     databaseConfigured: config.database.configured,
     whatsappConfigured: Object.values(config.whatsapp).every(Boolean),
     botCredentialEncryptionConfigured: config.botCredentialEncryptionConfigured

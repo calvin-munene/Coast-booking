@@ -173,6 +173,7 @@ button { color: inherit; }
   transition: border-color 0.18s ease, background 0.18s ease;
 }
 .telegram-link:hover { border-color: var(--green); background: rgba(142, 234, 34, 0.08); }
+.telegram-link[type="button"] { cursor: pointer; background: transparent; }
 .telegram-link[hidden] { display: none; }
 .connection-pill {
   display: inline-flex;

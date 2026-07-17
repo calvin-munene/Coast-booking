@@ -144,6 +144,22 @@ function runtimeMode({ type, chat, threadId, groupSettings }) {
   return "private_ai";
 }
 
+function operatingContext({ type, chat, threadId, groupSettings }) {
+  if (["successful_payment", "refunded_payment", "pre_checkout_query"].includes(type)) return "payment";
+  if (type === "inline_query") return "inline";
+  if (type === "guest_message") return "guest";
+  if (["business_connection", "business_message", "edited_business_message", "deleted_business_messages"].includes(type)) return "telegram_business_secretary";
+  if (type === "managed_bot") return "managed_bot";
+  if (type === "chat_join_request") return "guard";
+  if (type === "callback_query") return "callback";
+  if (["group", "supergroup"].includes(chat?.type) && groupSettings?.secretaryEnabled) return "group_secretary";
+  if (threadId !== null && threadId !== undefined) return "group_topic";
+  if (chat?.type === "private") return "private_bot_chat";
+  if (chat?.type === "supergroup") return "supergroup";
+  if (chat?.type === "group") return "group";
+  return chat?.type || "unknown";
+}
+
 function invocationDecision({ type, message, command, mentioned, replyToBot, senderIsBot, groupSettings, senderRole }) {
   const chatType = message?.chat?.type;
   if (type === "inline_query") return { invoked: true, reason: "inline_query" };
@@ -194,7 +210,10 @@ export function resolveTelegramUpdateContext(update, {
   senderMember = null,
   botMember = null,
   assistantMode = "chat",
-  managedBot = null
+  managedBot = null,
+  platformUser = null,
+  activeEntitlement = null,
+  billingOwnerUserId = null
 } = {}) {
   const type = updateType(update);
   const message = messageForUpdate(update, type);
@@ -262,6 +281,10 @@ export function resolveTelegramUpdateContext(update, {
     productFeatureMode: runtimeMode({ type, chat, threadId, groupSettings: settings }),
     assistantMode,
     effectiveRuntimeMode: runtimeMode({ type, chat, threadId, groupSettings: settings }),
+    operatingContext: operatingContext({ type, chat, threadId, groupSettings: settings }),
+    platformUserStatus: platformUser?.status || platformUser?.role || null,
+    activeEntitlement: activeEntitlement || null,
+    effectiveBillingOwnerUserId: billingOwnerUserId ?? from?.id ?? null,
     invocationReason: invocation.reason,
     invoked: invocation.invoked,
     promptText,

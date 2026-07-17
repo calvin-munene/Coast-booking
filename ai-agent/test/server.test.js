@@ -20,6 +20,11 @@ const ENV_NAMES = [
   "TELEGRAM_WEBHOOK_SECRET",
   "TELEGRAM_WEBAPP_MAX_AGE_SECONDS",
   "TELEGRAM_WEBAPP_SESSION_TTL_SECONDS",
+  "TELEGRAM_OIDC_CLIENT_ID",
+  "TELEGRAM_OIDC_CLIENT_SECRET",
+  "TELEGRAM_OIDC_REDIRECT_URI",
+  "WEB_SESSION_IDLE_SECONDS",
+  "WEB_SESSION_ABSOLUTE_SECONDS",
   "NVIDIA_API_KEY",
   "NVIDIA_GLOBAL_REQUESTS_PER_HOUR",
   "NVIDIA_MAX_CONCURRENT_REQUESTS",
@@ -223,6 +228,7 @@ function webLedgerDouble(overrides = {}) {
     async restorePrompt() {},
     async listPayments() { return []; },
     async listUsage() { return []; },
+    async getStats() { return { accounts: "1", credits: "2", payments: "0", prompts: "0" }; },
     async setUserMode(userId, selectedMode) { return { userId: String(userId), selectedMode }; },
     ...overrides
   };
@@ -624,7 +630,7 @@ test("Mini App direct routes serve the protected SPA shell with security headers
   const server = createAppServer();
   const port = await listen(server);
   try {
-    for (const path of ["/home", "/chat", "/groups", "/group/123", "/admin/system"]) {
+    for (const path of ["/home", "/chat", "/groups", "/group/123", "/vouchers", "/admin/system", "/admin/analytics"]) {
       const response = await requestGet(port, path);
       assert.equal(response.status, 200, `${path}: ${response.text}`);
       assert.match(response.text, /Nvid AI OS/);
@@ -1242,6 +1248,72 @@ test("assistant mutation APIs enforce repository ownership", async () => {
       origin: process.env.PUBLIC_URL
     });
     assert.equal(denied.status, 404);
+  } finally {
+    await close(server);
+  }
+});
+
+test("website Telegram sessions use secure cookies, current authorization, and CSRF for mutations", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const token = "t".repeat(64);
+  const csrf = "c".repeat(48);
+  let redeemed = 0;
+  let revoked = 0;
+  setPlatformStoreForTests(platformStoreDouble({
+    async getWebSession(value) {
+      if (value !== token || revoked) return null;
+      return { session_id: "77777777-7777-4777-8777-777777777777", user_id: "123", csrf_hash: crypto.createHash("sha256").update(csrf).digest("hex") };
+    },
+    async consumeSharedRateLimit() { return { allowed: true }; },
+    async redeemVoucher() { redeemed += 1; return { redeemed: true, creditsAdded: 5, balance: "7" }; },
+    async revokeWebSession() { revoked += 1; return true; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  const cookie = `__Host-nvid_session=${token}; nvid_csrf=${csrf}`;
+  try {
+    const session = await requestGet(port, "/api/web/session", { cookie });
+    assert.equal(session.status, 200, session.text);
+    assert.equal(JSON.parse(session.text).user.userId, "123");
+    const missingCsrf = await requestJson(port, "/api/vouchers/redeem", { code: "NVID-TEST" }, { cookie, origin: process.env.PUBLIC_URL });
+    assert.equal(missingCsrf.status, 403);
+    const wrongCsrf = await requestJson(port, "/api/vouchers/redeem", { code: "NVID-TEST" }, { cookie, origin: process.env.PUBLIC_URL, "x-csrf-token": "wrong" });
+    assert.equal(wrongCsrf.status, 403);
+    const valid = await requestJson(port, "/api/vouchers/redeem", { code: "NVID-TEST" }, { cookie, origin: process.env.PUBLIC_URL, "x-csrf-token": csrf });
+    assert.equal(valid.status, 200, valid.text);
+    assert.equal(redeemed, 1);
+    const logout = await requestJsonMethod(port, "/api/web/logout", "POST", null, { cookie, origin: process.env.PUBLIC_URL, "x-csrf-token": csrf });
+    assert.equal(logout.status, 200, logout.text);
+    assert.equal(revoked, 1);
+  } finally {
+    await close(server);
+  }
+});
+
+test("analytics and voucher administration remain server-authorized and exclude raw messages", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble());
+  const analytics = { total_users: 12, secretary_ai_replies: 4, voucher_redemptions: 2 };
+  setPlatformStoreForTests(platformStoreDouble({
+    async getUserRole(id) { return String(id) === "6643462826" ? "super_admin" : "standard_user"; },
+    async getAdminAnalytics() { return analytics; },
+    async listVouchers() { return [{ voucher_id: crypto.randomUUID(), display_prefix: "NVID-ABCD", credit_amount: 5, maximum_redemptions: 1, redemptions_used: 0, active: true }]; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const ordinary = await launchWebSession(port, 123);
+    assert.equal((await requestGet(port, "/api/admin/analytics", { authorization: `Bearer ${ordinary}` })).status, 403);
+    resetTelegramWebAuthForTests();
+    const admin = await launchWebSession(port, 6643462826);
+    const response = await requestGet(port, "/api/admin/analytics", { authorization: `Bearer ${admin}` });
+    assert.equal(response.status, 200, response.text);
+    assert.deepEqual(JSON.parse(response.text).analytics, analytics);
+    assert.doesNotMatch(response.text, /conversation|message_content|raw_message/i);
+    assert.equal((await requestGet(port, "/api/admin/vouchers", { authorization: `Bearer ${admin}` })).status, 200);
   } finally {
     await close(server);
   }

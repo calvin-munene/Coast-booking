@@ -35,8 +35,8 @@ Administrator API routes are under `/api/admin/*`. They require a valid Telegram
 
 The Telegram-authenticated Mini App is a mobile-first single-page application. Direct links restore the correct route and the Telegram Back Button is enabled only on supported client versions.
 
-- User: `/home`, `/chat`, `/models`, `/assistants`, `/groups`, `/group/:id`, `/moderation`, `/bots`, `/guard`, `/secretary`, `/threads`, `/usage`, `/payments`, `/settings`, `/help`.
-- Administrator: `/admin`, `/admin/users`, `/admin/groups`, `/admin/models`, `/admin/features`, `/admin/pricing`, `/admin/payments`, `/admin/logs`, `/admin/system`.
+- User: `/home`, `/chat`, `/models`, `/assistants`, `/groups`, `/group/:id`, `/moderation`, `/bots`, `/guard`, `/secretary`, `/threads`, `/usage`, `/payments`, `/vouchers`, `/settings`, `/help`.
+- Administrator: `/admin`, `/admin/users`, `/admin/user/:id`, `/admin/groups`, `/admin/access-requests`, `/admin/vouchers`, `/admin/analytics`, `/admin/models`, `/admin/features`, `/admin/pricing`, `/admin/payments`, `/admin/logs`, `/admin/system`.
 
 Chat, assistant mode selection, model selection, payment history, usage history, feature flags, pricing, provider health, and audit logs use live backend APIs. Telegram capabilities that still require a group permission, BotFather setting, encryption key, or staged rollout are shown as unavailable with the specific requirement; the UI does not pretend they are active.
 
@@ -60,9 +60,10 @@ The repository includes a root-level `render.yaml` Blueprint. In Render, create 
 2. Set `PUBLIC_URL` to the deployed HTTPS origin and provide a random `TELEGRAM_WEBHOOK_SECRET`.
 3. Set `TELEGRAM_ADMIN_USER_ID` to the numeric user ID authorized to view bot Stars totals and receive purchase/support notices.
 4. To require prepaid messages, set `TELEGRAM_STARS_REQUIRED=true`, provide a random 32-byte-or-longer `TELEGRAM_STAR_SIGNING_SECRET`, and connect a durable PostgreSQL database with `DATABASE_URL`.
-5. Optionally set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram user IDs. Leave it empty when any paying Telegram user should be able to use the bot. Send `/whoami` to discover a numeric ID.
+5. Optionally set `TELEGRAM_ALLOWED_USER_IDS` to a comma-separated list of Telegram user IDs. Leave it empty when any entitled Telegram user should be able to use the bot. Send `/whoami` to discover a numeric ID.
+6. For external website login, configure the production origin and exact callback in BotFather, then set `TELEGRAM_OIDC_CLIENT_ID`, `TELEGRAM_OIDC_CLIENT_SECRET`, and `TELEGRAM_OIDC_REDIRECT_URI=https://nvidbot.onrender.com/auth/telegram/callback`. The backend uses Authorization Code Flow with PKCE and keeps tokens out of browser storage.
 
-At startup the service validates the token, initializes the Stars ledger, restores stale prompt reservations, publishes the bot command menu, registers the protected webhook, and verifies it with Telegram. Private chats receive animated native message drafts while NVIDIA generates the answer; the completed answer is then persisted as a normal reply. Group chats receive typing status followed by the final answer.
+At startup the service validates the token, initializes the Stars ledger, restores stale prompt reservations, publishes member and administrator command scopes, registers the protected webhook, and verifies it with Telegram. Private and invoked group chats receive animated live edits while NVIDIA generates the answer; group replies remain in the originating topic. Ordinary uninvoked group messages are ignored and never billed.
 
 With Stars charging enabled, `/topup N` presents the current terms and then opens a native Telegram invoice for exactly `N` XTR. A successful payment atomically adds `N` credits, and each accepted non-command prompt reserves one credit. Failed NVIDIA generation or final Telegram delivery restores the reservation. Payment charge IDs, terms acceptance, balances, prompt reservations, and refunds are stored transactionally and idempotently in PostgreSQL.
 
@@ -74,8 +75,11 @@ Bot commands:
 - `/models` lists server-approved NVIDIA models.
 - `/model 2` or `/model <model-id>` changes the model for that Telegram chat.
 - `/use coding` (or `chat`, `research`, `translation`, `documents`, `secretary`) changes the user's durable assistant mode.
-- `/reset` clears that chat's in-memory AI context.
-- `/balance` shows the user's prepaid AI-message credits.
+- `/reset` clears that private conversation context.
+- `/balance` shows the user's credits and current free allowance.
+- `/redeem CODE` redeems a secure Nvid AI credit voucher.
+- `/nvid <question>` invokes AI in a group; mentions and direct replies also activate it.
+- `/nvid_register` lets a current group administrator register or refresh an existing group.
 - `/topup 25` buys any whole number of credits from 1 to 10,000 with Telegram Stars.
 - `/terms` shows the active purchase terms.
 - `/paysupport <message>` sends a payment issue to the configured administrator.
@@ -96,6 +100,6 @@ During Meta's test phase, add recipient numbers in the developer dashboard. Prod
 - Rotate any credential that has appeared in a message, screenshot, file, or Git history.
 - Keep `.env` untracked and set production secrets only in Render environment variables.
 - Keep PostgreSQL backups and verify migrations against production-like data before deployment.
-- Move remaining in-memory conversation history to durable conversation/message tables.
-- Add durable webhook jobs and centralized monitoring for higher traffic.
+- Configure Telegram OIDC before enabling website login in production.
+- Add a dedicated background worker queue and centralized monitoring before substantially increasing traffic.
 - Keep the Mini App and webhook behind HTTPS.

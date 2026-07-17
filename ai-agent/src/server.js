@@ -22,6 +22,7 @@ import {
   handleWhatsApp,
   reserveTelegramWebAiUsage,
   restoreTelegramWebAiUsage,
+  sendSecretaryActivationInvoice,
   startSecretaryReminderWorker,
   transitionTelegramWebAiUsage,
   setTelegramAssistantMode,
@@ -52,7 +53,12 @@ import {
 import { sourceIdentifierHash } from "./platformStore.js";
 import { nvidiaProviderHealth } from "./providerHealth.js";
 import { aiChatStarCost, setAiChatStarCost } from "./pricing.js";
-import { platformPrincipal } from "./rbac.js";
+import { authorizePlatformPermission, platformPrincipal } from "./rbac.js";
+import {
+  beginTelegramOidcLogin,
+  completeTelegramOidcLogin,
+  telegramOidcConfigured
+} from "./telegramOidc.js";
 import {
   decryptManagedBotToken,
   encryptManagedBotToken,
@@ -84,6 +90,59 @@ function httpError(statusCode, message) {
   const error = new Error(message);
   error.statusCode = statusCode;
   return error;
+}
+
+const WEB_SESSION_COOKIE = "__Host-nvid_session";
+const WEB_CSRF_COOKIE = "nvid_csrf";
+
+function cookieMap(req) {
+  const result = new Map();
+  for (const item of String(req.headers.cookie || "").split(";")) {
+    const separator = item.indexOf("=");
+    if (separator <= 0) continue;
+    const key = item.slice(0, separator).trim();
+    try { result.set(key, decodeURIComponent(item.slice(separator + 1).trim())); } catch { /* ignore malformed cookies */ }
+  }
+  return result;
+}
+
+function cookieHeader(name, value, { httpOnly = true, maxAge = null } = {}) {
+  return [
+    `${name}=${encodeURIComponent(value)}`,
+    "Path=/",
+    "Secure",
+    httpOnly ? "HttpOnly" : "",
+    "SameSite=Lax",
+    maxAge === null ? "" : `Max-Age=${Math.max(0, Math.floor(maxAge))}`
+  ].filter(Boolean).join("; ");
+}
+
+function hashSessionSecret(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+async function websiteSession(req, { mutation = false } = {}) {
+  const cookies = cookieMap(req);
+  const token = cookies.get(WEB_SESSION_COOKIE);
+  if (!token || !/^[A-Za-z0-9_-]{40,256}$/.test(token)) return null;
+  const config = runtimeConfig();
+  const stored = await getPlatformStore()?.getWebSession?.(token, { touchIdleSeconds: config.telegram.webSessionIdleSeconds });
+  if (!stored) return null;
+  if (mutation) {
+    if (!mutationOriginAllowed(req, config.publicOrigin)) return { denied: true, status: 403, error: "The request origin is not allowed" };
+    const csrfCookie = cookies.get(WEB_CSRF_COOKIE);
+    const csrfHeader = String(req.headers["x-csrf-token"] || "");
+    if (!csrfCookie || csrfHeader !== csrfCookie || hashSessionSecret(csrfHeader) !== stored.csrf_hash) {
+      return { denied: true, status: 403, error: "The security token is invalid" };
+    }
+  }
+  return {
+    userId: String(stored.user_id),
+    sessionId: stored.session_id,
+    kind: "website",
+    token,
+    csrfToken: cookies.get(WEB_CSRF_COOKIE) || null
+  };
 }
 
 async function body(req, { maxBytes = 1_000_000 } = {}) {
@@ -184,12 +243,28 @@ async function recordSecurityEvent(req, event) {
 }
 
 async function authorizeAdminRequest(req, { permission, mutation = false } = {}) {
-  const authorization = await authorizeHttpRequest(req, {
-    permission,
-    mutation,
-    store: getPlatformStore(),
-    expectedOrigin: runtimeConfig().publicOrigin
-  });
+  let authorization;
+  if (bearerToken(req)) {
+    authorization = await authorizeHttpRequest(req, {
+      permission,
+      mutation,
+      store: getPlatformStore(),
+      expectedOrigin: runtimeConfig().publicOrigin
+    });
+  } else {
+    const userAuthorization = await authorizeUserRequest(req, { mutation });
+    if (!userAuthorization.allowed) authorization = userAuthorization;
+    else {
+      const permissionResult = await authorizePlatformPermission({
+        userId: userAuthorization.session.userId,
+        permission,
+        store: getPlatformStore()
+      });
+      authorization = permissionResult.allowed
+        ? { ...userAuthorization, principal: permissionResult.principal }
+        : { ...permissionResult, session: userAuthorization.session };
+    }
+  }
   if (!authorization.allowed) {
     await recordSecurityEvent(req, {
       eventType: "admin_access_denied",
@@ -229,9 +304,14 @@ async function authorizeAdminRequest(req, { permission, mutation = false } = {})
 }
 
 async function authorizeUserRequest(req, { mutation = false } = {}) {
-  const session = verifyTelegramWebAppSession(bearerToken(req));
-  if (!session) return { allowed: false, status: 401, error: "Fresh Telegram authentication is required" };
-  if (mutation && !mutationOriginAllowed(req, runtimeConfig().publicOrigin)) {
+  let session = verifyTelegramWebAppSession(bearerToken(req));
+  if (!session) {
+    const web = await websiteSession(req, { mutation });
+    if (web?.denied) return { allowed: false, status: web.status, error: web.error };
+    session = web;
+  }
+  if (!session) return { allowed: false, status: 401, error: "Telegram authentication is required" };
+  if (mutation && session.kind !== "website" && !mutationOriginAllowed(req, runtimeConfig().publicOrigin)) {
     await recordSecurityEvent(req, {
       eventType: "user_mutation_origin_denied",
       severity: "medium",
@@ -502,6 +582,82 @@ export function createAppServer() {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/auth/telegram") {
+      if (!telegramOidcConfigured()) return json(res, 503, { error: "Telegram website login requires BotFather setup" });
+      const store = getPlatformStore();
+      const sourceHash = sourceIdentifierHash(chatClient(req));
+      const budget = await store?.consumeSharedRateLimit?.({ key: `oidc:start:${sourceHash}`, limit: 10, windowMs: 10 * 60_000 });
+      if (budget && !budget.allowed) return json(res, 429, { error: "Too many login attempts" });
+      const login = await beginTelegramOidcLogin({ store, returnTo: url.searchParams.get("returnTo") || "/home", sourceHash });
+      res.writeHead(302, { location: login.authorizationUrl, "cache-control": "no-store" });
+      return res.end();
+    }
+
+    if (req.method === "GET" && url.pathname === "/auth/telegram/callback") {
+      const store = getPlatformStore();
+      const identity = await completeTelegramOidcLogin({
+        state: url.searchParams.get("state"),
+        code: url.searchParams.get("code"),
+        store
+      });
+      await store.syncUserProfile?.({ ...identity.user, id: identity.userId, interactionSource: "website_login" });
+      const principal = await platformPrincipal(identity.userId, store);
+      if (["banned_user", "restricted_user"].includes(principal?.role)) {
+        await recordSecurityEvent(req, { eventType: "telegram_oidc_restricted_user", severity: "high", userId: identity.userId });
+        return json(res, 403, { error: "This account is restricted" });
+      }
+      const token = crypto.randomBytes(48).toString("base64url");
+      const csrfToken = crypto.randomBytes(32).toString("base64url");
+      const settings = runtimeConfig().telegram;
+      const now = Date.now();
+      await store.createWebSession({
+        userId: identity.userId,
+        token,
+        csrfToken,
+        idleExpiresAt: new Date(now + settings.webSessionIdleSeconds * 1000),
+        expiresAt: new Date(now + settings.webSessionAbsoluteSeconds * 1000)
+      });
+      await store.writeAudit?.({
+        actorUserId: identity.userId,
+        action: "website.telegram_login",
+        targetType: "web_session",
+        targetId: identity.userId,
+        metadata: { issuer: identity.claims.iss }
+      });
+      res.writeHead(302, {
+        location: identity.returnTo,
+        "cache-control": "no-store",
+        "set-cookie": [
+          cookieHeader(WEB_SESSION_COOKIE, token, { maxAge: settings.webSessionAbsoluteSeconds }),
+          cookieHeader(WEB_CSRF_COOKIE, csrfToken, { httpOnly: false, maxAge: settings.webSessionAbsoluteSeconds })
+        ]
+      });
+      return res.end();
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/web/session") {
+      const auth = await authorizeUserRequest(req);
+      if (!auth.allowed || auth.session.kind !== "website") return json(res, auth.status || 401, { authenticated: false, error: auth.error || "Website login is required" });
+      return json(res, 200, {
+        authenticated: true,
+        csrfToken: auth.session.csrfToken,
+        user: { userId: auth.session.userId, role: auth.principal?.role || "standard_user", plan: auth.dashboard?.plan || "standard" },
+        dashboard: auth.dashboard
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/web/logout") {
+      const auth = await authorizeUserRequest(req, { mutation: true });
+      if (!auth.allowed || auth.session.kind !== "website") return json(res, auth.status || 401, { error: auth.error || "Website login is required" });
+      await getPlatformStore()?.revokeWebSession?.(auth.session.token);
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        "set-cookie": [cookieHeader(WEB_SESSION_COOKIE, "", { maxAge: 0 }), cookieHeader(WEB_CSRF_COOKIE, "", { httpOnly: false, maxAge: 0 })]
+      });
+      return res.end(JSON.stringify({ loggedOut: true }));
+    }
+
     if (req.method === "GET" && url.pathname === "/api/models") {
       return json(res, 200, { models: availableModels(), defaultModel: defaultModel() });
     }
@@ -554,6 +710,25 @@ export function createAppServer() {
       const data = await jsonBody(req, { maxBytes: 16_000 });
       const settings = await setTelegramUserAiSettings({ userId: auth.session.userId, settings: data });
       return json(res, 200, { settings });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/usage/allowance") {
+      const auth = await authorizeUserRequest(req);
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const channel = String(url.searchParams.get("channel") || "telegram_private").slice(0, 64);
+      const allowance = await getPlatformStore()?.getUsageAllowance?.(auth.session.userId, { channel });
+      return json(res, 200, { allowance, plan: auth.dashboard?.plan || "standard", balance: auth.dashboard?.balance || "0" });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/vouchers/redeem") {
+      const auth = await authorizeUserRequest(req, { mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const budget = await getPlatformStore()?.consumeSharedRateLimit?.({ key: `voucher:${auth.session.userId}`, limit: 10, windowMs: 60 * 60_000 });
+      if (budget && !budget.allowed) return json(res, 429, { error: "Voucher attempt limit reached" });
+      const data = await jsonBody(req, { maxBytes: 4_000 });
+      if (typeof data.code !== "string" || data.code.length > 100) return json(res, 400, { error: "A valid voucher code is required" });
+      const redemption = await getPlatformStore()?.redeemVoucher?.({ userId: auth.session.userId, code: data.code });
+      return json(res, 200, { redemption });
     }
 
     if (req.method === "GET" && url.pathname === "/api/conversations") {
@@ -699,6 +874,64 @@ export function createAppServer() {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/api/admin/analytics") {
+      const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { analytics: await getPlatformStore()?.getAdminAnalytics?.() });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/access-requests") {
+      const auth = await authorizeAdminRequest(req, { permission: "users.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { requests: await getPlatformStore()?.listSecretaryAccessRequests?.({ status: url.searchParams.get("status") || null, limit: parseLimit(url) }) || [] });
+    }
+
+    const accessDecisionMatch = url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]{36})$/i);
+    if (accessDecisionMatch && req.method === "POST") {
+      const auth = await authorizeAdminRequest(req, { permission: "users.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 8_000 });
+      const result = await getPlatformStore()?.decideSecretaryAccess?.({
+        requestId: accessDecisionMatch[1],
+        actorUserId: auth.session.userId,
+        decision: data.decision,
+        reason: data.reason,
+        cooldownSeconds: data.cooldownSeconds || 86400
+      });
+      return json(res, 200, { result });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/vouchers") {
+      const auth = await authorizeAdminRequest(req, { permission: "billing.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      return json(res, 200, { vouchers: await getPlatformStore()?.listVouchers?.({ limit: parseLimit(url) }) || [] });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/vouchers") {
+      const auth = await authorizeAdminRequest(req, { permission: "billing.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 12_000 });
+      const voucher = await getPlatformStore()?.createVoucher?.({ actorUserId: auth.session.userId, ...data });
+      return json(res, 201, { voucher, warning: "The full voucher code is shown once. Store it securely now." });
+    }
+
+    const voucherAdminMatch = url.pathname.match(/^\/api\/admin\/vouchers\/([0-9a-f-]{36})\/revoke$/i);
+    if (voucherAdminMatch && req.method === "POST") {
+      const auth = await authorizeAdminRequest(req, { permission: "billing.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 4_000 });
+      const result = await getPlatformStore()?.revokeVoucher?.({ voucherId: voucherAdminMatch[1], actorUserId: auth.session.userId, reason: data.reason });
+      return json(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/admin/usage-policy") {
+      const auth = await authorizeAdminRequest(req, { permission: "billing.manage", mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 8_000 });
+      const policy = await getPlatformStore()?.setUsagePolicy?.({ actorUserId: auth.session.userId, ...data });
+      return json(res, 200, { policy });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/admin/overview") {
       if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
       const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
@@ -730,7 +963,8 @@ export function createAppServer() {
     if (adminUserMatch && req.method === "GET") {
       const auth = await authorizeAdminRequest(req, { permission: "users.view" });
       if (!auth.allowed) return json(res, auth.status, { error: auth.error });
-      const user = await getPlatformStore().getManagedUser(adminUserMatch[1]);
+      const user = await getPlatformStore().getUserAnalytics?.(adminUserMatch[1])
+        || await getPlatformStore().getManagedUser(adminUserMatch[1]);
       return user ? json(res, 200, { user }) : json(res, 404, { error: "User was not found" });
     }
     if (adminUserMatch && req.method === "PATCH") {
@@ -956,6 +1190,39 @@ export function createAppServer() {
       });
     }
 
+    const secretaryConnectionMatch = url.pathname.match(/^\/api\/secretary\/connections\/([^/]+)\/(settings|request-access|invoice)$/);
+    if (secretaryConnectionMatch && req.method === "POST") {
+      const auth = await authorizeUserRequest(req, { mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const connectionId = decodeURIComponent(secretaryConnectionMatch[1]);
+      const data = await jsonBody(req, { maxBytes: 12_000 });
+      if (secretaryConnectionMatch[2] === "request-access") {
+        const request = await getPlatformStore()?.requestSecretaryAccess?.({ connectionId, ownerUserId: auth.session.userId });
+        return json(res, request?.duplicate ? 200 : 201, { request });
+      }
+      if (secretaryConnectionMatch[2] === "invoice") {
+        const invoice = await sendSecretaryActivationInvoice({ ownerUserId: auth.session.userId, connectionId });
+        return json(res, 200, { invoice });
+      }
+      const connection = await getPlatformStore()?.updateSecretarySettings?.({ connectionId, ownerUserId: auth.session.userId, changes: data });
+      return connection ? json(res, 200, { connection }) : json(res, 404, { error: "Business connection was not found" });
+    }
+
+    const secretaryContactsMatch = url.pathname.match(/^\/api\/secretary\/connections\/([^/]+)\/contacts(?:\/(-?\d+))?$/);
+    if (secretaryContactsMatch && req.method === "GET" && !secretaryContactsMatch[2]) {
+      const auth = await authorizeUserRequest(req);
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const contacts = await getPlatformStore()?.listSecretaryContacts?.({ connectionId: decodeURIComponent(secretaryContactsMatch[1]), ownerUserId: auth.session.userId, limit: parseLimit(url) }) || [];
+      return json(res, 200, { contacts });
+    }
+    if (secretaryContactsMatch && req.method === "PATCH" && secretaryContactsMatch[2]) {
+      const auth = await authorizeUserRequest(req, { mutation: true });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const data = await jsonBody(req, { maxBytes: 8_000 });
+      const contact = await getPlatformStore()?.updateSecretaryContactSettings?.({ connectionId: decodeURIComponent(secretaryContactsMatch[1]), contactChatId: secretaryContactsMatch[2], ownerUserId: auth.session.userId, changes: data });
+      return json(res, 200, { contact });
+    }
+
     const groupModerationMatch = url.pathname.match(/^\/api\/groups\/(-?\d+)\/moderation$/);
     if (groupModerationMatch && req.method === "POST") {
       const auth = await authorizeUserRequest(req, { mutation: true });
@@ -1133,7 +1400,7 @@ export function createAppServer() {
     }
 
     if (req.method === "POST" && url.pathname === "/api/chat") {
-      const auth = await authorizeUserRequest(req);
+      const auth = await authorizeUserRequest(req, { mutation: true });
       if (!auth.allowed) return json(res, auth.status, { error: auth.error });
       const authenticated = auth.session;
       if (auth.dashboard?.modes?.chat?.enabled === false) {
@@ -1332,7 +1599,7 @@ export function createAppServer() {
     }
 
     if (req.method === "GET") {
-      const miniAppRoute = /^\/(home|chat|models|assistants|groups|moderation|bots|guard|secretary|threads|usage|history|payments|settings|help|admin(?:\/.*)?|group\/[^/]+)\/?$/.test(url.pathname);
+      const miniAppRoute = /^\/(home|chat|models|assistants|groups|moderation|bots|guard|secretary|threads|usage|history|payments|vouchers|settings|help|admin(?:\/.*)?|group\/[^/]+)\/?$/.test(url.pathname);
       const name = url.pathname === "/" ? "index.html" : miniAppRoute ? "miniapp.html" : decodeURIComponent(url.pathname.slice(1));
       const filePath = path.normalize(path.join(root, name));
       if (!filePath.startsWith(root + path.sep) && filePath !== root) return json(res, 404, { error: "Not found" });

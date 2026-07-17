@@ -678,6 +678,275 @@ export const PLATFORM_MIGRATIONS = Object.freeze([
       VALUES ('telegram_context_routing', TRUE, 'Deterministic Telegram transport and invocation routing')
       ON CONFLICT (feature_key) DO NOTHING;
     `
+  }),
+  Object.freeze({
+    version: "2026071703_adaptive_access_billing",
+    sql: `
+      ALTER TABLE platform_users
+        ADD COLUMN IF NOT EXISTS language_code TEXT CHECK (language_code IS NULL OR length(language_code) <= 16),
+        ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'standard'
+          CHECK (plan IN ('standard', 'premium', 'business', 'staff')),
+        ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'restricted', 'banned', 'disabled')),
+        ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS first_interaction_source TEXT
+          CHECK (first_interaction_source IS NULL OR length(first_interaction_source) <= 64),
+        ADD COLUMN IF NOT EXISTS last_interaction_source TEXT
+          CHECK (last_interaction_source IS NULL OR length(last_interaction_source) <= 64);
+      CREATE INDEX IF NOT EXISTS platform_users_plan_status_idx
+        ON platform_users(plan, status, last_seen_at DESC);
+
+      ALTER TABLE telegram_business_connections
+        ADD COLUMN IF NOT EXISTS access_status TEXT NOT NULL DEFAULT 'pending_access',
+        ADD COLUMN IF NOT EXISTS auto_reply_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS business_style TEXT NOT NULL DEFAULT 'friendly',
+        ADD COLUMN IF NOT EXISTS custom_style TEXT,
+        ADD COLUMN IF NOT EXISTS default_language TEXT NOT NULL DEFAULT 'auto',
+        ADD COLUMN IF NOT EXISTS retention_days INTEGER NOT NULL DEFAULT 30,
+        ADD COLUMN IF NOT EXISTS activation_version INTEGER NOT NULL DEFAULT 1,
+        ADD COLUMN IF NOT EXISTS onboarding_sent_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS access_decided_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS access_decided_by BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL;
+      ALTER TABLE telegram_business_connections
+        DROP CONSTRAINT IF EXISTS telegram_business_connections_access_status_check,
+        ADD CONSTRAINT telegram_business_connections_access_status_check CHECK (access_status IN (
+          'pending_access', 'approval_requested', 'payment_required', 'payment_pending',
+          'active_admin_approved', 'active_paid', 'denied', 'suspended', 'revoked', 'connection_disabled'
+        )),
+        DROP CONSTRAINT IF EXISTS telegram_business_connections_business_style_check,
+        ADD CONSTRAINT telegram_business_connections_business_style_check
+          CHECK (business_style IN ('formal', 'friendly', 'concise', 'custom')),
+        DROP CONSTRAINT IF EXISTS telegram_business_connections_retention_days_check,
+        ADD CONSTRAINT telegram_business_connections_retention_days_check CHECK (retention_days BETWEEN 1 AND 365),
+        DROP CONSTRAINT IF EXISTS telegram_business_connections_custom_style_check,
+        ADD CONSTRAINT telegram_business_connections_custom_style_check
+          CHECK (custom_style IS NULL OR length(custom_style) <= 1000);
+      CREATE INDEX IF NOT EXISTS telegram_business_connections_access_idx
+        ON telegram_business_connections(access_status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS secretary_access_requests (
+        request_id UUID PRIMARY KEY,
+        connection_id TEXT NOT NULL REFERENCES telegram_business_connections(connection_id) ON DELETE CASCADE,
+        owner_user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'approved', 'denied', 'cancelled')),
+        reason TEXT CHECK (reason IS NULL OR length(reason) <= 1000),
+        decided_by BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        decided_at TIMESTAMPTZ,
+        cooldown_until TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS secretary_access_requests_pending_uidx
+        ON secretary_access_requests(connection_id) WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS secretary_access_requests_admin_idx
+        ON secretary_access_requests(status, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS secretary_entitlements (
+        entitlement_id UUID PRIMARY KEY,
+        owner_user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        connection_id TEXT NOT NULL REFERENCES telegram_business_connections(connection_id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL CHECK (product_id = 'secretary_lifetime_activation'),
+        entitlement_version INTEGER NOT NULL DEFAULT 1 CHECK (entitlement_version > 0),
+        source TEXT NOT NULL CHECK (source IN ('primary_admin', 'admin_approved', 'telegram_stars')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'revoked', 'refunded')),
+        telegram_payment_charge_id TEXT UNIQUE,
+        granted_by BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        suspended_at TIMESTAMPTZ,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+        UNIQUE (connection_id, product_id, entitlement_version)
+      );
+      CREATE INDEX IF NOT EXISTS secretary_entitlements_owner_idx
+        ON secretary_entitlements(owner_user_id, status, granted_at DESC);
+
+      CREATE TABLE IF NOT EXISTS secretary_contact_settings (
+        connection_id TEXT NOT NULL REFERENCES telegram_business_connections(connection_id) ON DELETE CASCADE,
+        contact_chat_id BIGINT NOT NULL,
+        language_override TEXT,
+        tone_override TEXT CHECK (tone_override IS NULL OR tone_override IN ('adaptive', 'formal', 'friendly', 'concise')),
+        auto_reply_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        memory_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        retention_days INTEGER NOT NULL DEFAULT 30 CHECK (retention_days BETWEEN 1 AND 365),
+        introduction_sent_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (connection_id, contact_chat_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_usage_policies (
+        policy_id UUID PRIMARY KEY,
+        scope_type TEXT NOT NULL CHECK (scope_type IN ('global', 'plan', 'role', 'user', 'group', 'business_connection')),
+        scope_id TEXT NOT NULL DEFAULT '*',
+        feature_key TEXT NOT NULL DEFAULT 'ai_chat' CHECK (length(feature_key) BETWEEN 1 AND 64),
+        channel TEXT NOT NULL DEFAULT '*' CHECK (length(channel) BETWEEN 1 AND 64),
+        free_successes INTEGER NOT NULL DEFAULT 2 CHECK (free_successes BETWEEN 0 AND 100000),
+        window_seconds INTEGER NOT NULL DEFAULT 3600 CHECK (window_seconds BETWEEN 60 AND 2592000),
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        expires_at TIMESTAMPTZ,
+        updated_by BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (scope_type, scope_id, feature_key, channel)
+      );
+      INSERT INTO ai_usage_policies (policy_id, scope_type, scope_id, feature_key, channel, free_successes, window_seconds)
+      VALUES ('00000000-0000-4000-8000-000000000002', 'global', '*', 'ai_chat', '*', 2, 3600)
+      ON CONFLICT (scope_type, scope_id, feature_key, channel) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS ai_usage_events (
+        usage_id UUID PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE CHECK (length(idempotency_key) BETWEEN 1 AND 500),
+        owner_user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        subject_user_id BIGINT REFERENCES platform_users(user_id) ON DELETE SET NULL,
+        feature_key TEXT NOT NULL CHECK (length(feature_key) BETWEEN 1 AND 64),
+        channel TEXT NOT NULL CHECK (length(channel) BETWEEN 1 AND 64),
+        group_id BIGINT,
+        business_connection_id TEXT REFERENCES telegram_business_connections(connection_id) ON DELETE SET NULL,
+        conversation_key TEXT CHECK (conversation_key IS NULL OR length(conversation_key) <= 500),
+        billing_source TEXT NOT NULL CHECK (billing_source IN ('free', 'credit', 'unlimited')),
+        status TEXT NOT NULL DEFAULT 'reserved'
+          CHECK (status IN ('reserved', 'completed', 'failed', 'restored')),
+        credit_cost INTEGER NOT NULL DEFAULT 0 CHECK (credit_cost BETWEEN 0 AND 10000),
+        failure_category TEXT CHECK (failure_category IS NULL OR length(failure_category) <= 64),
+        provider_model TEXT,
+        provider_latency_ms INTEGER CHECK (provider_latency_ms IS NULL OR provider_latency_ms >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS ai_usage_events_allowance_idx
+        ON ai_usage_events(owner_user_id, feature_key, channel, completed_at DESC)
+        WHERE status = 'completed' AND billing_source = 'free';
+      CREATE INDEX IF NOT EXISTS ai_usage_events_analytics_idx
+        ON ai_usage_events(created_at DESC, channel, status);
+
+      ALTER TABLE telegram_group_settings
+        ADD COLUMN IF NOT EXISTS captcha_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS captcha_verification_seconds INTEGER NOT NULL DEFAULT 2592000,
+        ADD COLUMN IF NOT EXISTS captcha_max_attempts INTEGER NOT NULL DEFAULT 3,
+        ADD COLUMN IF NOT EXISTS captcha_retry_cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+        ADD COLUMN IF NOT EXISTS captcha_exempt_administrators BOOLEAN NOT NULL DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS group_model TEXT,
+        ADD COLUMN IF NOT EXISTS group_tone TEXT NOT NULL DEFAULT 'adaptive',
+        ADD COLUMN IF NOT EXISTS group_language TEXT NOT NULL DEFAULT 'auto',
+        ADD COLUMN IF NOT EXISTS group_response_length TEXT NOT NULL DEFAULT 'balanced',
+        ADD COLUMN IF NOT EXISTS group_creativity NUMERIC(3,2) NOT NULL DEFAULT 0.40,
+        ADD COLUMN IF NOT EXISTS group_instructions TEXT,
+        ADD COLUMN IF NOT EXISTS allowed_topics JSONB NOT NULL DEFAULT '[]'::jsonb;
+      ALTER TABLE telegram_group_settings
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_captcha_verification_seconds_check,
+        ADD CONSTRAINT telegram_group_settings_captcha_verification_seconds_check
+          CHECK (captcha_verification_seconds BETWEEN 300 AND 31536000),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_captcha_max_attempts_check,
+        ADD CONSTRAINT telegram_group_settings_captcha_max_attempts_check CHECK (captcha_max_attempts BETWEEN 1 AND 10),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_group_tone_check,
+        ADD CONSTRAINT telegram_group_settings_group_tone_check CHECK (group_tone IN ('adaptive', 'formal', 'casual', 'friendly', 'concise')),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_group_response_length_check,
+        ADD CONSTRAINT telegram_group_settings_group_response_length_check CHECK (group_response_length IN ('concise', 'balanced', 'detailed')),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_group_creativity_check,
+        ADD CONSTRAINT telegram_group_settings_group_creativity_check CHECK (group_creativity BETWEEN 0 AND 1),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_group_instructions_check,
+        ADD CONSTRAINT telegram_group_settings_group_instructions_check CHECK (group_instructions IS NULL OR length(group_instructions) <= 5000),
+        DROP CONSTRAINT IF EXISTS telegram_group_settings_allowed_topics_check,
+        ADD CONSTRAINT telegram_group_settings_allowed_topics_check CHECK (jsonb_typeof(allowed_topics) = 'array');
+
+      CREATE TABLE IF NOT EXISTS group_user_verifications (
+        group_id BIGINT NOT NULL REFERENCES telegram_groups(chat_id) ON DELETE CASCADE,
+        user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'verified' CHECK (status IN ('verified', 'revoked')),
+        verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ,
+        verified_by TEXT NOT NULL DEFAULT 'captcha' CHECK (verified_by IN ('captcha', 'administrator', 'exempt')),
+        PRIMARY KEY (group_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS group_user_verifications_expiry_idx
+        ON group_user_verifications(expires_at) WHERE expires_at IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS captcha_challenges (
+        challenge_id UUID PRIMARY KEY,
+        group_id BIGINT NOT NULL REFERENCES telegram_groups(chat_id) ON DELETE CASCADE,
+        user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        answer_hash TEXT NOT NULL CHECK (answer_hash ~ '^[a-f0-9]{64}$'),
+        prompt TEXT NOT NULL CHECK (length(prompt) BETWEEN 1 AND 200),
+        options JSONB NOT NULL CHECK (jsonb_typeof(options) = 'array'),
+        original_request JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(original_request) = 'object'),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts BETWEEN 1 AND 10),
+        expires_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS captcha_challenges_active_uidx
+        ON captcha_challenges(group_id, user_id) WHERE completed_at IS NULL;
+      CREATE INDEX IF NOT EXISTS captcha_challenges_expiry_idx
+        ON captcha_challenges(expires_at) WHERE completed_at IS NULL;
+
+      CREATE TABLE IF NOT EXISTS credit_vouchers (
+        voucher_id UUID PRIMARY KEY,
+        creation_request_id UUID NOT NULL UNIQUE,
+        code_hash TEXT NOT NULL UNIQUE CHECK (code_hash ~ '^[a-f0-9]{64}$'),
+        display_prefix TEXT NOT NULL CHECK (length(display_prefix) BETWEEN 4 AND 16),
+        credit_amount INTEGER NOT NULL CHECK (credit_amount BETWEEN 1 AND 1000000),
+        maximum_redemptions INTEGER NOT NULL DEFAULT 1 CHECK (maximum_redemptions BETWEEN 1 AND 1000000),
+        redemptions_used INTEGER NOT NULL DEFAULT 0 CHECK (redemptions_used >= 0 AND redemptions_used <= maximum_redemptions),
+        per_user_limit INTEGER NOT NULL DEFAULT 1 CHECK (per_user_limit BETWEEN 1 AND 1000),
+        eligible_plans JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(eligible_plans) = 'array'),
+        eligible_roles JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(eligible_roles) = 'array'),
+        assigned_user_id BIGINT REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        created_by BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE RESTRICT,
+        valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        revoked_at TIMESTAMPTZ,
+        internal_note TEXT CHECK (internal_note IS NULL OR length(internal_note) <= 1000),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS credit_vouchers_admin_idx
+        ON credit_vouchers(created_by, created_at DESC);
+      CREATE TABLE IF NOT EXISTS voucher_redemptions (
+        redemption_id UUID PRIMARY KEY,
+        voucher_id UUID NOT NULL REFERENCES credit_vouchers(voucher_id) ON DELETE RESTRICT,
+        user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        credits_added INTEGER NOT NULL CHECK (credits_added > 0),
+        redeemed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (voucher_id, user_id, redemption_id)
+      );
+      CREATE INDEX IF NOT EXISTS voucher_redemptions_user_idx
+        ON voucher_redemptions(user_id, redeemed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS web_oidc_requests (
+        state_hash TEXT PRIMARY KEY CHECK (state_hash ~ '^[a-f0-9]{64}$'),
+        nonce TEXT NOT NULL CHECK (length(nonce) BETWEEN 16 AND 200),
+        code_verifier_ciphertext TEXT NOT NULL,
+        redirect_uri TEXT NOT NULL CHECK (length(redirect_uri) BETWEEN 8 AND 2000),
+        return_to TEXT NOT NULL DEFAULT '/' CHECK (return_to ~ '^/'),
+        source_hash TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS web_oidc_requests_expiry_idx ON web_oidc_requests(expires_at);
+      CREATE TABLE IF NOT EXISTS web_sessions (
+        session_id UUID PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[a-f0-9]{64}$'),
+        csrf_hash TEXT NOT NULL CHECK (csrf_hash ~ '^[a-f0-9]{64}$'),
+        user_id BIGINT NOT NULL REFERENCES platform_users(user_id) ON DELETE CASCADE,
+        idle_expires_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        revoked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS web_sessions_user_active_idx
+        ON web_sessions(user_id, expires_at DESC) WHERE revoked_at IS NULL;
+
+      INSERT INTO feature_flags (feature_key, enabled, description)
+      VALUES
+        ('adaptive_secretary', TRUE, 'Adaptive Telegram Business Secretary routing and access control'),
+        ('group_captcha', TRUE, 'First-use verification for group AI access'),
+        ('credit_vouchers', TRUE, 'Administrator-issued internal AI credit vouchers'),
+        ('telegram_web_login', TRUE, 'Telegram OIDC website login when configured')
+      ON CONFLICT (feature_key) DO NOTHING;
+    `
   })
 ]);
 

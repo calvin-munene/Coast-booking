@@ -41,7 +41,7 @@ test("stabilization migration is additive and upgrades an existing migration his
     .map(({ values }) => ({ version: values[0], checksum: values[1] }));
   const upgrade = migrationPool(existingRows);
   const result = await runMigrations(upgrade.pool);
-  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services", "2026071702_telegram_contexts"]);
+  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services", "2026071702_telegram_contexts", "2026071703_adaptive_access_billing"]);
   const stabilizationSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071505_stabilization_foundation").sql;
   assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversations/);
   assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversation_messages/);
@@ -62,4 +62,11 @@ test("stabilization migration is additive and upgrades an existing migration his
   assert.match(contextSql, /activation_policy TEXT NOT NULL DEFAULT 'mention_only'/);
   assert.match(contextSql, /activation_policy <> 'always_on' OR always_on_confirmed_at IS NOT NULL/);
   assert.doesNotMatch(contextSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
+  const adaptiveSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071703_adaptive_access_billing").sql;
+  assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS secretary_entitlements/);
+  assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS ai_usage_events/);
+  assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS captcha_challenges/);
+  assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS credit_vouchers/);
+  assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS web_sessions/);
+  assert.doesNotMatch(adaptiveSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
 });

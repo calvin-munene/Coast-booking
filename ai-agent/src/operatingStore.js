@@ -64,6 +64,12 @@ function managedUserRow(row) {
     firstName: row.first_name || null,
     lastName: row.last_name || null,
     username: row.username || null,
+    languageCode: row.language_code || null,
+    plan: row.plan || "standard",
+    status: row.status || "active",
+    verified: row.verified === true,
+    firstInteractionSource: row.first_interaction_source || null,
+    lastInteractionSource: row.last_interaction_source || null,
     banned: row.banned === true,
     banReason: row.ban_reason || null,
     unlimitedCredits: row.unlimited_credits === true,
@@ -129,6 +135,18 @@ function groupSettingsRow(row) {
     blockedDomains: row.blocked_domains || [],
     guardPolicy: row.guard_policy || {},
     secretaryPolicy: row.secretary_policy || {},
+    captchaEnabled: row.captcha_enabled !== false,
+    captchaVerificationSeconds: Number(row.captcha_verification_seconds || 2592000),
+    captchaMaxAttempts: Number(row.captcha_max_attempts || 3),
+    captchaRetryCooldownSeconds: Number(row.captcha_retry_cooldown_seconds || 300),
+    captchaExemptAdministrators: row.captcha_exempt_administrators !== false,
+    groupModel: row.group_model || null,
+    groupTone: row.group_tone || "adaptive",
+    groupLanguage: row.group_language || "auto",
+    groupResponseLength: row.group_response_length || "balanced",
+    groupCreativity: Number(row.group_creativity ?? 0.4),
+    groupInstructions: row.group_instructions || null,
+    allowedTopics: row.allowed_topics || [],
     updatedAt: row.updated_at
   };
 }
@@ -143,6 +161,15 @@ function businessConnectionRow(row) {
     canReply: row.can_reply === true,
     rights: row.rights || {},
     allowedChatConfiguration: row.allowed_chat_configuration || {},
+    accessStatus: row.access_status || "pending_access",
+    accessActive: ["active_admin_approved", "active_paid"].includes(row.access_status),
+    autoReplyEnabled: row.auto_reply_enabled === true,
+    businessStyle: row.business_style || "friendly",
+    customStyle: row.custom_style || null,
+    defaultLanguage: row.default_language || "auto",
+    retentionDays: Number(row.retention_days || 30),
+    activationVersion: Number(row.activation_version || 1),
+    onboardingSentAt: row.onboarding_sent_at || null,
     connectedAt: row.connected_at,
     lastVerifiedAt: row.last_verified_at,
     updatedAt: row.updated_at
@@ -176,14 +203,19 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     const firstName = profile?.first_name ? bounded(profile.first_name, "firstName", 128) : null;
     const lastName = profile?.last_name ? bounded(profile.last_name, "lastName", 128) : null;
     const username = profile?.username ? bounded(profile.username, "username", 64) : null;
+    const languageCode = profile?.language_code ? bounded(profile.language_code, "languageCode", 16) : null;
+    const source = profile?.interactionSource ? bounded(profile.interactionSource, "interactionSource", 64) : null;
     return transaction(async (client) => {
       await ensureUserWithClient(client, id);
       const result = await client.query(
         `UPDATE platform_users SET first_name = COALESCE($2, first_name), last_name = COALESCE($3, last_name),
-           username = COALESCE($4, username), last_seen_at = NOW(), updated_at = NOW()
+           username = COALESCE($4, username), language_code = COALESCE($5, language_code),
+           first_interaction_source = COALESCE(first_interaction_source, $6),
+           last_interaction_source = COALESCE($6, last_interaction_source), last_seen_at = NOW(), updated_at = NOW()
          WHERE user_id = $1
-         RETURNING user_id::text, role, first_name, last_name, username, created_at, last_seen_at, updated_at`,
-        [id, firstName, lastName, username]
+         RETURNING user_id::text, role, first_name, last_name, username, language_code, plan, status,
+           verified, first_interaction_source, last_interaction_source, created_at, last_seen_at, updated_at`,
+        [id, firstName, lastName, username, languageCode, source]
       );
       return result.rows[0];
     });
@@ -469,11 +501,12 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     for (const key of [
       "enabled", "moderationEnabled", "guardEnabled", "secretaryEnabled", "secretaryObservationEnabled",
       "messageStorageEnabled", "botToBotEnabled", "alwaysOnConfirmed", "threadIsolationEnabled",
-      "welcomeEnabled", "goodbyeEnabled", "antiFloodEnabled", "antiLinkEnabled", "antiCapsEnabled", "antiSpamEnabled"
+      "welcomeEnabled", "goodbyeEnabled", "antiFloodEnabled", "antiLinkEnabled", "antiCapsEnabled", "antiSpamEnabled",
+      "captchaEnabled", "captchaExemptAdministrators"
     ]) {
       if (input[key] !== undefined) normalized[key] = boolean(input[key], key);
     }
-    for (const [key, maximum] of [["welcomeMessage", 2000], ["goodbyeMessage", 2000], ["rules", 10000]]) {
+    for (const [key, maximum] of [["welcomeMessage", 2000], ["goodbyeMessage", 2000], ["rules", 10000], ["groupInstructions", 5000]]) {
       if (input[key] !== undefined) normalized[key] = input[key] === null || input[key] === "" ? null : bounded(input[key], key, maximum);
     }
     if (input.warningThreshold !== undefined) {
@@ -505,7 +538,32 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
       normalized.retentionDays = Number(input.retentionDays);
       if (!Number.isSafeInteger(normalized.retentionDays) || normalized.retentionDays < 1 || normalized.retentionDays > 90) throw new TypeError("retentionDays is invalid");
     }
+    for (const [key, minimum, maximum] of [
+      ["captchaVerificationSeconds", 300, 31_536_000],
+      ["captchaMaxAttempts", 1, 10],
+      ["captchaRetryCooldownSeconds", 30, 86_400]
+    ]) {
+      if (input[key] !== undefined) {
+        normalized[key] = Number(input[key]);
+        if (!Number.isSafeInteger(normalized[key]) || normalized[key] < minimum || normalized[key] > maximum) throw new TypeError(`${key} is invalid`);
+      }
+    }
+    if (input.groupModel !== undefined) normalized.groupModel = input.groupModel === null || input.groupModel === "" ? null : bounded(input.groupModel, "groupModel", 200);
+    if (input.groupTone !== undefined) {
+      normalized.groupTone = String(input.groupTone);
+      if (!["adaptive", "formal", "casual", "friendly", "concise"].includes(normalized.groupTone)) throw new TypeError("groupTone is invalid");
+    }
+    if (input.groupLanguage !== undefined) normalized.groupLanguage = bounded(input.groupLanguage, "groupLanguage", 32).toLowerCase();
+    if (input.groupResponseLength !== undefined) {
+      normalized.groupResponseLength = String(input.groupResponseLength);
+      if (!["concise", "balanced", "detailed"].includes(normalized.groupResponseLength)) throw new TypeError("groupResponseLength is invalid");
+    }
+    if (input.groupCreativity !== undefined) {
+      normalized.groupCreativity = Number(input.groupCreativity);
+      if (!Number.isFinite(normalized.groupCreativity) || normalized.groupCreativity < 0 || normalized.groupCreativity > 1) throw new TypeError("groupCreativity is invalid");
+    }
     for (const key of ["blockedWords", "allowedDomains", "blockedDomains", "botToBotAllowlist"]) if (input[key] !== undefined) normalized[key] = stringArray(input[key], key);
+    if (input.allowedTopics !== undefined) normalized.allowedTopics = stringArray(input.allowedTopics, "allowedTopics", 100);
     for (const key of ["guardPolicy", "secretaryPolicy", "delegationPolicy"]) if (input[key] !== undefined) normalized[key] = jsonObject(input[key], key);
     if (!Object.keys(normalized).length) throw new TypeError("At least one group setting is required");
     return transaction(async (client) => {
@@ -543,7 +601,17 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
           bot_to_bot_allowlist = COALESCE($33::jsonb, bot_to_bot_allowlist),
           always_on_confirmed_at = CASE WHEN $34::boolean THEN CASE WHEN $35::boolean THEN NOW() ELSE NULL END ELSE always_on_confirmed_at END,
           thread_isolation_enabled = COALESCE($36, thread_isolation_enabled),
-          delegation_policy = COALESCE($37::jsonb, delegation_policy), updated_by = $38, updated_at = NOW()
+          delegation_policy = COALESCE($37::jsonb, delegation_policy), updated_by = $38,
+          captcha_enabled = COALESCE($39, captcha_enabled),
+          captcha_verification_seconds = COALESCE($40, captcha_verification_seconds),
+          captcha_max_attempts = COALESCE($41, captcha_max_attempts),
+          captcha_retry_cooldown_seconds = COALESCE($42, captcha_retry_cooldown_seconds),
+          captcha_exempt_administrators = COALESCE($43, captcha_exempt_administrators),
+          group_model = CASE WHEN $44::boolean THEN $45 ELSE group_model END,
+          group_tone = COALESCE($46, group_tone), group_language = COALESCE($47, group_language),
+          group_response_length = COALESCE($48, group_response_length), group_creativity = COALESCE($49, group_creativity),
+          group_instructions = CASE WHEN $50::boolean THEN $51 ELSE group_instructions END,
+          allowed_topics = COALESCE($52::jsonb, allowed_topics), updated_at = NOW()
          WHERE chat_id = $1 RETURNING *`,
         [id, normalized.enabled, normalized.moderationEnabled, normalized.guardEnabled, normalized.secretaryEnabled,
           normalized.welcomeEnabled, Object.hasOwn(normalized, "welcomeMessage"), normalized.welcomeMessage,
@@ -560,7 +628,11 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
           normalized.botToBotEnabled, normalized.botToBotAllowlist ? JSON.stringify(normalized.botToBotAllowlist) : null,
           Object.hasOwn(normalized, "alwaysOnConfirmed"), normalized.alwaysOnConfirmed,
           normalized.threadIsolationEnabled, normalized.delegationPolicy ? JSON.stringify(normalized.delegationPolicy) : null,
-          actor]
+          actor, normalized.captchaEnabled, normalized.captchaVerificationSeconds, normalized.captchaMaxAttempts,
+          normalized.captchaRetryCooldownSeconds, normalized.captchaExemptAdministrators,
+          Object.hasOwn(normalized, "groupModel"), normalized.groupModel, normalized.groupTone, normalized.groupLanguage,
+          normalized.groupResponseLength, normalized.groupCreativity, Object.hasOwn(normalized, "groupInstructions"),
+          normalized.groupInstructions, normalized.allowedTopics ? JSON.stringify(normalized.allowedTopics) : null]
       );
       if (!result.rowCount) {
         const error = new Error("Telegram group was not found");
@@ -1121,6 +1193,17 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
          ON CONFLICT (connection_id) DO UPDATE SET owner_user_id = EXCLUDED.owner_user_id,
            user_chat_id = EXCLUDED.user_chat_id, enabled = EXCLUDED.enabled, can_reply = EXCLUDED.can_reply,
            rights = EXCLUDED.rights, allowed_chat_configuration = EXCLUDED.allowed_chat_configuration,
+           access_status = CASE
+             WHEN EXCLUDED.enabled = FALSE THEN 'connection_disabled'
+             WHEN telegram_business_connections.access_status = 'connection_disabled' THEN COALESCE((
+               SELECT CASE WHEN entitlements.source = 'telegram_stars' THEN 'active_paid' ELSE 'active_admin_approved' END
+               FROM secretary_entitlements AS entitlements
+               WHERE entitlements.connection_id = EXCLUDED.connection_id AND entitlements.status = 'active'
+               ORDER BY entitlements.granted_at DESC LIMIT 1
+             ), 'pending_access')
+             ELSE telegram_business_connections.access_status
+           END,
+           auto_reply_enabled = CASE WHEN EXCLUDED.enabled AND EXCLUDED.can_reply THEN telegram_business_connections.auto_reply_enabled ELSE FALSE END,
            connected_at = EXCLUDED.connected_at, last_verified_at = NOW(), updated_at = NOW()
          RETURNING *`,
         [connectionId, owner, userChat, enabled, rights.can_reply === true, JSON.stringify(rights), JSON.stringify(allowed), connectedAt]
@@ -1180,19 +1263,21 @@ export function createOperatingStore({ transaction, ensureUserWithClient }) {
     });
   }
 
-  async function listObservedMessages({ chatId: rawChatId, threadId = null, transportMode = "group_secretary", limit: rawLimit = 100 } = {}) {
+  async function listObservedMessages({ chatId: rawChatId, threadId = null, transportMode = "group_secretary", businessConnectionId = null, limit: rawLimit = 100 } = {}) {
     const groupId = chatId(rawChatId);
     const thread = threadId === null || threadId === undefined ? null : chatId(threadId);
     if (!["group_secretary", "telegram_secretary"].includes(transportMode)) throw new TypeError("transportMode is invalid");
+    const connectionId = businessConnectionId ? bounded(businessConnectionId, "businessConnectionId", 256) : null;
     return transaction(async (client) => {
       const result = await client.query(
         `SELECT observation_id, update_type, transport_mode, chat_id::text, thread_id::text,
                 message_id::text, sender_user_id::text, content, status, observed_at, expires_at
          FROM telegram_observed_messages
          WHERE chat_id = $1 AND COALESCE(thread_id, 0) = COALESCE($2::bigint, 0)
-           AND transport_mode = $3 AND status IN ('active', 'edited') AND expires_at > NOW()
-         ORDER BY observed_at DESC LIMIT $4`,
-        [groupId, thread, transportMode, limit(rawLimit, 100, 500)]
+           AND transport_mode = $3 AND ($4::text IS NULL OR business_connection_id = $4)
+           AND status IN ('active', 'edited') AND expires_at > NOW()
+         ORDER BY observed_at DESC LIMIT $5`,
+        [groupId, thread, transportMode, connectionId, limit(rawLimit, 100, 500)]
       );
       return result.rows.reverse();
     });

@@ -10,6 +10,8 @@ const uptime = document.querySelector("#uptime");
 const modelSelect = document.querySelector("#model-select");
 const activeModel = document.querySelector("#active-model");
 const telegramLink = document.querySelector("#telegram-link");
+const telegramLogin = document.querySelector("#telegram-login");
+const telegramLogout = document.querySelector("#telegram-logout");
 const sessionId = localStorage.aiSessionId ||= crypto.randomUUID();
 const telegram = window.Telegram?.WebApp;
 const startedAt = Date.now();
@@ -17,6 +19,28 @@ const modelsById = new Map();
 let activeChatController = null;
 let channelLoadAttempts = 0;
 let telegramSessionToken = sessionStorage.getItem("nvidbotTelegramSession") || "";
+let websiteSession = null;
+
+async function loadWebsiteSession() {
+  try {
+    const response = await fetch("/api/web/session", { credentials: "same-origin", headers: { accept: "application/json" } });
+    if (!response.ok) return null;
+    websiteSession = await response.json();
+    telegramLogin.hidden = true;
+    telegramLogout.hidden = false;
+    telegramLogout.textContent = `LOG OUT · ${websiteSession.user.userId}`;
+    return websiteSession;
+  } catch { return null; }
+}
+
+telegramLogout?.addEventListener("click", async () => {
+  if (!websiteSession?.csrfToken) return;
+  await fetch("/api/web/logout", { method: "POST", credentials: "same-origin", headers: { "x-csrf-token": websiteSession.csrfToken } }).catch(() => undefined);
+  websiteSession = null;
+  telegramLogin.hidden = false;
+  telegramLogout.hidden = true;
+  location.reload();
+});
 
 async function loadTelegramSession() {
   if (telegramSessionToken) return telegramSessionToken;
@@ -227,12 +251,15 @@ form.addEventListener("submit", async (event) => {
 
   try {
     const authentication = await loadTelegramSession();
-    if (!authentication) throw new Error("AI chat is available from the NvidBot Telegram Mini App. Use OPEN TELEGRAM to continue.");
+    if (!authentication && !websiteSession) await loadWebsiteSession();
+    if (!authentication && !websiteSession) throw new Error("Log in securely with Telegram or open the Nvid AI Mini App to continue.");
     const response = await fetch("/api/chat", {
       method: "POST",
+      credentials: "same-origin",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${authentication}`
+        ...(authentication ? { authorization: `Bearer ${authentication}` } : {}),
+        ...(!authentication && websiteSession?.csrfToken ? { "x-csrf-token": websiteSession.csrfToken } : {})
       },
       body: JSON.stringify({ requestId: crypto.randomUUID(), message, model: requestedModel }),
       signal: controller.signal
@@ -468,6 +495,7 @@ setInterval(updateUptime, 1000);
 syncComposer();
 updateNetworkState();
 updateUptime();
+loadWebsiteSession();
 loadModels();
 loadChannels();
 startHackerField(document.querySelector("#hacker-canvas"));

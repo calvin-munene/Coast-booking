@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { runMigrations } from "./migrations.js";
 import { normalizePlatformRole } from "./rbac.js";
 import { createOperatingStore } from "./operatingStore.js";
+import { createMilestoneStore } from "./milestoneStore.js";
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FEATURE_KEY = /^[a-z][a-z0-9_]{1,63}$/;
@@ -975,6 +976,7 @@ export function createPlatformStore({ pool: injectedPool, connectionString = pro
   }
 
   const operatingStore = createOperatingStore({ transaction, ensureUserWithClient });
+  const milestoneStore = createMilestoneStore({ transaction, ensureUserWithClient });
 
   return {
     init,
@@ -1017,6 +1019,7 @@ export function createPlatformStore({ pool: injectedPool, connectionString = pro
     releaseLease,
     consumeSharedRateLimit,
     ...operatingStore,
+    ...milestoneStore,
     health,
     close
   };

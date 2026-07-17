@@ -13,6 +13,7 @@ test("Mini App Telegram mode settings render backend capability state", async ()
   assert.match(source, /messageStorageEnabled/);
   assert.match(source, /threadIsolationEnabled/);
   assert.match(source, /renderThreads/);
+  assert.match(source, /if \(!offline && state\.dashboard\) render\(currentPath\(\)\)/);
 });
 
 test("Mini App group management uses durable and live-backed routes", async () => {

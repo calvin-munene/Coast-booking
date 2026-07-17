@@ -1113,7 +1113,7 @@ function setupConnectivity() {
     offlineBanner.hidden = !offline;
     connectionState.classList.toggle("offline", offline);
     connectionState.lastChild.textContent = offline ? "OFFLINE" : "SECURE";
-    if (!offline) render(currentPath());
+    if (!offline && state.dashboard) render(currentPath());
   };
   window.addEventListener("online", update);
   window.addEventListener("offline", update);

@@ -139,7 +139,13 @@ export function classifyAiFailure(error) {
   if (code.includes("business_right")) return "missing_business_right";
   if (code.includes("credit") || message.includes("credit")) return "no_credits";
   if (status === 429) return message.includes("quota") ? "provider_quota_exhausted" : "rate_limited";
-  if (code.includes("timeout") || status === 504 || error?.name === "AbortError") return "nvidia_timeout";
+  if (
+    code.includes("timeout")
+    || status === 504
+    || ["AbortError", "TimeoutError"].includes(error?.name)
+    || message.includes("timed out")
+    || message.includes("aborted due to timeout")
+  ) return "nvidia_timeout";
   if (status === 404 || message.includes("model") && message.includes("unavailable")) return "model_unavailable";
   if (status === 400 && (message.includes("nvidia") || code.includes("provider"))) return "model_unavailable";
   if (status === 500 && message.includes("database") || code.includes("database")) return "database_failure";

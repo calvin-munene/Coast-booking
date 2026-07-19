@@ -4,6 +4,9 @@ const toast = document.getElementById("toast");
 const offlineBanner = document.getElementById("offline-banner");
 const connectionState = document.getElementById("connection-state");
 const backButton = document.getElementById("back-button");
+const adminLaunch = document.getElementById("admin-launch");
+const adminNavLink = document.getElementById("admin-nav-link");
+const bottomNav = document.getElementById("bottom-nav");
 const state = {
   session: sessionStorage.getItem("nvidbotTelegramSession") || "",
   dashboard: null,
@@ -90,6 +93,38 @@ async function authenticate() {
   }
   state.dashboard = result.dashboard;
   state.botLink = result.dashboard.telegram?.link || "/";
+  syncRoleNavigation();
+}
+
+function syncRoleNavigation() {
+  const platformAdmin = state.dashboard?.platformAdmin === true;
+  adminLaunch.hidden = !platformAdmin;
+  adminNavLink.hidden = !platformAdmin;
+  bottomNav.style.setProperty("--nav-items", platformAdmin ? "6" : "5");
+}
+
+const adminRoutes = Object.freeze([
+  ["Overview", "/admin"],
+  ["Users", "/admin/users"],
+  ["Groups", "/admin/groups"],
+  ["Analytics", "/admin/analytics"],
+  ["Access", "/admin/access-requests"],
+  ["Vouchers", "/admin/vouchers"],
+  ["Models", "/admin/models"],
+  ["Features", "/admin/features"],
+  ["Pricing", "/admin/pricing"],
+  ["Payments", "/admin/payments"],
+  ["Logs", "/admin/logs"],
+  ["System", "/admin/system"]
+]);
+
+function adminNavigation(path) {
+  return node("nav", { className: "admin-nav", "aria-label": "Administrator navigation" }, adminRoutes.map(([label, route]) => node("a", {
+    href: route,
+    "data-route": route,
+    className: path === route || (route === "/admin/users" && path.startsWith("/admin/user/")) ? "active" : "",
+    text: label
+  })));
 }
 
 function pageHead(title, description, eyebrow = "NVID AI OPERATING SYSTEM") {
@@ -1274,7 +1309,10 @@ async function render(path = currentPath()) {
     else if (path === "/vouchers") await renderVouchers();
     else if (path === "/settings") await renderSettings();
     else if (path === "/help") renderHelp();
-    else if (path.startsWith("/admin") && !unavailableRoutes[path]) await renderAdmin(path);
+    else if (path.startsWith("/admin") && !unavailableRoutes[path]) {
+      await renderAdmin(path);
+      app.prepend(adminNavigation(path));
+    }
     else renderUnavailable(path);
     app.focus({ preventScroll: true });
   } catch (error) {
@@ -1294,7 +1332,11 @@ function navigate(path, { replace = false } = {}) {
 }
 
 function updateNavigation(path) {
-  document.querySelectorAll("[data-route]").forEach((link) => link.classList.toggle("active", link.getAttribute("data-route") === path));
+  document.querySelectorAll("[data-route]").forEach((link) => {
+    const route = link.getAttribute("data-route");
+    const active = route === "/admin" ? path.startsWith("/admin") : route === path;
+    link.classList.toggle("active", active);
+  });
   const root = path === "/home";
   backButton.hidden = root;
   if (tg?.isVersionAtLeast?.("6.1")) {

@@ -874,14 +874,14 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
          LEFT JOIN telegram_user_controls AS controls ON controls.user_id = users.user_id WHERE users.user_id = $1`, [user]
       );
       if (!profile.rowCount) return null;
-      const [usage, payments, vouchers, groups, connections, access] = await Promise.all([
-        client.query("SELECT channel, billing_source, status, COUNT(*)::int AS count FROM ai_usage_events WHERE owner_user_id = $1 GROUP BY channel, billing_source, status", [user]),
-        client.query("SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::bigint::text AS stars FROM telegram_star_payments WHERE user_id = $1", [user]),
-        client.query("SELECT COUNT(*)::int AS count, COALESCE(SUM(credits_added), 0)::bigint::text AS credits FROM voucher_redemptions WHERE user_id = $1", [user]),
-        client.query("SELECT COUNT(DISTINCT group_id)::int AS count FROM group_user_verifications WHERE user_id = $1", [user]),
-        client.query("SELECT connection_id, access_status, enabled, can_reply, updated_at FROM telegram_business_connections WHERE owner_user_id = $1 ORDER BY updated_at DESC", [user]),
-        client.query("SELECT request_id, connection_id, status, created_at, decided_at FROM secretary_access_requests WHERE owner_user_id = $1 ORDER BY created_at DESC", [user])
-      ]);
+      // A checked-out pg client executes one query at a time. Keep this sequence explicit so
+      // the administrator user view remains reliable with current and future pg releases.
+      const usage = await client.query("SELECT channel, billing_source, status, COUNT(*)::int AS count FROM ai_usage_events WHERE owner_user_id = $1 GROUP BY channel, billing_source, status", [user]);
+      const payments = await client.query("SELECT COUNT(*)::int AS count, COALESCE(SUM(amount), 0)::bigint::text AS stars FROM telegram_star_payments WHERE user_id = $1", [user]);
+      const vouchers = await client.query("SELECT COUNT(*)::int AS count, COALESCE(SUM(credits_added), 0)::bigint::text AS credits FROM voucher_redemptions WHERE user_id = $1", [user]);
+      const groups = await client.query("SELECT COUNT(DISTINCT group_id)::int AS count FROM group_user_verifications WHERE user_id = $1", [user]);
+      const connections = await client.query("SELECT connection_id, access_status, enabled, can_reply, updated_at FROM telegram_business_connections WHERE owner_user_id = $1 ORDER BY updated_at DESC", [user]);
+      const access = await client.query("SELECT request_id, connection_id, status, created_at, decided_at FROM secretary_access_requests WHERE owner_user_id = $1 ORDER BY created_at DESC", [user]);
       return { ...profile.rows[0], usage: usage.rows, payments: payments.rows[0], vouchers: vouchers.rows[0], groupsUsed: groups.rows[0].count, businessConnections: connections.rows, accessRequests: access.rows };
     });
   }

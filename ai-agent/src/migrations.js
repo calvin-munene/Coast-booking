@@ -947,6 +947,25 @@ export const PLATFORM_MIGRATIONS = Object.freeze([
         ('telegram_web_login', TRUE, 'Telegram OIDC website login when configured')
       ON CONFLICT (feature_key) DO NOTHING;
     `
+  }),
+  Object.freeze({
+    version: "2026071901_conversation_transport_channels",
+    sql: `
+      ALTER TABLE conversations
+        DROP CONSTRAINT IF EXISTS conversations_channel_check;
+      ALTER TABLE conversations
+        ADD CONSTRAINT conversations_channel_check
+        CHECK (channel IN (
+          'telegram',
+          'telegram_business',
+          'telegram_guest',
+          'telegram_inline',
+          'miniapp',
+          'web',
+          'whatsapp',
+          'managed_bot'
+        ));
+    `
   })
 ]);
 

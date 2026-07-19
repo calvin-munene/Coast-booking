@@ -41,7 +41,7 @@ test("stabilization migration is additive and upgrades an existing migration his
     .map(({ values }) => ({ version: values[0], checksum: values[1] }));
   const upgrade = migrationPool(existingRows);
   const result = await runMigrations(upgrade.pool);
-  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services", "2026071702_telegram_contexts", "2026071703_adaptive_access_billing"]);
+  assert.deepEqual(result.applied, ["2026071505_stabilization_foundation", "2026071701_operating_services", "2026071702_telegram_contexts", "2026071703_adaptive_access_billing", "2026071901_conversation_transport_channels"]);
   const stabilizationSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071505_stabilization_foundation").sql;
   assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversations/);
   assert.match(stabilizationSql, /CREATE TABLE IF NOT EXISTS conversation_messages/);
@@ -69,4 +69,10 @@ test("stabilization migration is additive and upgrades an existing migration his
   assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS credit_vouchers/);
   assert.match(adaptiveSql, /CREATE TABLE IF NOT EXISTS web_sessions/);
   assert.doesNotMatch(adaptiveSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
+  const transportSql = PLATFORM_MIGRATIONS.find((migration) => migration.version === "2026071901_conversation_transport_channels").sql;
+  assert.match(transportSql, /DROP CONSTRAINT IF EXISTS conversations_channel_check/);
+  assert.match(transportSql, /'telegram_business'/);
+  assert.match(transportSql, /'telegram_guest'/);
+  assert.match(transportSql, /'telegram_inline'/);
+  assert.doesNotMatch(transportSql, /DROP TABLE|TRUNCATE TABLE|DELETE FROM/i);
 });

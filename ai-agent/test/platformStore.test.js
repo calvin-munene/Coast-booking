@@ -5,6 +5,7 @@ import { createPlatformStore, sourceIdentifierHash } from "../src/platformStore.
 
 function platformPool() {
   const audit = new Map();
+  const conversations = new Map();
   const features = new Map([
     ["group_management", {
       feature_key: "group_management",
@@ -43,6 +44,31 @@ function platformPool() {
       if (text.includes("SELECT version, checksum FROM app_schema_migrations")) return { rows: [], rowCount: 0 };
       if (text.includes("INSERT INTO platform_users") && text.includes("RETURNING user_id::text")) {
         return { rows: [{ user_id: String(values[0]), role: "standard_user" }], rowCount: 1 };
+      }
+      if (text.includes("INSERT INTO conversations (") && text.includes("ON CONFLICT (scope_key)")) {
+        if (!conversations.has(values[1])) {
+          conversations.set(values[1], {
+            conversation_id: values[0],
+            scope_key: values[1],
+            user_id: String(values[2]),
+            telegram_chat_id: values[3] === null ? null : String(values[3]),
+            telegram_thread_id: values[4] === null ? null : String(values[4]),
+            channel: values[5],
+            assistant_id: values[6],
+            selected_model: values[7],
+            title: values[8],
+            status: "active",
+            created_at: new Date(),
+            updated_at: new Date(),
+            deleted_at: null
+          });
+        }
+        return { rows: [], rowCount: 1 };
+      }
+      if (text.includes("FROM conversations WHERE scope_key = $1 AND user_id = $2")) {
+        const row = conversations.get(values[0]);
+        const owned = row && row.user_id === String(values[1]) ? row : null;
+        return { rows: owned ? [{ ...owned }] : [], rowCount: owned ? 1 : 0 };
       }
       if (text.includes("SELECT action, target_id, metadata FROM audit_logs")) {
         const row = audit.get(values[0]);
@@ -192,4 +218,18 @@ test("billing price changes are transactional, audited, and idempotent", async (
     store.setBillingPrice({ actorUserId: "42", featureKey: "ai_chat", starCost: 3, requestId }),
     (error) => error.statusCode === 409
   );
+});
+
+test("conversation persistence accepts Telegram Business, guest, and inline transports", async () => {
+  const fake = platformPool();
+  const store = createPlatformStore({ pool: fake.pool });
+  for (const [index, channel] of ["telegram_business", "telegram_guest", "telegram_inline"].entries()) {
+    const conversation = await store.getOrCreateConversation({
+      scopeKey: `${channel}:scope:${index}`,
+      userId: "42",
+      telegramChatId: String(100 + index),
+      channel
+    });
+    assert.equal(conversation.channel, channel);
+  }
 });

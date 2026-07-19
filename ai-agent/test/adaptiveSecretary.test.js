@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   adaptiveSecretaryProfile,
   asksSecretaryIdentity,
+  classifyAiFailure,
   detectMessageLanguage,
   safeAiFailureMessage,
   telegramMemoryScope
@@ -42,4 +43,10 @@ test("safe AI failure messages preserve allowance and do not expose internals", 
   assert.match(safeAiFailureMessage("entitlement_denied", { secretary: true }), /not been activated/);
   assert.match(safeAiFailureMessage("nvidia_timeout"), /not charged/);
   assert.doesNotMatch(safeAiFailureMessage("database_failure"), /stack|token|secret/i);
+});
+
+test("provider TimeoutError failures are classified as NVIDIA timeouts", () => {
+  const error = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  assert.equal(classifyAiFailure(error), "nvidia_timeout");
+  assert.match(safeAiFailureMessage(classifyAiFailure(error)), /not charged/);
 });

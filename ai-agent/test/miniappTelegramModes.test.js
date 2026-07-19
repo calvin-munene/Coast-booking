@@ -25,3 +25,20 @@ test("Mini App group management uses durable and live-backed routes", async () =
   assert.match(source, /Verified permissions/);
   assert.match(source, /Recent logs/);
 });
+
+test("authorized administrators receive persistent access to every implemented admin module", async () => {
+  const [source, html, css] = await Promise.all([
+    fs.readFile(new URL("../public/miniapp.js", import.meta.url), "utf8"),
+    fs.readFile(new URL("../public/miniapp.html", import.meta.url), "utf8"),
+    fs.readFile(new URL("../public/miniapp.css", import.meta.url), "utf8")
+  ]);
+  assert.match(html, /id="admin-launch"[^>]+hidden/);
+  assert.match(html, /id="admin-nav-link"[^>]+hidden/);
+  assert.match(source, /function syncRoleNavigation\(\)/);
+  assert.match(source, /state\.dashboard\?\.platformAdmin === true/);
+  for (const route of ["/admin/users", "/admin/groups", "/admin/analytics", "/admin/access-requests", "/admin/vouchers", "/admin/models", "/admin/features", "/admin/pricing", "/admin/payments", "/admin/logs", "/admin/system"]) {
+    assert.match(source, new RegExp(route.replaceAll("/", "\\/")));
+  }
+  assert.match(css, /\.admin-nav/);
+  assert.match(css, /repeat\(var\(--nav-items, 5\), 1fr\)/);
+});

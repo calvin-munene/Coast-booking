@@ -685,10 +685,18 @@ test("group configuration commands use live Telegram authority instead of stale 
 test("Telegram Business messages use telegram_secretary delivery context", async () => {
   process.env.TELEGRAM_BOT_TOKEN = "123:test-token";
   process.env.NVIDIA_API_KEY = "nvapi-test";
+  const persistedChannels = [];
   setPlatformStoreForTests(groupStoreDouble({
     async getBusinessConnection() {
       return { connectionId: "business-connection-1", ownerUserId: "123", enabled: true, canReply: true, accessActive: true, accessStatus: "active_paid", autoReplyEnabled: true, allowedChatConfiguration: {} };
-    }
+    },
+    async getOrCreateConversation(input) {
+      persistedChannels.push(input.channel);
+      return { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+    },
+    async conversationContext() { return []; },
+    async beginConversationTurn() { return { assistantMessageId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }; },
+    async finishConversationTurn() {}
   }));
   const telegramCalls = [];
   let nvidiaCalls = 0;
@@ -714,6 +722,7 @@ test("Telegram Business messages use telegram_secretary delivery context", async
   });
 
   assert.equal(nvidiaCalls, 1);
+  assert.deepEqual(persistedChannels, ["telegram_business"]);
   assert.equal(telegramCalls.find(({ method }) => method === "sendMessage").payload.business_connection_id, "business-connection-1");
 });
 

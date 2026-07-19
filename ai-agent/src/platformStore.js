@@ -617,7 +617,17 @@ export function createPlatformStore({ pool: injectedPool, connectionString = pro
   }) {
     const userId = normalizeUserId(rawUserId);
     const scope = normalizeBoundedText(scopeKey, "scopeKey", { maximum: 500 });
-    if (!["telegram", "miniapp", "whatsapp"].includes(channel)) throw new TypeError("channel is invalid");
+    const supportedChannels = new Set([
+      "telegram",
+      "telegram_business",
+      "telegram_guest",
+      "telegram_inline",
+      "miniapp",
+      "web",
+      "whatsapp",
+      "managed_bot"
+    ]);
+    if (!supportedChannels.has(channel)) throw new TypeError("channel is invalid");
     const chatId = telegramChatId === null ? null : normalizeTelegramChatId(telegramChatId);
     const threadId = telegramThreadId === null ? null : normalizeTelegramChatId(telegramThreadId);
     const normalizedAssistantId = assistantId ? normalizeUuid(assistantId, "assistantId") : null;

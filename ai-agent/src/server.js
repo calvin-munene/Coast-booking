@@ -86,6 +86,27 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+function csvCell(value) {
+  let text = value === null || value === undefined ? "" : String(value);
+  if (/^[\t\r ]*[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function csv(res, filename, columns, rows) {
+  const body = [
+    columns.map(({ label }) => csvCell(label)).join(","),
+    ...rows.map((row) => columns.map(({ key }) => csvCell(row[key])).join(","))
+  ].join("\r\n");
+  res.writeHead(200, {
+    "content-type": "text/csv; charset=utf-8",
+    "content-disposition": `attachment; filename="${filename}"`,
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer"
+  });
+  res.end(body);
+}
+
 function httpError(statusCode, message) {
   const error = new Error(message);
   error.statusCode = statusCode;
@@ -932,6 +953,13 @@ export function createAppServer() {
       return json(res, 200, { policy });
     }
 
+    if (req.method === "GET" && url.pathname === "/api/admin/usage-policies") {
+      const auth = await authorizeAdminRequest(req, { permission: "billing.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const policies = await getPlatformStore()?.listUsagePolicies?.({ limit: parseLimit(url) }) || [];
+      return json(res, 200, { policies });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/admin/overview") {
       if (!consumeRequestBudget(req, "admin-read", { limit: 120, windowMs: 60_000 })) return json(res, 429, { error: "Request limit reached" });
       const auth = await authorizeAdminRequest(req, { permission: "admin.view" });
@@ -1519,6 +1547,24 @@ export function createAppServer() {
       if (userId && !/^[1-9]\d*$/.test(userId)) return json(res, 400, { error: "userId must be a Telegram user ID" });
       const history = await telegramBillingHistory({ userId: userId || null, limit: parseLimit(url) });
       return json(res, 200, url.pathname.endsWith("/payments") ? { payments: history.payments } : { usage: history.usage });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/admin/payments.csv") {
+      if (!consumeRequestBudget(req, "admin-export", { limit: 12, windowMs: 60_000 })) return json(res, 429, { error: "Export limit reached" });
+      const auth = await authorizeAdminRequest(req, { permission: "billing.view" });
+      if (!auth.allowed) return json(res, auth.status, { error: auth.error });
+      const userId = url.searchParams.get("userId");
+      if (userId && !/^[1-9]\d*$/.test(userId)) return json(res, 400, { error: "userId must be a Telegram user ID" });
+      const history = await telegramBillingHistory({ userId: userId || null, limit: parseLimit(url) });
+      return csv(res, "nvid-ai-payments.csv", [
+        { key: "chargeId", label: "Telegram charge ID" },
+        { key: "userId", label: "Telegram user ID" },
+        { key: "amount", label: "Stars" },
+        { key: "currency", label: "Currency" },
+        { key: "creditedAt", label: "Credited at" },
+        { key: "refundedAt", label: "Refunded at" },
+        { key: "refundedAmount", label: "Refunded Stars" }
+      ], history.payments);
     }
 
     if (req.method === "POST" && url.pathname === "/webhooks/telegram") {

@@ -52,3 +52,38 @@ test("voucher creation is request-idempotent and never persists the redeemable c
   assert.match(inserts[0][2], /^[a-f0-9]{64}$/);
   assert.equal(inserts[0].includes(first.code), false);
 });
+
+test("usage policy listing is bounded and returns durable policy records", async () => {
+  const rows = [{ policy_id: "policy-1", scope_type: "global", scope_id: "*", free_successes: 2, window_seconds: 3600, active: true }];
+  const calls = [];
+  const store = createMilestoneStore({
+    transaction: (operation) => operation({ async query(sql, params) { calls.push({ sql: String(sql), params }); return result(rows); } }),
+    ensureUserWithClient: async () => {}
+  });
+  assert.deepEqual(await store.listUsagePolicies({ limit: 25 }), rows);
+  assert.deepEqual(calls[0].params, [25]);
+  await assert.rejects(() => store.listUsagePolicies({ limit: 251 }), /limit is invalid/);
+});
+
+test("user analytics includes internal notes and effective allowance policies without raw messages", async () => {
+  const client = {
+    async query(sql) {
+      const statement = String(sql);
+      if (statement.includes("FROM platform_users AS users")) return result([{ user_id: "123", role: "standard_user", plan: "standard", balance: "4" }]);
+      if (statement.includes("GROUP BY channel")) return result([{ channel: "miniapp", billing_source: "free", status: "completed", count: 2 }]);
+      if (statement.includes("FROM telegram_star_payments")) return result([{ count: 1, stars: "5" }]);
+      if (statement.includes("FROM voucher_redemptions")) return result([{ count: 1, credits: "10" }]);
+      if (statement.includes("FROM group_user_verifications")) return result([{ count: 2 }]);
+      if (statement.includes("FROM telegram_business_connections")) return result([]);
+      if (statement.includes("FROM secretary_access_requests")) return result([]);
+      if (statement.includes("FROM user_admin_notes")) return result([{ note_id: "note-1", author_user_id: "6643462826", note: "Support follow-up", created_at: new Date() }]);
+      if (statement.includes("FROM ai_usage_policies")) return result([{ scope_type: "user", scope_id: "123", free_successes: 3, window_seconds: 3600, active: true }]);
+      throw new Error(`Unexpected query: ${statement.slice(0, 90)}`);
+    }
+  };
+  const store = createMilestoneStore({ transaction: (operation) => operation(client), ensureUserWithClient: async () => {} });
+  const analytics = await store.getUserAnalytics("123");
+  assert.equal(analytics.notes[0].note, "Support follow-up");
+  assert.equal(analytics.usagePolicies[0].free_successes, 3);
+  assert.equal(analytics.messages, undefined);
+});

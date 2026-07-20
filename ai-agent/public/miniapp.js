@@ -73,6 +73,35 @@ async function api(path, { method = "GET", body, signal } = {}) {
   return data;
 }
 
+async function downloadAdminExport(path, filename) {
+  const response = await fetch(path, {
+    headers: {
+      accept: "text/csv",
+      ...(state.session ? { authorization: `Bearer ${state.session}` } : {})
+    }
+  });
+  if (response.status === 401) {
+    sessionStorage.removeItem("nvidbotTelegramSession");
+    state.session = "";
+  }
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Export failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const href = URL.createObjectURL(blob);
+  const link = node("a", { href, download: filename });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
+}
+
+async function copyText(value) {
+  if (!navigator.clipboard?.writeText) throw new Error("Clipboard access is unavailable. Select and copy the code manually.");
+  await navigator.clipboard.writeText(String(value));
+}
+
 async function authenticate() {
   const launch = async (useSession) => api("/api/miniapp/state", {
     method: "POST",
@@ -110,6 +139,8 @@ const adminRoutes = Object.freeze([
   ["Analytics", "/admin/analytics"],
   ["Access", "/admin/access-requests"],
   ["Vouchers", "/admin/vouchers"],
+  ["Limits", "/admin/limits"],
+  ["Bots", "/admin/bots"],
   ["Models", "/admin/models"],
   ["Features", "/admin/features"],
   ["Pricing", "/admin/pricing"],
@@ -477,21 +508,61 @@ async function renderModels() {
   const models = data.models;
   const items = models.map((model) => {
     const enabled = model.enabled ?? true;
-    const control = admin ? node("button", { className: `toggle ${enabled ? "on" : ""}`, type: "button", "aria-label": `${enabled ? "Disable" : "Enable"} ${model.label}` }) : badge(model.tag || "AVAILABLE", "neutral");
-    if (admin) control.addEventListener("click", async () => {
-      control.disabled = true;
-      try {
-        await api("/api/admin/models", { method: "POST", body: { requestId: requestId(), modelId: model.id, enabled: !enabled } });
-        haptic();
-        await renderModels();
-      } catch (error) { showToast(error.message); control.disabled = false; }
-    });
-    return node("article", { className: "list-item" }, [
+    if (!admin) return node("article", { className: "list-item" }, [
       node("div", {}, [node("h3", { text: model.label || model.id }), node("p", { text: model.description || "NVIDIA model" }), node("code", { text: model.id })]),
-      node("div", {}, [control, admin && model.providerAvailable === false ? badge("PROVIDER OFFLINE", "danger") : null])
+      badge(model.tag || "AVAILABLE", "neutral")
+    ]);
+    const label = node("input", { value: model.label || model.id, maxlength: "200" });
+    const description = node("textarea", { maxlength: "1000", placeholder: "Capability and use-case description" });
+    description.value = model.description || "";
+    const enabledInput = node("input", { type: "checkbox" });
+    enabledInput.checked = enabled;
+    const featuredInput = node("input", { type: "checkbox" });
+    featuredInput.checked = model.featured === true;
+    const save = node("button", { className: "button", type: "button", text: "Save model" });
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        await api("/api/admin/models", {
+          method: "POST",
+          body: {
+            requestId: requestId(),
+            modelId: model.id,
+            enabled: enabledInput.checked,
+            featured: featuredInput.checked,
+            label: label.value.trim(),
+            description: description.value.trim() || null
+          }
+        });
+        haptic();
+        showToast("Model controls saved and audited");
+        await renderModels();
+      } catch (error) { showToast(error.message); save.disabled = false; }
+    });
+    return node("article", { className: "card model-admin-card" }, [
+      node("div", { className: "model-admin-head" }, [
+        node("div", {}, [node("h3", { text: model.label || model.id }), node("code", { text: model.id })]),
+        node("div", { className: "button-row" }, [
+          badge(model.providerAvailable === false ? "PROVIDER OFFLINE" : "PROVIDER READY", model.providerAvailable === false ? "danger" : ""),
+          badge(enabled ? "ENABLED" : "DISABLED", enabled ? "" : "off")
+        ])
+      ]),
+      node("div", { className: "settings-grid" }, [
+        node("div", { className: "field" }, [node("label", { text: "Display label" }), label]),
+        node("div", { className: "switch-pair" }, [
+          node("label", { className: "setting-switch" }, [node("span", { text: "Enabled" }), enabledInput]),
+          node("label", { className: "setting-switch" }, [node("span", { text: "Featured" }), featuredInput])
+        ])
+      ]),
+      node("div", { className: "field" }, [node("label", { text: "Description" }), description]),
+      save
     ]);
   });
-  app.replaceChildren(pageHead("NVIDIA Models", admin ? "Enable or disable models without editing source code. At least one model must remain enabled." : "Models approved by the Nvid AI administrator."), node("section", { className: "list" }, items));
+  app.replaceChildren(...[
+    pageHead("NVIDIA Models", admin ? "Control availability, featured placement, labels, and descriptions. At least one provider-ready model must remain enabled." : "Models approved by the Nvid AI administrator."),
+    admin ? node("section", { className: "provider-strip" }, [stat("Discovered", data.discovered ?? models.length), stat("Provider", data.provider?.status || "unknown"), stat("Enabled", models.filter((item) => item.enabled).length)]) : null,
+    node("section", { className: "list" }, items)
+  ].filter(Boolean));
 }
 
 function historyItem(title, subtitle, stateText, danger = false) {
@@ -1059,22 +1130,87 @@ async function renderAdminUserDetail(userId) {
     } }));
   }
   actions.push(node("button", { className: "button danger", type: "button", text: profile.role === "banned_user" || profile.status === "banned" ? "Unban user" : "Ban user", onclick: () => mutate({ banned: !(profile.role === "banned_user" || profile.status === "banned"), banReason: "Administrator dashboard action" }) }));
-  const usageRows = (detail.usage || []).map((row) => historyItem(`${row.channel} · ${row.billing_source}`, `${row.count} request events`, row.status.toUpperCase(), row.status === "failed"));
-  app.replaceChildren(
+  const noteInput = node("textarea", { maxlength: "2000", placeholder: "Internal note (never shown to the user)" });
+  const addNote = node("button", { className: "button", type: "button", text: "Add audited note" });
+  addNote.addEventListener("click", async () => {
+    const note = noteInput.value.trim();
+    if (!note) return showToast("Enter a note first");
+    addNote.disabled = true;
+    try { await mutate({ note }); } catch (error) { showToast(error.message); addNote.disabled = false; }
+  });
+  const usageRows = (detail.usage || []).map((row) => historyItem(`${row.channel} / ${row.billing_source}`, `${row.count} request events`, row.status.toUpperCase(), row.status === "failed"));
+  const noteRows = (detail.notes || []).map((note) => historyItem(`Administrator ${note.author_user_id || "system"}`, note.note, verifiedTime(note.created_at)));
+  const policyRows = (detail.usagePolicies || []).map((policy) => historyItem(
+    `${policy.scope_type} / ${policy.channel}`,
+    `${policy.free_successes} successful requests per ${Math.round(Number(policy.window_seconds) / 60)} minutes`,
+    policy.active ? "ACTIVE" : "OFF",
+    !policy.active
+  ));
+  const connectionRows = (detail.businessConnections || []).map((connection) => historyItem(
+    `Business ${connection.connection_id}`,
+    `Reply right: ${connection.can_reply ? "yes" : "no"} / Updated ${verifiedTime(connection.updated_at)}`,
+    displayStatus(connection.access_status),
+    !connection.enabled
+  ));
+  const allowanceControls = [];
+  if (state.dashboard.platformRole === "super_admin") {
+    const free = node("input", { type: "number", min: "0", max: "100000", value: "2" });
+    const minutes = node("input", { type: "number", min: "1", max: "43200", value: "60" });
+    const saveAllowance = node("button", { className: "button primary", type: "button", text: "Save user allowance" });
+    saveAllowance.addEventListener("click", async () => {
+      saveAllowance.disabled = true;
+      try {
+        await api("/api/admin/usage-policy", { method: "POST", body: { requestId: requestId(), scopeType: "user", scopeId: userId, featureKey: "ai_chat", channel: "*", freeSuccesses: Number(free.value), windowSeconds: Number(minutes.value) * 60 } });
+        showToast("User allowance saved and audited");
+        await renderAdminUserDetail(userId);
+      } catch (error) { showToast(error.message); saveAllowance.disabled = false; }
+    });
+    allowanceControls.push(
+      node("div", { className: "settings-grid" }, [
+        node("div", { className: "field" }, [node("label", { text: "Free successful requests" }), free]),
+        node("div", { className: "field" }, [node("label", { text: "Rolling window (minutes)" }), minutes])
+      ]),
+      saveAllowance
+    );
+  }
+  app.replaceChildren(...[
     pageHead(profile.username ? `@${profile.username}` : `Telegram user ${userId}`, "Tenant-safe account details, entitlements, billing metadata, and aggregated usage."),
-    node("section", { className: "stats" }, [stat("Role", profile.role || "standard_user"), stat("Plan", profile.plan || "standard"), stat("Credits", profile.balance || "0"), stat("Verified", profile.verified ? "Yes" : "No")]),
-    node("section", { className: "card" }, [node("h3", { text: [profile.first_name, profile.last_name].filter(Boolean).join(" ") || "Telegram account" }), node("p", { text: `First seen ${verifiedTime(profile.created_at)} · Last active ${verifiedTime(profile.last_seen_at)}` }), node("div", { className: "button-row" }, actions)]),
-    node("section", { className: "section" }, [sectionTitle("Usage by channel"), usageRows.length ? node("div", { className: "list" }, usageRows) : node("p", { className: "notice", text: "No AI usage events." })])
-  );
+    node("section", { className: "stats" }, [stat("Role", profile.role || "standard_user"), stat("Plan", profile.plan || "standard"), stat("Credits", profile.balance || "0"), stat("Verified", profile.verified ? "Yes" : "No"), stat("Stars paid", detail.payments?.stars || "0"), stat("Groups", detail.groupsUsed || "0")]),
+    node("section", { className: "card" }, [node("h3", { text: [profile.first_name, profile.last_name].filter(Boolean).join(" ") || "Telegram account" }), node("p", { text: `First seen ${verifiedTime(profile.created_at)} / Last active ${verifiedTime(profile.last_seen_at)}` }), node("div", { className: "button-row" }, actions)]),
+    allowanceControls.length ? node("section", { className: "card" }, [node("h3", { text: "Individual free allowance" }), node("p", { className: "subcopy", text: "This policy overrides the global default without changing other accounts." }), ...allowanceControls]) : null,
+    node("section", { className: "section" }, [sectionTitle("Usage policies"), policyRows.length ? node("div", { className: "list" }, policyRows) : node("p", { className: "notice", text: "Global default applies." })]),
+    node("section", { className: "section" }, [sectionTitle("Usage by channel"), usageRows.length ? node("div", { className: "list" }, usageRows) : node("p", { className: "notice", text: "No AI usage events." })]),
+    node("section", { className: "section" }, [sectionTitle("Secretary connections"), connectionRows.length ? node("div", { className: "list" }, connectionRows) : node("p", { className: "notice", text: "No Telegram Business connections." })]),
+    node("section", { className: "card" }, [node("h3", { text: "Internal notes" }), node("div", { className: "field" }, [node("label", { text: "Add note" }), noteInput]), addNote, noteRows.length ? node("div", { className: "list inset-list" }, noteRows) : node("p", { className: "notice", text: "No internal notes." })])
+  ].filter(Boolean));
 }
 
 async function renderAdminAnalytics() {
   const data = await api("/api/admin/analytics");
   const metrics = data.analytics || {};
-  const cards = Object.entries(metrics).map(([key, value]) => stat(key.replaceAll("_", " "), String(value ?? 0)));
+  const labels = {
+    total_users: "Total users", new_users: "New users (30d)", active_users: "Active users (7d)", verified_users: "Verified users",
+    paying_users: "Paying users", restricted_users: "Restricted / banned", secretary_connections: "Secretary connections",
+    pending_secretary_requests: "Pending access", paid_secretary_activations: "Paid activations", active_groups: "Active groups",
+    group_invocations: "Group AI requests", private_ai_requests: "Private AI requests", secretary_ai_replies: "Secretary replies",
+    free_requests_consumed: "Free requests", credits_consumed: "Credits consumed", stars_received: "Stars received",
+    voucher_credits_issued: "Voucher credits issued", voucher_redemptions: "Voucher redemptions", failed_generations: "Failed generations"
+  };
+  const maximum = Math.max(1, ...Object.values(metrics).map((value) => Number(value) || 0));
+  const metricCard = (key) => {
+    const value = Number(metrics[key]) || 0;
+    return node("article", { className: "metric-card" }, [
+      node("div", { className: "metric-head" }, [node("span", { text: labels[key] || key.replaceAll("_", " ") }), node("strong", { text: String(metrics[key] ?? 0) })]),
+      node("div", { className: "metric-track", "aria-hidden": "true" }, [node("span", { style: `width:${Math.max(value ? 4 : 0, Math.round((value / maximum) * 100))}%` })])
+    ]);
+  };
+  const section = (title, keys) => node("section", { className: "section analytics-section" }, [sectionTitle(title), node("div", { className: "analytics-grid" }, keys.filter((key) => key in metrics).map(metricCard))]);
   app.replaceChildren(
     pageHead("Platform Analytics", "Aggregated users, groups, Secretary activations, Stars, credits, vouchers, and provider usage—without raw conversations."),
-    node("section", { className: "analytics-grid" }, cards)
+    section("Audience", ["total_users", "new_users", "active_users", "verified_users", "paying_users", "restricted_users", "active_groups"]),
+    section("AI usage", ["private_ai_requests", "group_invocations", "secretary_ai_replies", "free_requests_consumed", "credits_consumed", "failed_generations"]),
+    section("Secretary", ["secretary_connections", "pending_secretary_requests", "paid_secretary_activations"]),
+    section("Revenue and campaigns", ["stars_received", "voucher_credits_issued", "voucher_redemptions"])
   );
 }
 
@@ -1097,21 +1233,171 @@ async function renderAdminVouchers() {
   const data = await api("/api/admin/vouchers?limit=100");
   const amount = node("input", { type: "number", min: "1", max: "1000000", value: "10" });
   const uses = node("input", { type: "number", min: "1", max: "1000000", value: "1" });
+  const perUser = node("input", { type: "number", min: "1", max: "1000", value: "1" });
+  const expires = node("input", { type: "datetime-local" });
+  const assignedUser = node("input", { inputmode: "numeric", maxlength: "20", placeholder: "Optional Telegram user ID" });
+  const plans = node("input", { maxlength: "250", placeholder: "Optional: standard,premium" });
+  const roles = node("input", { maxlength: "250", placeholder: "Optional: standard_user,premium_user" });
+  const note = node("textarea", { maxlength: "1000", placeholder: "Internal campaign note" });
   const result = node("pre", { className: "one-time-secret", text: "The generated code will appear here once." });
-  const create = node("button", { className: "button primary", type: "button", text: "Generate secure voucher" });
-  create.addEventListener("click", async () => {
-    try {
-      const response = await api("/api/admin/vouchers", { method: "POST", body: { requestId: requestId(), creditAmount: Number(amount.value), maximumRedemptions: Number(uses.value), perUserLimit: 1 } });
-      result.textContent = response.voucher.code || "This request was already processed. The one-time code cannot be displayed again.";
-      showToast(response.voucher.duplicate ? "Voucher request was already processed." : "Voucher created. Copy the one-time code now.");
-    } catch (error) { showToast(error.message); }
+  const copy = node("button", { className: "button", type: "button", text: "Copy code" });
+  const exportCode = node("button", { className: "button", type: "button", text: "Download code" });
+  copy.disabled = true;
+  exportCode.disabled = true;
+  let latestCode = "";
+  copy.addEventListener("click", async () => {
+    try { await copyText(latestCode); showToast("Voucher code copied"); } catch (error) { showToast(error.message); }
   });
-  const rows = (data.vouchers || []).map((voucher) => historyItem(`${voucher.display_prefix}… · ${voucher.credit_amount} credits`, `${voucher.redemptions_used}/${voucher.maximum_redemptions} redemptions`, voucher.active && !voucher.revoked_at ? "ACTIVE" : "REVOKED", !voucher.active));
+  exportCode.addEventListener("click", () => {
+    if (!latestCode) return;
+    const href = URL.createObjectURL(new Blob([`${latestCode}\r\n`], { type: "text/plain;charset=utf-8" }));
+    const link = node("a", { href, download: "nvid-ai-voucher.txt" });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 1000);
+  });
+  const create = node("button", { className: "button primary", type: "button", text: "Generate secure voucher" });
+  const refresh = node("button", { className: "button", type: "button", text: "Refresh campaigns", onclick: () => renderAdminVouchers() });
+  create.addEventListener("click", async () => {
+    create.disabled = true;
+    try {
+      const response = await api("/api/admin/vouchers", { method: "POST", body: {
+        requestId: requestId(),
+        creditAmount: Number(amount.value),
+        maximumRedemptions: Number(uses.value),
+        perUserLimit: Number(perUser.value),
+        expiresAt: expires.value ? new Date(expires.value).toISOString() : null,
+        assignedUserId: assignedUser.value.trim() || null,
+        eligiblePlans: plans.value.split(",").map((value) => value.trim()).filter(Boolean),
+        eligibleRoles: roles.value.split(",").map((value) => value.trim()).filter(Boolean),
+        internalNote: note.value.trim() || null
+      } });
+      latestCode = response.voucher.code || "";
+      result.textContent = latestCode || "This request was already processed. The one-time code cannot be displayed again.";
+      copy.disabled = !latestCode;
+      exportCode.disabled = !latestCode;
+      showToast(response.voucher.duplicate ? "Voucher request was already processed." : "Voucher created. Copy the one-time code now.");
+    } catch (error) { showToast(error.message); } finally { create.disabled = false; }
+  });
+  const rows = (data.vouchers || []).map((voucher) => {
+    const expired = voucher.expires_at && new Date(voucher.expires_at) <= new Date();
+    const active = voucher.active && !voucher.revoked_at && !expired;
+    const revoke = node("button", { className: "button danger", type: "button", text: "Revoke" });
+    revoke.disabled = !active;
+    revoke.addEventListener("click", async () => {
+      const reason = window.prompt("Reason for revoking this voucher", "Campaign ended");
+      if (reason === null) return;
+      revoke.disabled = true;
+      try {
+        await api(`/api/admin/vouchers/${voucher.voucher_id}/revoke`, { method: "POST", body: { reason: reason.trim() || "Administrator revocation" } });
+        showToast("Voucher revoked and audited");
+        await renderAdminVouchers();
+      } catch (error) { showToast(error.message); revoke.disabled = false; }
+    });
+    return node("article", { className: "list-item" }, [
+      node("div", {}, [
+        node("h3", { text: `${voucher.display_prefix}… / ${voucher.credit_amount} credits` }),
+        node("p", { text: `${voucher.redemptions_used}/${voucher.maximum_redemptions} redemptions / ${voucher.per_user_limit} per user${voucher.expires_at ? ` / expires ${verifiedTime(voucher.expires_at)}` : " / no expiry"}` }),
+        voucher.internal_note ? node("small", { text: voucher.internal_note }) : null
+      ]),
+      node("div", { className: "button-row" }, [badge(active ? "ACTIVE" : expired ? "EXPIRED" : "REVOKED", active ? "" : "danger"), revoke])
+    ]);
+  });
   app.replaceChildren(
     pageHead("Voucher Studio", "Generate cryptographically secure one-use or campaign credit vouchers. Full codes are never stored in plaintext."),
-    node("section", { className: "card" }, [node("div", { className: "settings-grid" }, [node("div", { className: "field" }, [node("label", { text: "Credits" }), amount]), node("div", { className: "field" }, [node("label", { text: "Maximum redemptions" }), uses])]), create, result]),
+    node("section", { className: "card voucher-console" }, [
+      node("div", { className: "settings-grid" }, [
+        node("div", { className: "field" }, [node("label", { text: "Credits" }), amount]),
+        node("div", { className: "field" }, [node("label", { text: "Maximum redemptions" }), uses]),
+        node("div", { className: "field" }, [node("label", { text: "Per-user limit" }), perUser]),
+        node("div", { className: "field" }, [node("label", { text: "Expiry (optional)" }), expires]),
+        node("div", { className: "field" }, [node("label", { text: "Assigned user (optional)" }), assignedUser]),
+        node("div", { className: "field" }, [node("label", { text: "Eligible plans (comma separated)" }), plans]),
+        node("div", { className: "field" }, [node("label", { text: "Eligible roles (comma separated)" }), roles])
+      ]),
+      node("div", { className: "field" }, [node("label", { text: "Internal note" }), note]),
+      node("div", { className: "button-row" }, [create, copy, exportCode, refresh]),
+      result
+    ]),
     node("section", { className: "section list" }, rows)
   );
+}
+
+async function renderAdminLimits() {
+  const data = await api("/api/admin/usage-policies?limit=250");
+  const scopeType = node("select");
+  for (const value of ["global", "plan", "role", "user", "group", "business_connection"]) scopeType.append(node("option", { value, text: value.replaceAll("_", " ") }));
+  const scopeId = node("input", { value: "*", maxlength: "256", placeholder: "Scope identifier" });
+  const channel = node("select");
+  for (const value of ["*", "telegram_private", "telegram_group", "telegram_secretary", "miniapp", "web", "whatsapp"]) channel.append(node("option", { value, text: value === "*" ? "All channels" : value.replaceAll("_", " ") }));
+  const free = node("input", { type: "number", min: "0", max: "100000", value: "2" });
+  const minutes = node("input", { type: "number", min: "1", max: "43200", value: "60" });
+  scopeType.addEventListener("change", () => { if (scopeType.value === "global") scopeId.value = "*"; else if (scopeId.value === "*") scopeId.value = ""; });
+  const save = node("button", { className: "button primary", type: "button", text: "Save allowance policy" });
+  save.addEventListener("click", async () => {
+    const resolvedScope = scopeType.value === "global" ? "*" : scopeId.value.trim();
+    if (!resolvedScope) return showToast("Enter the plan, role, user, group, or connection identifier");
+    save.disabled = true;
+    try {
+      await api("/api/admin/usage-policy", { method: "POST", body: {
+        requestId: requestId(), scopeType: scopeType.value, scopeId: resolvedScope,
+        featureKey: "ai_chat", channel: channel.value, freeSuccesses: Number(free.value), windowSeconds: Number(minutes.value) * 60
+      } });
+      showToast("Usage policy saved and audited");
+      await renderAdminLimits();
+    } catch (error) { showToast(error.message); save.disabled = false; }
+  });
+  const rows = (data.policies || []).map((policy) => historyItem(
+    `${policy.scope_type}: ${policy.scope_id}`,
+    `${policy.feature_key} / ${policy.channel} / ${policy.free_successes} free successes per ${Math.round(Number(policy.window_seconds) / 60)} minutes`,
+    policy.active ? "ACTIVE" : "OFF",
+    !policy.active
+  ));
+  app.replaceChildren(
+    pageHead("Usage Limits", "Configure durable free-request policies by audience and channel. Billing and authorization are always enforced on the backend."),
+    node("section", { className: "card" }, [
+      node("div", { className: "settings-grid" }, [
+        node("div", { className: "field" }, [node("label", { text: "Scope" }), scopeType]),
+        node("div", { className: "field" }, [node("label", { text: "Scope ID" }), scopeId]),
+        node("div", { className: "field" }, [node("label", { text: "Channel" }), channel]),
+        node("div", { className: "field" }, [node("label", { text: "Free successful requests" }), free]),
+        node("div", { className: "field" }, [node("label", { text: "Rolling window (minutes)" }), minutes])
+      ]),
+      save
+    ]),
+    node("section", { className: "section" }, [sectionTitle("Active policies"), rows.length ? node("div", { className: "list" }, rows) : node("p", { className: "notice", text: "No custom policies. The safe default is 2 successful requests per hour." })])
+  );
+}
+
+async function renderAdminPayments() {
+  const userId = node("input", { inputmode: "numeric", maxlength: "20", placeholder: "Optional Telegram user ID" });
+  const list = node("section", { className: "list" });
+  const load = async () => {
+    const query = userId.value.trim();
+    if (query && !/^[1-9]\d*$/.test(query)) throw new Error("Enter a valid Telegram user ID");
+    const data = await api(`/api/admin/payments?limit=250${query ? `&userId=${encodeURIComponent(query)}` : ""}`);
+    list.replaceChildren(...data.payments.map((row) => historyItem(`${row.amount} XTR / User ${row.userId}`, `${row.chargeId} / ${new Date(row.creditedAt).toLocaleString()}`, row.refundedAt ? "REFUNDED" : "CREDITED", Boolean(row.refundedAt))));
+    if (!data.payments.length) list.append(node("p", { className: "notice", text: "No payment records matched this filter." }));
+  };
+  const search = node("button", { className: "button", type: "button", text: "Search" });
+  search.addEventListener("click", async () => { try { await load(); } catch (error) { showToast(error.message); } });
+  const exportButton = node("button", { className: "button primary", type: "button", text: "Export CSV" });
+  exportButton.addEventListener("click", async () => {
+    exportButton.disabled = true;
+    try {
+      const query = userId.value.trim();
+      if (query && !/^[1-9]\d*$/.test(query)) throw new Error("Enter a valid Telegram user ID");
+      await downloadAdminExport(`/api/admin/payments.csv?limit=250${query ? `&userId=${encodeURIComponent(query)}` : ""}`, "nvid-ai-payments.csv");
+      showToast("Payment export downloaded");
+    } catch (error) { showToast(error.message); } finally { exportButton.disabled = false; }
+  });
+  app.replaceChildren(
+    pageHead("Payment Ledger", "Search and export the auditable Telegram Stars transaction ledger. Payment credentials are never included."),
+    node("section", { className: "card filter-bar" }, [node("div", { className: "field" }, [node("label", { text: "Filter by Telegram user" }), userId]), node("div", { className: "button-row" }, [search, exportButton])]),
+    list
+  );
+  await load();
 }
 
 async function renderAdmin(path) {
@@ -1124,11 +1410,9 @@ async function renderAdmin(path) {
   if (path === "/admin/analytics") return renderAdminAnalytics();
   if (path === "/admin/access-requests") return renderAdminAccessRequests();
   if (path === "/admin/vouchers") return renderAdminVouchers();
-  if (path === "/admin/payments") {
-    const data = await api("/api/admin/payments?limit=100");
-    app.replaceChildren(pageHead("Payment Ledger", "Administrator view of Telegram Stars transactions."), node("section", { className: "list" }, data.payments.map((row) => historyItem(`${row.amount} XTR · User ${row.userId}`, new Date(row.creditedAt).toLocaleString(), row.refundedAt ? "REFUNDED" : "CREDITED", Boolean(row.refundedAt)))));
-    return;
-  }
+  if (path === "/admin/limits") return renderAdminLimits();
+  if (path === "/admin/bots") return renderBots();
+  if (path === "/admin/payments") return renderAdminPayments();
   if (path === "/admin/logs") {
     const [audit, security] = await Promise.all([api("/api/admin/logs?limit=100"), api("/api/admin/security-events?limit=100")]);
     const rows = [
@@ -1155,15 +1439,21 @@ async function renderAdmin(path) {
     return;
   }
   if (path === "/admin/system") {
-    const data = await api("/api/admin/system");
+    const [data, featureData] = await Promise.all([api("/api/admin/system"), api("/api/admin/features")]);
+    const maintenance = featureData.features.find((feature) => feature.key === "maintenance_mode");
     const entries = [
       ["Deployment", data.configuration.deploymentVersion, true],
       ["Database", data.platform.ready ? "READY" : "UNAVAILABLE", data.platform.ready],
       ["Telegram webhook", data.telegram.webhookReady ? "READY" : "SETUP", data.telegram.webhookReady],
       ["NVIDIA provider", data.nvidia.status.toUpperCase(), data.nvidia.healthy],
-      ["NVIDIA API key", data.configuration.nvidiaConfigured ? "CONFIGURED" : "MISSING", data.configuration.nvidiaConfigured]
+      ["NVIDIA API key", data.configuration.nvidiaConfigured ? "CONFIGURED" : "MISSING", data.configuration.nvidiaConfigured],
+      ["Maintenance mode", maintenance?.enabled ? "ACTIVE" : "OFF", !maintenance?.enabled]
     ];
-    app.replaceChildren(pageHead("System Health", "Status only. Secret values are never returned to the Mini App."), node("section", { className: "list" }, entries.map(([title, value, ok]) => historyItem(title, String(value), ok ? "OK" : "ACTION", !ok))));
+    app.replaceChildren(
+      pageHead("System Health", "Status only. Secret values are never returned to the Mini App."),
+      node("section", { className: "list" }, entries.map(([title, value, ok]) => historyItem(title, String(value), ok ? "OK" : "ACTION", !ok))),
+      node("section", { className: "notice" }, [node("strong", { text: "Operational controls" }), node("p", { text: "Use audited feature flags for maintenance and rollouts. Provider and deployment controls remain read-only to prevent accidental production changes." }), routeLink("Open feature controls", "/admin/features", "button")])
+    );
     return;
   }
   if (path === "/admin") {
@@ -1181,7 +1471,9 @@ async function renderAdmin(path) {
         quickAction("Groups", "Live permissions, Guard, and moderation controls.", "/admin/groups"),
         quickAction("Analytics", "Users, channels, Secretary, vouchers, Stars, and failures.", "/admin/analytics"),
         quickAction("Secretary access", "Approve or deny Telegram Business connections.", "/admin/access-requests"),
-        quickAction("Vouchers", "Generate and monitor secure credit campaigns.", "/admin/vouchers")
+        quickAction("Vouchers", "Generate and monitor secure credit campaigns.", "/admin/vouchers"),
+        quickAction("Usage limits", "Free allowance policies by user, plan, role, group, and channel.", "/admin/limits"),
+        quickAction("Managed bots", "Encrypted bot profiles, connectivity checks, and credential lifecycle.", "/admin/bots")
       ])])
     );
     return;
@@ -1410,7 +1702,7 @@ function setupMatrixCanvas() {
 function startParamPath() {
   const value = tg?.initDataUnsafe?.start_param || new URLSearchParams(location.search).get("startapp") || "";
   const mapped = `/${value.replaceAll("_", "/")}`;
-  return ["/chat", "/models", "/assistants", "/groups", "/guard", "/secretary", "/bots", "/usage", "/payments", "/vouchers", "/admin", "/admin/users", "/admin/groups", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system", "/admin/analytics", "/admin/access-requests", "/admin/vouchers"].includes(mapped) ? mapped : null;
+  return ["/chat", "/models", "/assistants", "/groups", "/guard", "/secretary", "/bots", "/usage", "/payments", "/vouchers", "/admin", "/admin/users", "/admin/groups", "/admin/models", "/admin/features", "/admin/payments", "/admin/logs", "/admin/system", "/admin/analytics", "/admin/access-requests", "/admin/vouchers", "/admin/limits", "/admin/bots"].includes(mapped) ? mapped : null;
 }
 
 async function start() {

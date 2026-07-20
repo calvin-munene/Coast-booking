@@ -559,13 +559,32 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
     });
   }
 
+  async function listUsagePolicies({ limit = 100 } = {}) {
+    const size = positiveInteger(limit, "limit", { minimum: 1, maximum: 250 });
+    return transaction(async (client) => {
+      const result = await client.query(
+        `SELECT policy_id, scope_type, scope_id, feature_key, channel, free_successes,
+                window_seconds, active, updated_by::text, created_at, updated_at
+         FROM ai_usage_policies
+         ORDER BY updated_at DESC, scope_type, scope_id
+         LIMIT $1`,
+        [size]
+      );
+      return result.rows;
+    });
+  }
+
   async function createVoucher({ actorUserId: rawActor, requestId: rawRequestId, creditAmount, maximumRedemptions = 1, perUserLimit = 1, eligiblePlans = [], eligibleRoles = [], assignedUserId = null, validFrom = new Date(), expiresAt = null, internalNote = null }) {
     const actor = userId(rawActor, "actorUserId");
     const requestId = uuid(rawRequestId);
     const amount = positiveInteger(creditAmount, "creditAmount", { minimum: 1, maximum: 1_000_000 });
     const maximum = positiveInteger(maximumRedemptions, "maximumRedemptions", { minimum: 1, maximum: 1_000_000 });
     const perUser = positiveInteger(perUserLimit, "perUserLimit", { minimum: 1, maximum: 1000 });
+    if (!Array.isArray(eligiblePlans) || !Array.isArray(eligibleRoles) || eligiblePlans.length > 50 || eligibleRoles.length > 50) throw new TypeError("Voucher eligibility is invalid");
+    const plans = [...new Set(eligiblePlans.map((value) => bounded(value, "eligiblePlan", 64)))];
+    const roles = [...new Set(eligibleRoles.map((value) => bounded(value, "eligibleRole", 64)))];
     const assigned = assignedUserId == null ? null : userId(assignedUserId, "assignedUserId");
+    const note = bounded(internalNote, "internalNote", 1000, { optional: true });
     const start = new Date(validFrom);
     const expiry = expiresAt == null ? null : new Date(expiresAt);
     if (!Number.isFinite(start.getTime()) || expiry && (!Number.isFinite(expiry.getTime()) || expiry <= start)) throw new TypeError("Voucher dates are invalid");
@@ -603,7 +622,7 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
           (voucher_id, creation_request_id, code_hash, display_prefix, credit_amount, maximum_redemptions, per_user_limit,
            eligible_plans, eligible_roles, assigned_user_id, created_by, valid_from, expires_at, internal_note)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14)`,
-        [voucherId, requestId, hashed.hash, code.slice(0, 10), amount, maximum, perUser, JSON.stringify(eligiblePlans), JSON.stringify(eligibleRoles), assigned, actor, start, expiry, internalNote]
+        [voucherId, requestId, hashed.hash, code.slice(0, 10), amount, maximum, perUser, JSON.stringify(plans), JSON.stringify(roles), assigned, actor, start, expiry, note]
       );
       await client.query(
         `INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, metadata)
@@ -882,7 +901,30 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
       const groups = await client.query("SELECT COUNT(DISTINCT group_id)::int AS count FROM group_user_verifications WHERE user_id = $1", [user]);
       const connections = await client.query("SELECT connection_id, access_status, enabled, can_reply, updated_at FROM telegram_business_connections WHERE owner_user_id = $1 ORDER BY updated_at DESC", [user]);
       const access = await client.query("SELECT request_id, connection_id, status, created_at, decided_at FROM secretary_access_requests WHERE owner_user_id = $1 ORDER BY created_at DESC", [user]);
-      return { ...profile.rows[0], usage: usage.rows, payments: payments.rows[0], vouchers: vouchers.rows[0], groupsUsed: groups.rows[0].count, businessConnections: connections.rows, accessRequests: access.rows };
+      const notes = await client.query(
+        `SELECT note_id, author_user_id::text, note, created_at
+         FROM user_admin_notes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+        [user]
+      );
+      const policies = await client.query(
+        `SELECT policy_id, scope_type, scope_id, feature_key, channel, free_successes,
+                window_seconds, active, updated_at
+         FROM ai_usage_policies
+         WHERE (scope_type = 'user' AND scope_id = $1) OR (scope_type = 'global' AND scope_id = '*')
+         ORDER BY CASE WHEN scope_type = 'user' THEN 0 ELSE 1 END, updated_at DESC`,
+        [user]
+      );
+      return {
+        ...profile.rows[0],
+        usage: usage.rows,
+        payments: payments.rows[0],
+        vouchers: vouchers.rows[0],
+        groupsUsed: groups.rows[0].count,
+        businessConnections: connections.rows,
+        accessRequests: access.rows,
+        notes: notes.rows,
+        usagePolicies: policies.rows
+      };
     });
   }
 
@@ -905,6 +947,7 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
     finishUsageEvent,
     getUsageAllowance,
     setUsagePolicy,
+    listUsagePolicies,
     createVoucher,
     redeemVoucher,
     listVouchers,

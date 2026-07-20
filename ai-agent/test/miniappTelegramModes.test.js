@@ -36,9 +36,17 @@ test("authorized administrators receive persistent access to every implemented a
   assert.match(html, /id="admin-nav-link"[^>]+hidden/);
   assert.match(source, /function syncRoleNavigation\(\)/);
   assert.match(source, /state\.dashboard\?\.platformAdmin === true/);
-  for (const route of ["/admin/users", "/admin/groups", "/admin/analytics", "/admin/access-requests", "/admin/vouchers", "/admin/models", "/admin/features", "/admin/pricing", "/admin/payments", "/admin/logs", "/admin/system"]) {
+  for (const route of ["/admin/users", "/admin/groups", "/admin/analytics", "/admin/access-requests", "/admin/vouchers", "/admin/limits", "/admin/bots", "/admin/models", "/admin/features", "/admin/pricing", "/admin/payments", "/admin/logs", "/admin/system"]) {
     assert.match(source, new RegExp(route.replaceAll("/", "\\/")));
   }
+  assert.match(source, /Generate secure voucher/);
+  assert.match(source, /Copy code/);
+  assert.match(source, /revoke/);
+  assert.match(source, /api\/admin\/usage-policies/);
+  assert.match(source, /Add audited note/);
+  assert.match(source, /Export CSV/);
+  assert.match(source, /featured: featuredInput\.checked/);
   assert.match(css, /\.admin-nav/);
+  assert.match(css, /\.metric-track/);
   assert.match(css, /repeat\(var\(--nav-items, 5\), 1fr\)/);
 });

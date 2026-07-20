@@ -630,7 +630,7 @@ test("Mini App direct routes serve the protected SPA shell with security headers
   const server = createAppServer();
   const port = await listen(server);
   try {
-    for (const path of ["/home", "/chat", "/groups", "/group/123", "/vouchers", "/admin/system", "/admin/analytics"]) {
+    for (const path of ["/home", "/chat", "/groups", "/group/123", "/vouchers", "/admin/system", "/admin/analytics", "/admin/limits", "/admin/bots"]) {
       const response = await requestGet(port, path);
       assert.equal(response.status, 200, `${path}: ${response.text}`);
       assert.match(response.text, /Nvid AI OS/);
@@ -1314,6 +1314,41 @@ test("analytics and voucher administration remain server-authorized and exclude 
     assert.deepEqual(JSON.parse(response.text).analytics, analytics);
     assert.doesNotMatch(response.text, /conversation|message_content|raw_message/i);
     assert.equal((await requestGet(port, "/api/admin/vouchers", { authorization: `Bearer ${admin}` })).status, 200);
+  } finally {
+    await close(server);
+  }
+});
+
+test("usage policies and payment CSV exports are administrator-authorized and safe", async () => {
+  enableTelegramPayments();
+  process.env.PUBLIC_URL = "https://nvidbot.onrender.com";
+  setTelegramStarLedgerForTests(webLedgerDouble({
+    async listPayments() {
+      return [{ chargeId: "=unsafe-formula", userId: "123", amount: 5, currency: "XTR", creditedAt: "2026-07-20T10:00:00.000Z", refundedAt: null, refundedAmount: null }];
+    }
+  }));
+  const policies = [{ policy_id: crypto.randomUUID(), scope_type: "global", scope_id: "*", free_successes: 2, window_seconds: 3600, active: true }];
+  setPlatformStoreForTests(platformStoreDouble({
+    async getUserRole(id) { return String(id) === "6643462826" ? "super_admin" : "standard_user"; },
+    async listUsagePolicies() { return policies; }
+  }));
+  const server = createAppServer();
+  const port = await listen(server);
+  try {
+    const ordinary = await launchWebSession(port, 123);
+    assert.equal((await requestGet(port, "/api/admin/usage-policies", { authorization: `Bearer ${ordinary}` })).status, 403);
+    assert.equal((await requestGet(port, "/api/admin/payments.csv", { authorization: `Bearer ${ordinary}` })).status, 403);
+    resetTelegramWebAuthForTests();
+    const admin = await launchWebSession(port, 6643462826);
+    const policyResponse = await requestGet(port, "/api/admin/usage-policies", { authorization: `Bearer ${admin}` });
+    assert.equal(policyResponse.status, 200, policyResponse.text);
+    assert.deepEqual(JSON.parse(policyResponse.text).policies, policies);
+    const exportResponse = await requestGet(port, "/api/admin/payments.csv", { authorization: `Bearer ${admin}` });
+    assert.equal(exportResponse.status, 200, exportResponse.text);
+    assert.match(exportResponse.headers["content-type"], /^text\/csv/);
+    assert.match(exportResponse.headers["content-disposition"], /nvid-ai-payments\.csv/);
+    assert.match(exportResponse.text, /"'=unsafe-formula"/);
+    assert.doesNotMatch(exportResponse.text, /provider.*secret|bot.*token/i);
   } finally {
     await close(server);
   }

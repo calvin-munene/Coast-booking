@@ -191,7 +191,7 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
       );
       await client.query(
         `INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, result, reason, metadata)
-         VALUES ($1, $2, 'business_connection', $3, 'success', $4, jsonb_build_object('requestId', $5))`,
+         VALUES ($1, $2, 'business_connection', $3, 'success', $4, jsonb_build_object('requestId', $5::text))`,
         [actor, `secretary.access.${approved ? "approved" : "denied"}`, request.connection_id, explanation, requestId]
       );
       return { duplicate: false, status: connectionStatus, connectionId: request.connection_id, ownerUserId: String(request.owner_user_id) };
@@ -552,7 +552,7 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
       );
       await client.query(
         `INSERT INTO audit_logs (request_id, actor_user_id, action, target_type, target_id, metadata)
-         VALUES ($1, $2, 'usage_policy.updated', 'usage_policy', $3, jsonb_build_object('freeSuccesses', $4, 'windowSeconds', $5))`,
+         VALUES ($1, $2, 'usage_policy.updated', 'usage_policy', $3, jsonb_build_object('freeSuccesses', $4::int, 'windowSeconds', $5::int))`,
         [operationId, actor, `${type}:${scopeId}:${featureKey}:${channel}`, free, window]
       );
       return { duplicate: false, policy: result.rows[0] };
@@ -626,7 +626,7 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
       );
       await client.query(
         `INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, metadata)
-         VALUES ($1, 'voucher.created', 'voucher', $2, jsonb_build_object('credits', $3, 'maximumRedemptions', $4))`,
+         VALUES ($1, 'voucher.created', 'voucher', $2, jsonb_build_object('credits', $3::int, 'maximumRedemptions', $4::int))`,
         [actor, voucherId, amount, maximum]
       );
       return { duplicate: false, voucherId, code, displayPrefix: code.slice(0, 10), creditAmount: amount, maximumRedemptions: maximum, perUserLimit: perUser, validFrom: start, expiresAt: expiry };
@@ -660,7 +660,7 @@ export function createMilestoneStore({ transaction, ensureUserWithClient }) {
       const account = await client.query("UPDATE telegram_star_accounts SET balance = balance + $2, updated_at = NOW() WHERE user_id = $1 RETURNING balance::text", [user, voucher.credit_amount]);
       await client.query(
         `INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, metadata)
-         VALUES ($1, 'voucher.redeemed', 'voucher', $2, jsonb_build_object('creditsAdded', $3))`,
+         VALUES ($1, 'voucher.redeemed', 'voucher', $2, jsonb_build_object('creditsAdded', $3::int))`,
         [user, voucher.voucher_id, voucher.credit_amount]
       );
       return { redeemed: true, redemptionId, creditsAdded: Number(voucher.credit_amount), balance: account.rows[0].balance, displayPrefix: voucher.display_prefix };

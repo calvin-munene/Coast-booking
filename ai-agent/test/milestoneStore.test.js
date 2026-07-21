@@ -9,6 +9,7 @@ function result(rows = []) {
 test("voucher creation is request-idempotent and never persists the redeemable code", async () => {
   const vouchers = new Map();
   const inserts = [];
+  const auditStatements = [];
   const client = {
     async query(sql, params = []) {
       const statement = String(sql);
@@ -30,7 +31,7 @@ test("voucher creation is request-idempotent and never persists the redeemable c
         });
         return result();
       }
-      if (statement.includes("INSERT INTO audit_logs")) return result();
+      if (statement.includes("INSERT INTO audit_logs")) { auditStatements.push(statement); return result(); }
       throw new Error(`Unexpected query: ${statement.slice(0, 80)}`);
     }
   };
@@ -51,6 +52,16 @@ test("voucher creation is request-idempotent and never persists the redeemable c
   assert.equal(inserts[0][1], requestId);
   assert.match(inserts[0][2], /^[a-f0-9]{64}$/);
   assert.equal(inserts[0].includes(first.code), false);
+  assert.match(auditStatements[0], /\$3::int/);
+  assert.match(auditStatements[0], /\$4::int/);
+});
+
+test("polymorphic JSON audit values use explicit PostgreSQL parameter types", async () => {
+  const source = await import("node:fs/promises").then((fs) => fs.readFile(new URL("../src/milestoneStore.js", import.meta.url), "utf8"));
+  assert.match(source, /jsonb_build_object\('requestId', \$5::text\)/);
+  assert.match(source, /jsonb_build_object\('freeSuccesses', \$4::int, 'windowSeconds', \$5::int\)/);
+  assert.match(source, /jsonb_build_object\('credits', \$3::int, 'maximumRedemptions', \$4::int\)/);
+  assert.match(source, /jsonb_build_object\('creditsAdded', \$3::int\)/);
 });
 
 test("usage policy listing is bounded and returns durable policy records", async () => {

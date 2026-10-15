@@ -3,20 +3,30 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
     <meta
       name="description"
-      content="Find safe and affordable group accommodation in Mombasa, Diani, Nyali, Bamburi, Kilifi and Watamu for schools, churches, companies and families."
+      content="Coast Bookings coordinates group accommodation in Mombasa and Kenya's Coast for schools, churches, companies and families. Request a tailored group quote."
     />
     <meta name="robots" content="index, follow" />
-    <meta property="og:title" content="CoastBookings.org | Group Accommodation in Mombasa & Kenyan Coast" />
+    <meta property="og:title" content="Group Accommodation in Mombasa & Kenyan Coast | Coast Bookings" />
     <meta
       property="og:description"
-      content="Coast Bookings coordinates Kenyan Coast group stays for schools, churches, companies, universities, sports teams, NGOs, tour groups and families."
+      content="Coast Bookings coordinates group accommodation in Mombasa and Kenya's Coast for schools, churches, companies and families. Request a tailored group quote."
     />
     <meta property="og:type" content="website" />
     <meta property="og:locale" content="en_KE" />
+    <meta property="og:site_name" content="Coast Bookings" />
+    <meta property="og:url" content="https://coastbookings.org/" />
+    <meta property="og:image" content="https://images.unsplash.com/photo-1589308078059-be1415eab4c3?auto=format&amp;fit=crop&amp;w=1200&amp;h=630&amp;q=85&amp;fm=jpg" />
+    <meta property="og:image:alt" content="Coastal landscape in Kenya" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Group Accommodation in Mombasa & Kenyan Coast | Coast Bookings" />
+    <meta name="twitter:description" content="Coast Bookings coordinates group accommodation in Mombasa and Kenya's Coast for schools, churches, companies and families. Request a tailored group quote." />
+    <meta name="twitter:image" content="https://images.unsplash.com/photo-1589308078059-be1415eab4c3?auto=format&amp;fit=crop&amp;w=1200&amp;h=630&amp;q=85&amp;fm=jpg" />
+    <meta name="theme-color" content="#0b2d5b" />
     <link rel="canonical" href="https://coastbookings.org/" />
-    <title>CoastBookings.org | Group Accommodation in Mombasa & Kenyan Coast</title>
+    <title>Group Accommodation in Mombasa & Kenyan Coast | Coast Bookings</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -28,6 +38,22 @@
       {
         "@context": "https://schema.org",
         "@graph": [
+          {
+            "@type": "WebSite",
+            "@id": "https://coastbookings.org/#website",
+            "url": "https://coastbookings.org/",
+            "name": "Coast Bookings",
+            "inLanguage": "en-KE",
+            "publisher": { "@id": "https://coastbookings.org/#organization" }
+          },
+          {
+            "@type": "WebPage",
+            "@id": "https://coastbookings.org/#webpage",
+            "url": "https://coastbookings.org/",
+            "name": "Group Accommodation in Mombasa & Kenyan Coast | Coast Bookings",
+            "description": "Coast Bookings coordinates group accommodation in Mombasa and Kenya's Coast for schools, churches, companies and families. Request a tailored group quote.",
+            "isPartOf": { "@id": "https://coastbookings.org/#website" }
+          },
           {
             "@type": "Organization",
             "@id": "https://coastbookings.org/#organization",
@@ -122,6 +148,7 @@
       <section class="hero premium-hero" id="home">
         <div class="hero-scene" id="heroScene" aria-hidden="true">
           <div class="hero-photo"></div>
+          <div class="sea-plane"></div>
           <div class="sun-glow"></div>
           <div class="palm palm-left"></div>
           <div class="palm palm-right"></div>
@@ -130,12 +157,11 @@
           <div class="wave-layer wave-two"></div>
         </div>
         <div class="hero-content reveal">
-          <img class="hero-logo" src="assets/coastbookings-logo.svg" alt="CoastBookings.org" width="230" height="48" />
           <p class="eyebrow">Mombasa-based group travel coordination</p>
-          <h1>CoastBookings.org Group Accommodation Along Kenya's Coast</h1>
+          <h1>Group Accommodation Along Kenya’s Coast</h1>
           <p>
-            Coast Bookings helps schools, churches, companies, universities, sports teams and families find suitable
-            group accommodation in Mombasa and across the Kenyan Coast.
+            Thoughtfully coordinated stays for schools, churches, teams, companies and families across Mombasa and
+            Kenya’s coast.
           </p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="#quote">Request a Group Quote</a>
@@ -365,7 +391,6 @@
           <a href="#destinations">Destinations</a>
           <a href="#how-it-works">How It Works</a>
           <a href="#faq">FAQ</a>
-          <a href="admin.html">Admin</a>
         </div>
         <div class="footer-contact">
           <a href="tel:+254741076845">0741 076 845</a>

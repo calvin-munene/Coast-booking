@@ -1,7 +1,7 @@
 # CoastBookings
 
-This repository's root website is a static HTML, CSS, and JavaScript site. It has
-no application server, database, package installation, or build step.
+This repository is a static HTML, CSS, and JavaScript website. It needs no
+application server, database, package installation, or compiled build.
 
 ## Run locally
 
@@ -19,5 +19,6 @@ The quote form validates the information in the browser and opens WhatsApp with
 the request prefilled. The visitor sends the message in WhatsApp; the website
 does not store or transmit requests to a database.
 
-The Render configuration in `render.yaml` points to the separate `ai-agent/`
-service and is not used by this static website.
+## Hosting
+
+The `render.yaml` configuration publishes the repository root as a static site.

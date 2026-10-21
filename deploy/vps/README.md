@@ -53,6 +53,13 @@ and assets into `/var/www/coastbookings`. It uses `rsync --delete` inside that
 dedicated directory so removed website files do not remain online. Do not use
 that path for another site or for files you need to keep.
 
-The repository no longer configures Render. Removing that configuration does
-not delete an already-created Render service or database; those must be managed
-separately in Render.
+## Render alongside the VPS
+
+The repository also includes a static Render Blueprint in
+[`../../render.yaml`](../../render.yaml). It builds a `dist/` directory
+containing only the public website files and publishes that directory, so the
+VPS scripts and repository configuration are not exposed as site content.
+
+Connect the Render static site to this repository and enable auto-deploys from
+`main`. This is independent of the VPS workflow; each provider deploys the same
+static website when `main` changes.

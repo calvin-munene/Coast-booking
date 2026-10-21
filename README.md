@@ -19,8 +19,17 @@ The quote form validates the information in the browser and opens WhatsApp with
 the request prefilled. The visitor sends the message in WhatsApp; the website
 does not store or transmit requests to a database.
 
-## Hosting on a VPS
+## Hosting on Render and a VPS
 
-This is a static website. See [`deploy/vps/README.md`](deploy/vps/README.md) for
-Ubuntu/Debian VPS setup and GitHub Actions deployment. After the VPS is prepared
-and GitHub Actions secrets are configured, each push to `main` deploys the site.
+This is a static website and can deploy to both providers from `main`:
+
+- **Render:** [`render.yaml`](render.yaml) configures a static site. Its build
+  publishes only the website files into `dist/`, not the repository's deployment
+  scripts or configuration.
+- **Ubuntu/Debian VPS:** See [`deploy/vps/README.md`](deploy/vps/README.md) for
+  one-time server setup and GitHub Actions secrets. Once configured, pushes to
+  `main` deploy the site to the VPS.
+
+Render auto-deploys when its static site is connected to this repository with
+auto-deploy enabled. The VPS uses the GitHub Actions workflow. Neither target
+requires an application server or database.

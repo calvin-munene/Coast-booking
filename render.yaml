@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: coast-bookings
+    runtime: static
+    autoDeployTrigger: commit
+    buildCommand: >-
+      mkdir -p dist/assets &&
+      cp -- ./*.html ./*.css ./*.js robots.txt sitemap.xml .nojekyll dist/ &&
+      cp -a assets/. dist/assets/
+    staticPublishPath: dist

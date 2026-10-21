@@ -1,0 +1,78 @@
+name: Deploy CoastBookings to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coastbookings-vps-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check VPS deployment configuration
+        id: config
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${VPS_HOST}${VPS_USER}${VPS_SSH_PRIVATE_KEY}${VPS_KNOWN_HOSTS}" ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Add VPS_HOST, VPS_USER, VPS_SSH_PRIVATE_KEY, and VPS_KNOWN_HOSTS in GitHub Actions secrets to enable deployment."
+            exit 0
+          fi
+
+          for name in VPS_HOST VPS_USER VPS_SSH_PRIVATE_KEY VPS_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::GitHub Actions secret $name is missing."
+              exit 1
+            fi
+          done
+
+          if [[ ! "$VPS_HOST" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$ ]]; then
+            echo "::error::VPS_HOST must be a DNS name or IPv4 address."
+            exit 1
+          fi
+          if [[ ! "$VPS_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ || "$VPS_USER" == "root" ]]; then
+            echo "::error::VPS_USER must be a valid non-root Linux username."
+            exit 1
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        if: steps.config.outputs.ready == 'true'
+        uses: actions/checkout@v4
+
+      - name: Prepare static website files
+        if: steps.config.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          site_dir="$RUNNER_TEMP/coastbookings-site"
+          mkdir -p "$site_dir/assets"
+          cp -- ./*.html ./*.css ./*.js robots.txt sitemap.xml .nojekyll "$site_dir/"
+          cp -a assets/. "$site_dir/assets/"
+
+      - name: Deploy to VPS
+        if: steps.config.outputs.ready == 'true'
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT || '22' }}
+        run: bash deploy/vps/deploy.sh

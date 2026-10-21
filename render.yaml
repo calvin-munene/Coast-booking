@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: coast-bookings
-    runtime: static
-    autoDeployTrigger: commit
-    buildCommand: "echo 'No build required'"
-    staticPublishPath: .

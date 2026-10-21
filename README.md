@@ -19,6 +19,8 @@ The quote form validates the information in the browser and opens WhatsApp with
 the request prefilled. The visitor sends the message in WhatsApp; the website
 does not store or transmit requests to a database.
 
-## Hosting
+## Hosting on a VPS
 
-The `render.yaml` configuration publishes the repository root as a static site.
+This is a static website. See [`deploy/vps/README.md`](deploy/vps/README.md) for
+Ubuntu/Debian VPS setup and GitHub Actions deployment. After the VPS is prepared
+and GitHub Actions secrets are configured, each push to `main` deploys the site.

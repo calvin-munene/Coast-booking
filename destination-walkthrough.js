@@ -3,37 +3,37 @@
     mombasa: {
       name: "Mombasa",
       image:
-        "https://images.unsplash.com/photo-1589308078059-be1415eab4c3?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/mombasa-old-town.jpg",
     },
     nyali: {
       name: "Nyali",
       image:
-        "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/nyali-beach.jpg",
     },
     bamburi: {
       name: "Bamburi",
       image:
-        "https://images.unsplash.com/photo-1540541338287-41700207dee6?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/bamburi-beach.jpg",
     },
     shanzu: {
       name: "Shanzu",
       image:
-        "https://images.unsplash.com/photo-1519046904884-53103b34b206?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/shanzu-beach.jpg",
     },
     diani: {
       name: "Diani",
       image:
-        "https://images.unsplash.com/photo-1500375592092-40eb2168fd21?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/diani-sunrise.jpg",
     },
     kilifi: {
       name: "Kilifi",
       image:
-        "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/kilifi-creek.jpg",
     },
     watamu: {
       name: "Watamu",
       image:
-        "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=1000&q=80&fm=webp",
+        "assets/watamu-beach.jpg",
     },
   };
 
@@ -50,8 +50,8 @@
       <p class="eyebrow">Interactive destination view</p>
       <h2 id="${slug}-experience-title"></h2>
       <p class="destination-experience-description">
-        Rotate the coastal scene to explore a different perspective. The artwork is illustrative,
-        not a navigational map or a preview of a specific hotel.
+        Rotate the illustrated coastal model. Its inset uses the real destination
+        photograph credited above. The 3D landscape is illustrative, not a map or a hotel preview.
       </p>
       <a class="btn btn-primary" href="index.html#quote">Plan a group stay</a>
     </div>
@@ -64,7 +64,7 @@
           <div class="destination-scene-reef"></div>
           <div class="destination-scene-photo">
             <img alt="" loading="lazy" decoding="async" />
-            <span>Coastal atmosphere · illustrative</span>
+             <span>Real location photo · illustrated 3D model</span>
           </div>
           <div class="destination-scene-pin">
             <span class="destination-scene-pin-dot"></span>
@@ -98,11 +98,10 @@
     "aria-label",
     `Illustrative 3D coastal scene for ${place.name}. Use arrow keys to rotate, plus or minus to zoom, and Home to reset.`,
   );
-  photo.src = place.image;
   photo.alt = "";
 
-  const imageUrl = new URL(place.image);
-  if (imageUrl.protocol === "https:" && imageUrl.hostname === "images.unsplash.com") {
+  const imageUrl = new URL(place.image, document.baseURI);
+  if (imageUrl.origin === location.origin && imageUrl.pathname.startsWith("/assets/")) {
     photo.src = imageUrl.href;
   }
 

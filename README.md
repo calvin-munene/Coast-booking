@@ -27,7 +27,7 @@ The supplied redesign is integrated in `index.html`, `mombasa.html`,
 `redesign-integration.css` and `redesign-integration.js`. Other destination and
 group pages remain available at their existing URLs.
 
-Diani, Mombasa and school-trip pages include locally bundled photographs of
+All destination pages and the school-trip page include locally bundled photographs of
 the actual destinations. See [`PHOTO-CREDITS.md`](PHOTO-CREDITS.md) for sources
 and licenses; credits are also visible beside the images.
 

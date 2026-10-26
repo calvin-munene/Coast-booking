@@ -1,7 +1,10 @@
 /* Integration fixes for the supplied Coast Bookings redesign. */
 html { scroll-behavior: smooth; scroll-padding-top: 100px; }
 body { overflow-wrap: break-word; }
-.hero-bg { background-image: url("assets/mombasa-coast.jpg"); }
+.hero-bg { background-image: url("assets/diani-sunrise.jpg"); }
+.destination-photo-credits summary { cursor: pointer; padding-block: 12px; font-weight: 700; }
+.destination-photo-credits ul { padding-left: 20px; }
+.footer a[href^="mailto:"] { overflow-wrap: anywhere; }
 body.destination-mombasa .hero { background-image: linear-gradient(rgba(6,42,66,.78),rgba(6,42,66,.56)), url("assets/mombasa-old-town.jpg"); }
 body.destination-diani .hero { background-image: linear-gradient(rgba(6,42,66,.72),rgba(6,42,66,.4)), url("assets/diani-sunrise.jpg"); }
 body.school-destination .hero { background-image: linear-gradient(rgba(6,42,66,.78),rgba(6,42,66,.55)), url("assets/fort-jesus-courtyard.jpg"); }

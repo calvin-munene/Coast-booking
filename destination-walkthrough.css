@@ -56,6 +56,28 @@
   padding-top: 104px;
 }
 
+.destination-location-photo {
+  margin: 28px 0;
+  background: white;
+  border: 1px solid #dbe3ec;
+  border-radius: 18px;
+  overflow: hidden;
+}
+.destination-location-photo img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  object-position: center 40%;
+}
+.destination-location-photo figcaption { padding: 18px 22px; color: #45566b; font-size: 14px; line-height: 1.7; }
+.destination-location-photo figcaption strong { display: block; color: #0a3d5c; font-size: 18px; }
+.destination-location-photo .photo-attribution { display: block; margin-top: 8px; font-size: 12px; }
+.destination-location-photo a { color: #244d78; text-decoration: underline; text-underline-offset: 3px; }
+.destination-contact { padding: 24px; text-align: center; background: #062a42; color: white; font-size: 14px; }
+.destination-contact a { color: white; text-decoration: underline; overflow-wrap: anywhere; }
+
 .destination-breadcrumbs {
   margin: 0 0 var(--cb-space-6);
   color: var(--cb-muted);

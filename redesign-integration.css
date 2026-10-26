@@ -2,8 +2,25 @@
 html { scroll-behavior: smooth; scroll-padding-top: 100px; }
 body { overflow-wrap: break-word; }
 .hero-bg { background-image: url("assets/mombasa-coast.jpg"); }
-body.destination-mombasa .hero { background-image: linear-gradient(rgba(6,42,66,.7),rgba(6,42,66,.5)), url("assets/mombasa-coast.jpg"); }
-body.destination-diani .hero { background-image: linear-gradient(rgba(6,42,66,.7),rgba(6,42,66,.5)), url("assets/diani-coast.jpg"); }
+body.destination-mombasa .hero { background-image: linear-gradient(rgba(6,42,66,.78),rgba(6,42,66,.56)), url("assets/mombasa-old-town.jpg"); }
+body.destination-diani .hero { background-image: linear-gradient(rgba(6,42,66,.72),rgba(6,42,66,.4)), url("assets/diani-sunrise.jpg"); }
+body.school-destination .hero { background-image: linear-gradient(rgba(6,42,66,.78),rgba(6,42,66,.55)), url("assets/fort-jesus-courtyard.jpg"); }
+.destination-mombasa .hero h1, .destination-diani .hero h1, .school-destination .hero h1 { font-size: clamp(32px, 4.8vw, 56px); line-height: 1.12; margin-bottom: 20px; }
+.destination-mombasa .hero p, .destination-diani .hero p, .school-destination .hero p { max-width: 660px; font-size: 18px; }
+.photo-credit { max-width: 940px; margin: 0 auto; padding: 12px 20px; font-size: 12px; line-height: 1.6; color: #47586b; }
+.photo-credit a, .photo-frame a { text-decoration: underline; text-underline-offset: 3px; }
+.destination-story { background: #f5efe6; }
+.destination-story h2 { font-size: clamp(26px, 3vw, 38px); color: #0a3d5c; margin-bottom: 16px; }
+.destination-story .intro { color: #47586b; max-width: 720px; margin-bottom: 28px; }
+.photo-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+.photo-frame { margin: 0; min-width: 0; background: white; border-radius: 16px; overflow: hidden; border: 1px solid #e4e8eb; }
+.photo-frame img { width: 100%; height: auto; aspect-ratio: 16 / 10; object-fit: cover; display: block; }
+.photo-frame figcaption { padding: 20px; color: #47586b; font-size: 14px; }
+.photo-frame figcaption strong { display: block; color: #0a3d5c; margin-bottom: 8px; font-size: 18px; }
+.photo-frame .attribution { display: block; margin-top: 12px; font-size: 12px; }
+.photo-grid.single { grid-template-columns: 1fr; }
+.photo-grid.single img { aspect-ratio: 16 / 8; }
+.destination-note { color: #47586b; font-size: 14px; margin-top: 24px; }
 .btn-primary, .btn, .badge { background-color: #ad4c36; }
 .btn-outline { background-color: transparent; }
 .eyebrow { color: #ffb6a3; }
@@ -35,6 +52,8 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
   .section { padding: 56px 18px; }
   .quote-box { padding: 24px 18px; }
   .grid-3, .why-grid { grid-template-columns: 1fr; }
+  .photo-grid { grid-template-columns: 1fr; }
+  .photo-grid.single img { aspect-ratio: 4 / 3; }
   .floating-wa { width: 48px; height: 48px; right: 16px; bottom: 16px; }
 }
 @media (prefers-reduced-motion: reduce) {

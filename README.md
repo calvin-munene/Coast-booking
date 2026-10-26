@@ -27,6 +27,10 @@ The supplied redesign is integrated in `index.html`, `mombasa.html`,
 `redesign-integration.css` and `redesign-integration.js`. Other destination and
 group pages remain available at their existing URLs.
 
+Diani, Mombasa and school-trip pages include locally bundled photographs of
+the actual destinations. See [`PHOTO-CREDITS.md`](PHOTO-CREDITS.md) for sources
+and licenses; credits are also visible beside the images.
+
 This is a static website and can deploy to both providers from `main`:
 
 - **Render:** [`render.yaml`](render.yaml) configures a static site. Its build

@@ -8,3 +8,7 @@ services:
       cp -- ./*.html ./*.css ./*.js robots.txt sitemap.xml .nojekyll dist/ &&
       cp -a assets/. dist/assets/
     staticPublishPath: dist
+    headers:
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=86400

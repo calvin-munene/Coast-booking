@@ -5,11 +5,6 @@ document.querySelectorAll('a[target="_blank"]').forEach(link => {
   link.rel = "noopener noreferrer";
   if (link.classList.contains("floating-wa")) link.setAttribute("aria-label", "Chat on WhatsApp");
 });
-// Use the bundled image instead of repeatedly decoding embedded logo copies.
-document.querySelectorAll('img[src^="data:image"]').forEach(image => {
-  image.src = "assets/logo.jpg";
-});
-document.querySelectorAll(".dest-card img").forEach(image => { image.loading = "lazy"; });
 
 const menu = document.querySelector(".menu-toggle");
 const navigation = document.querySelector("#main-navigation");
@@ -35,15 +30,6 @@ if (header) {
   window.addEventListener("scroll", updateHeader, { passive: true });
   updateHeader();
 }
-
-const groupPages = ["school-trips.html", "church-retreats.html", "corporate-groups.html", "family-groups.html", "sports-teams.html", "ngo-groups.html"];
-document.querySelectorAll("#groups .card").forEach((card, index) => {
-  const link = document.createElement("a");
-  link.href = groupPages[index];
-  link.className = "group-page-link";
-  link.textContent = "Explore " + card.querySelector("h3").textContent;
-  card.append(link);
-});
 
 const form = document.getElementById("quoteForm");
 if (form) {

@@ -70,6 +70,16 @@ server {
     root $web_root;
     index index.html;
 
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/javascript application/json application/xml text/xml image/svg+xml;
+
+    location ~* \\.(?:css|js|jpg|jpeg|png|webp|svg|ico|woff2)$ {
+        expires 1d;
+        try_files \$uri =404;
+    }
+
     location / {
         try_files \$uri \$uri/ =404;
     }

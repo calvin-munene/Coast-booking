@@ -3,37 +3,37 @@
     mombasa: {
       name: "Mombasa",
       image:
-        "assets/mombasa-old-town.jpg",
+        "assets/mombasa-old-town.webp",
     },
     nyali: {
       name: "Nyali",
       image:
-        "assets/nyali-beach.jpg",
+        "assets/nyali-beach.webp",
     },
     bamburi: {
       name: "Bamburi",
       image:
-        "assets/bamburi-beach.jpg",
+        "assets/bamburi-beach.webp",
     },
     shanzu: {
       name: "Shanzu",
       image:
-        "assets/shanzu-beach.jpg",
+        "assets/shanzu-beach.webp",
     },
     diani: {
       name: "Diani",
       image:
-        "assets/diani-sunrise.jpg",
+        "assets/diani-sunrise.webp",
     },
     kilifi: {
       name: "Kilifi",
       image:
-        "assets/kilifi-creek.jpg",
+        "assets/kilifi-creek.webp",
     },
     watamu: {
       name: "Watamu",
       image:
-        "assets/watamu-beach.jpg",
+        "assets/watamu-beach.webp",
     },
   };
 

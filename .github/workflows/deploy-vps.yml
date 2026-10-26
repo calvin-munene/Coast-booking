@@ -14,7 +14,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  seo:
+    name: Check static website SEO
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check metadata, sitemap, links, image loading and structured data
+        run: python3 scripts/check-seo.py
   deploy:
+    needs: seo
     runs-on: ubuntu-latest
     steps:
       - name: Check VPS deployment configuration

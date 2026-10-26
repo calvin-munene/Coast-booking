@@ -17,7 +17,9 @@ The original file pages provide provenance and full license information.
 | `assets/watamu-beach.jpg` | [Watamu Beach, Kenya 12](https://commons.wikimedia.org/wiki/File:Watamu_Beach,_Kenya_12.jpg) | Jenny Kellett | [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) |
 
 The locally bundled files are Wikimedia-generated resized versions. The site
-also crops their visible presentation with CSS. These resized/cropped photo
+also includes compressed `.webp` and `-640.webp` derivatives of each listed JPEG
+for responsive display and crops their visible presentation with CSS. The
+source JPEGs remain available alongside those derivatives. These resized/cropped photo
 versions remain available under the respective licenses listed above (or public-domain status).
 Those licenses apply to the identified photographs, not to unrelated website
 code, brand assets, or other photographs in this repository.

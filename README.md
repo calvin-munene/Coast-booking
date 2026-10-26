@@ -31,6 +31,9 @@ All destination pages and the school-trip page include locally bundled photograp
 the actual destinations. See [`PHOTO-CREDITS.md`](PHOTO-CREDITS.md) for sources
 and licenses; credits are also visible beside the images.
 
+For technical SEO checks, primary-domain guidance, performance configuration
+and Search Console next steps, see [`SEO.md`](SEO.md).
+
 This is a static website and can deploy to both providers from `main`:
 
 - **Render:** [`render.yaml`](render.yaml) configures a static site. Its build

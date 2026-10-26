@@ -1,0 +1,35 @@
+.seo-breadcrumbs {
+  max-width: 1100px;
+  margin: 20px auto;
+  padding: 12px 24px;
+  color: #45566b;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.seo-breadcrumbs a { color: #244d78; text-decoration: underline; }
+.seo-planning, .seo-faq, .seo-group-guide {
+  max-width: 1100px;
+  margin: 32px auto;
+  padding: 28px clamp(18px, 4vw, 36px);
+  background: #f7f2e9;
+  color: #19384a;
+  border-radius: 18px;
+  line-height: 1.8;
+}
+.seo-group-guide h2, .seo-faq h2, .seo-planning h2 { margin-bottom: 16px; color: #0a3d5c; }
+.seo-group-guide h3 { margin: 20px 0 8px; font-size: 20px; }
+.seo-group-guide ul, .seo-planning ul { padding-left: 24px; margin: 12px 0; }
+.seo-group-guide a, .seo-faq a, .seo-planning a { color: #244d78; text-decoration: underline; text-underline-offset: 3px; }
+.seo-faq details { padding: 16px 0; border-bottom: 1px solid #d5d9d7; }
+.seo-faq summary { cursor: pointer; font-weight: 700; min-height: 28px; }
+.seo-faq details p { margin: 12px 0 0; }
+.seo-group-guide .seo-contact { overflow-wrap: anywhere; margin-top: 20px; }
+.seo-link-directory { display: flex; justify-content: center; gap: 14px 22px; flex-wrap: wrap; padding: 20px 24px; }
+.seo-link-directory a { color: inherit; text-decoration: underline; }
+.seo-contact-footer { background: #062a42; color: white; padding: 24px; text-align: center; font-size: 14px; line-height: 1.8; }
+.seo-contact-footer a { color: white; text-decoration: underline; overflow-wrap: anywhere; }
+a:focus-visible, summary:focus-visible { outline: 3px solid #9a452f; outline-offset: 4px; }
+@media (max-width: 768px) {
+  .seo-faq, .seo-planning, .seo-group-guide { margin: 24px 16px; }
+  .hero-content h1 { font-size: clamp(32px, 8vw, 44px); }
+}

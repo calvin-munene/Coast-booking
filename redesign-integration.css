@@ -1,0 +1,43 @@
+/* Integration fixes for the supplied Coast Bookings redesign. */
+html { scroll-behavior: smooth; scroll-padding-top: 100px; }
+body { overflow-wrap: break-word; }
+.hero-bg { background-image: url("assets/mombasa-coast.jpg"); }
+body.destination-mombasa .hero { background-image: linear-gradient(rgba(6,42,66,.7),rgba(6,42,66,.5)), url("assets/mombasa-coast.jpg"); }
+body.destination-diani .hero { background-image: linear-gradient(rgba(6,42,66,.7),rgba(6,42,66,.5)), url("assets/diani-coast.jpg"); }
+.btn-primary, .btn, .badge { background-color: #ad4c36; }
+.btn-outline { background-color: transparent; }
+.eyebrow { color: #ffb6a3; }
+.section-header .eyebrow { color: #126c6c; }
+.floating-wa { color: #062a42; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 3px solid #126c6c; outline-offset: 4px;
+}
+.hero a:focus-visible { outline-color: white; }
+.skip-link { position: fixed; left: 16px; top: -100px; z-index: 200; background: white; color: #0a3d5c; padding: 12px 20px; }
+.skip-link:focus { top: 12px; }
+.menu-toggle { display: none; }
+.reveal { opacity: 1; transform: none; }
+.form-grid > *, .why-grid > *, .grid-3 > * { min-width: 0; }
+.form-grid input, .form-grid select, .form-grid textarea { width: 100%; font-size: 16px; }
+.privacy-note { font-size: 13px; color: #5c6b7a; margin-top: 12px; }
+.group-page-link { display: inline-block; color: #126c6c; font-weight: 700; margin-top: 12px; padding-block: 6px; }
+@media (max-width: 768px) {
+  .nav { position: relative; padding: 12px 16px; gap: 12px; flex-wrap: wrap; }
+  .nav .logo { font-size: 18px; gap: 4px !important; }
+  .nav .btn { padding: 10px 12px; font-size: 13px; }
+  .menu-toggle { display: inline-flex; align-items: center; min-height: 44px; padding: 8px 14px; border: 1px solid #0a3d5c; border-radius: 8px; background: white; color: #0a3d5c; font: inherit; }
+  .nav-links { display: flex; width: 100%; gap: 8px; flex-wrap: wrap; }
+  .js-nav .nav-links { display: none; }
+  .js-nav .nav-links.is-open { display: flex; }
+  .nav-links a { min-height: 44px; display: inline-flex; align-items: center; padding: 8px; }
+  .hero-content { padding-top: 160px; }
+  .hero h1 { font-size: clamp(34px, 10vw, 48px); }
+  .section { padding: 56px 18px; }
+  .quote-box { padding: 24px 18px; }
+  .grid-3, .why-grid { grid-template-columns: 1fr; }
+  .floating-wa { width: 48px; height: 48px; right: 16px; bottom: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

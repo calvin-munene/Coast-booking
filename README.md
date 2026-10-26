@@ -21,6 +21,12 @@ does not store or transmit requests to a database.
 
 ## Hosting on Render and a VPS
 
+The supplied redesign is integrated in `index.html`, `mombasa.html`,
+`diani.html`, and `school-trips.html`. Its logo and advertisement images are in
+`assets/`; shared mobile navigation, accessibility and quote-form fixes are in
+`redesign-integration.css` and `redesign-integration.js`. Other destination and
+group pages remain available at their existing URLs.
+
 This is a static website and can deploy to both providers from `main`:
 
 - **Render:** [`render.yaml`](render.yaml) configures a static site. Its build

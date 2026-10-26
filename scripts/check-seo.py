@@ -94,6 +94,9 @@ def check():
         expected = ORIGIN + ("/" if file.name == "index.html" else "/" + file.name)
         canonical = [a["href"] for a in page.links if a.get("rel") == "canonical"]
         assert canonical == [expected], f"Canonical: {file.name}"
+        icons = [a["href"] for a in page.links if a.get("rel") == "icon"]
+        assert icons and all((ROOT / icon.lstrip("/")).stat().st_size < 10_000
+                             for icon in icons), f"Oversized or missing favicon: {file.name}"
         canonicals.add(expected)
         for key in ("og:title", "og:description", "og:image", "twitter:card",
                     "twitter:title", "twitter:description", "twitter:image"):
